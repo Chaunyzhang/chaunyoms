@@ -1,0 +1,30 @@
+{
+  "name": "lossless-lite",
+  "version": "0.1.0",
+  "description": "Lightweight lossless context engine plugin for OpenClaw.",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test:raw-store": "node dist/scripts/test-raw-store.js",
+    "test:summary-store": "node dist/scripts/test-summary-store.js",
+    "test:assembler": "node dist/scripts/test-assembler.js",
+    "test:recall": "node dist/scripts/test-recall.js",
+    "test:memory-router": "node dist/scripts/test-memory-router.js",
+    "test:external-bootstrap": "node dist/scripts/test-external-bootstrap.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "gpt-tokenizer": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

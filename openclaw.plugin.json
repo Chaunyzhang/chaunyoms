@@ -1,0 +1,9 @@
+{
+  "id": "lossless-lite",
+  "kind": "context-engine",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}
