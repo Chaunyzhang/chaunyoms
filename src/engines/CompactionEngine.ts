@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { LlmCaller, LoggerLike, RawMessage, SummaryEntry, SummaryResult } from "../types";
 import { estimateTokens } from "../utils/tokenizer";
+import { hashRawMessages } from "../utils/integrity";
 import { RawMessageStore } from "../stores/RawMessageStore";
 import { SummaryIndexStore } from "../stores/SummaryIndexStore";
 
@@ -21,17 +22,27 @@ export class CompactionEngine {
 
   selectTurnsForCompaction(
     rawStore: RawMessageStore,
-    recentTailSize: number,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
     maxTurns = 20,
   ): { startTurn: number; endTurn: number; messages: RawMessage[] } | null {
-    const uncompacted = rawStore.getUncompactedMessages();
-    const turnNumbers = [...new Set(uncompacted.map((message) => message.turnNumber))];
-
-    if (turnNumbers.length <= recentTailSize) {
+    const allMessages = rawStore.getAll();
+    const lastClosedTurn = this.resolveLastClosedTurn(allMessages);
+    if (lastClosedTurn <= 0) {
       return null;
     }
 
-    const candidateTurns = turnNumbers.slice(0, Math.min(maxTurns, turnNumbers.length - recentTailSize));
+    const uncompacted = rawStore
+      .getUncompactedMessages()
+      .filter((message) => message.turnNumber <= lastClosedTurn);
+    const turnNumbers = [...new Set(uncompacted.map((message) => message.turnNumber))];
+    if (turnNumbers.length === 0) {
+      return null;
+    }
+
+    const protectedTurns = this.selectProtectedTailTurns(uncompacted, freshTailTokens, maxFreshTailTurns);
+    const candidateTurnNumbers = turnNumbers.filter((turnNumber) => !protectedTurns.has(turnNumber));
+    const candidateTurns = candidateTurnNumbers.slice(0, Math.min(maxTurns, candidateTurnNumbers.length));
     if (candidateTurns.length === 0) {
       return null;
     }
@@ -42,7 +53,7 @@ export class CompactionEngine {
     return messages.length === 0 ? null : { startTurn, endTurn, messages };
   }
 
-  async generateSummary(messages: RawMessage[], summaryModel: string, maxOutputTokens: number): Promise<SummaryResult> {
+  async generateSummary(messages: RawMessage[], summaryModel: string | undefined, maxOutputTokens: number): Promise<SummaryResult> {
     if (!this.llmCaller) {
       return this.buildFallbackSummary(messages);
     }
@@ -82,8 +93,9 @@ export class CompactionEngine {
     summaryStore: SummaryIndexStore,
     contextWindow: number,
     contextThreshold: number,
-    recentTailSize: number,
-    summaryModel: string,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+    summaryModel: string | undefined,
     maxOutputTokens: number,
     sessionId: string,
     maxTurns: number,
@@ -92,7 +104,7 @@ export class CompactionEngine {
       return null;
     }
 
-    const candidate = this.selectTurnsForCompaction(rawStore, recentTailSize, maxTurns);
+    const candidate = this.selectTurnsForCompaction(rawStore, freshTailTokens, maxFreshTailTurns, maxTurns);
     if (!candidate) {
       return null;
     }
@@ -109,6 +121,8 @@ export class CompactionEngine {
         endTurn: candidate.endTurn,
         tokenCount: estimateTokens(summary.summary),
         createdAt: new Date().toISOString(),
+        sourceHash: hashRawMessages(candidate.messages),
+        sourceMessageCount: candidate.messages.length,
       };
 
       await summaryStore.addSummary(entry);
@@ -154,5 +168,49 @@ export class CompactionEngine {
       keywords,
       toneTag: "neutral",
     };
+  }
+
+  private resolveLastClosedTurn(messages: RawMessage[]): number {
+    let maxClosedTurn = 0;
+    for (const message of messages) {
+      if (message.role === "assistant") {
+        maxClosedTurn = Math.max(maxClosedTurn, message.turnNumber);
+      }
+    }
+    return maxClosedTurn;
+  }
+
+  private selectProtectedTailTurns(
+    messages: RawMessage[],
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+  ): Set<number> {
+    if (freshTailTokens <= 0 || maxFreshTailTurns <= 0) {
+      return new Set<number>();
+    }
+
+    const turnNumbers = [...new Set(messages.map((message) => message.turnNumber))];
+    const protectedTurns = new Set<number>();
+    let consumed = 0;
+
+    for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
+      const turnNumber = turnNumbers[index];
+      const turnTokens = messages
+        .filter((message) => message.turnNumber === turnNumber)
+        .reduce((sum, message) => sum + message.tokenCount, 0);
+
+      if (protectedTurns.size > 0 && consumed + turnTokens > freshTailTokens) {
+        break;
+      }
+
+      protectedTurns.add(turnNumber);
+      consumed += turnTokens;
+
+      if (protectedTurns.size >= maxFreshTailTurns) {
+        break;
+      }
+    }
+
+    return protectedTurns;
   }
 }

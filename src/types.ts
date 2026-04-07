@@ -22,6 +22,8 @@ export interface SummaryEntry {
   endTurn: number;
   tokenCount: number;
   createdAt: string;
+  sourceHash?: string;
+  sourceMessageCount?: number;
 }
 
 export interface ContextBudget {
@@ -82,9 +84,10 @@ export interface BridgeConfig {
   sharedDataDir: string;
   contextWindow: number;
   contextThreshold: number;
-  recentTailTurns: number;
+  freshTailTokens: number;
+  maxFreshTailTurns: number;
   compactionBatchTurns: number;
-  summaryModel: string;
+  summaryModel?: string;
   summaryMaxOutputTokens: number;
 }
 

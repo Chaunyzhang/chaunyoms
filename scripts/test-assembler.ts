@@ -8,7 +8,7 @@ import { RawMessageStore } from "../src/stores/RawMessageStore";
 import { SummaryIndexStore } from "../src/stores/SummaryIndexStore";
 
 async function main(): Promise<void> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "lossless-lite-assemble-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-assemble-"));
   const rawStore = new RawMessageStore(dir, "test-session");
   const summaryStore = new SummaryIndexStore(dir, "test-session");
   const contextViewStore = new ContextViewStore();
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
     });
   }
 
-  const result = await assembler.assemble(rawStore, summaryStore, 400, 50, 8, sharedDataDir, workspaceDir);
+  const result = await assembler.assemble(rawStore, summaryStore, 400, 50, 120, 8, sharedDataDir, workspaceDir);
   const used = result.items.reduce((sum, item) => sum + item.tokenCount, 0);
 
   if (used > result.budget.availableBudget) {
@@ -65,6 +65,10 @@ async function main(): Promise<void> {
 
   if (result.items[result.items.length - 1]?.kind !== "message") {
     throw new Error("Recent tail ordering failed");
+  }
+
+  if (!result.items.some((item) => item.content.includes("[lcm_recall_guidance]"))) {
+    throw new Error("LCM recall guidance injection failed");
   }
 
   await rm(dir, { recursive: true, force: true });

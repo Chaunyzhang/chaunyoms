@@ -11,7 +11,8 @@ This directory stores shared system data outside the agent workspace.
 - shared-insights/: shared insight files and insight index
 - shared-cognition/: shared cognition injected at runtime
 - vector-store/: retrieval index files
-- lossless-data/: external data area for lossless context data
+- oms-data/: external data area for oms context data
+- chaunym-db/: transcript and summary base files
 `;
 
 export class ExternalSystemBootstrap {
@@ -25,7 +26,8 @@ export class ExternalSystemBootstrap {
       this.ensureDir(path.join(sharedDataDir, "shared-insights")),
       this.ensureDir(path.join(sharedDataDir, "shared-cognition")),
       this.ensureDir(path.join(sharedDataDir, "vector-store")),
-      this.ensureDir(path.join(sharedDataDir, "lossless-data")),
+      this.ensureDir(path.join(sharedDataDir, "oms-data")),
+      this.ensureDir(path.join(sharedDataDir, "chaunym-db")),
       this.ensureDir(path.join(sharedDataDir, "plugin-cache")),
     ]);
 
@@ -35,7 +37,8 @@ export class ExternalSystemBootstrap {
       this.ensureFile(path.join(sharedDataDir, "shared-insights", "insight-index.json"), "{\n  \"topics\": []\n}\n"),
       this.ensureFile(path.join(sharedDataDir, "knowledge-base", "topic-index.json"), "{\n  \"topics\": []\n}\n"),
       this.ensureFile(path.join(sharedDataDir, "vector-store", ".keep"), ""),
-      this.ensureFile(path.join(sharedDataDir, "lossless-data", ".keep"), ""),
+      this.ensureFile(path.join(sharedDataDir, "oms-data", ".keep"), ""),
+      this.ensureFile(path.join(sharedDataDir, "chaunym-db", "lcm.db"), ""),
     ]);
   }
 

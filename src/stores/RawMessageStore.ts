@@ -54,6 +54,37 @@ export class RawMessageStore {
     return this.messages.filter((message) => protectedTurns.has(message.turnNumber));
   }
 
+  getRecentTailByTokens(tokenBudget: number, maxTurns: number): RawMessage[] {
+    if (tokenBudget <= 0 || maxTurns <= 0) {
+      return [];
+    }
+
+    const turnOrder = [...new Set(this.messages.map((message) => message.turnNumber))];
+    const selectedTurns: number[] = [];
+    let consumed = 0;
+
+    for (let index = turnOrder.length - 1; index >= 0; index -= 1) {
+      const turnNumber = turnOrder[index];
+      const turnTokens = this.messages
+        .filter((message) => message.turnNumber === turnNumber)
+        .reduce((sum, message) => sum + message.tokenCount, 0);
+
+      if (selectedTurns.length > 0 && consumed + turnTokens > tokenBudget) {
+        break;
+      }
+
+      selectedTurns.unshift(turnNumber);
+      consumed += turnTokens;
+
+      if (selectedTurns.length >= maxTurns) {
+        break;
+      }
+    }
+
+    const selectedTurnSet = new Set(selectedTurns);
+    return this.messages.filter((message) => selectedTurnSet.has(message.turnNumber));
+  }
+
   totalUncompactedTokens(): number {
     return this.messages.reduce((total, message) => {
       return total + (message.compacted ? 0 : message.tokenCount);

@@ -11,7 +11,7 @@ const logger = {
 };
 
 async function main(): Promise<void> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "lossless-lite-external-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-external-"));
   const sharedDataDir = path.join(dir, "openclaw-data");
   const bootstrap = new ExternalSystemBootstrap(logger);
 
@@ -22,6 +22,7 @@ async function main(): Promise<void> {
     path.join(sharedDataDir, "shared-cognition", "COGNITION.md"),
     path.join(sharedDataDir, "shared-insights", "insight-index.json"),
     path.join(sharedDataDir, "knowledge-base", "topic-index.json"),
+    path.join(sharedDataDir, "chaunym-db", "lcm.db"),
   ];
 
   for (const filePath of requiredFiles) {

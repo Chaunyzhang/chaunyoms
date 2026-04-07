@@ -5,7 +5,7 @@ import path from "node:path";
 import { SummaryIndexStore } from "../src/stores/SummaryIndexStore";
 
 async function main(): Promise<void> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "lossless-lite-summary-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-summary-"));
   const store = new SummaryIndexStore(dir, "test-session");
   await store.init();
 

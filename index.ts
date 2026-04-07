@@ -3,9 +3,9 @@ import { OpenClawBridge } from "./src/OpenClawBridge";
 const bridge = new OpenClawBridge();
 
 const plugin = {
-  id: "lossless-lite",
-  name: "Lossless Lite",
-  description: "Lightweight lossless context engine plugin for OpenClaw",
+  id: "chaunyoms",
+  name: "Chaunyoms",
+  description: "Lightweight oms context engine plugin for OpenClaw",
   kind: "context-engine",
   configSchema: {
     type: "object",

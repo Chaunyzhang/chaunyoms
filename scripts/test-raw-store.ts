@@ -5,7 +5,7 @@ import path from "node:path";
 import { RawMessageStore } from "../src/stores/RawMessageStore";
 
 async function main(): Promise<void> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "lossless-lite-raw-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-raw-"));
   const store = new RawMessageStore(dir, "test-session");
   await store.init();
 
@@ -30,6 +30,10 @@ async function main(): Promise<void> {
 
   if (store.getRecentTail(2).length !== 4) {
     throw new Error("Recent tail read failed");
+  }
+
+  if (store.getRecentTailByTokens(20, 2).length !== 4) {
+    throw new Error("Token-based recent tail read failed");
   }
 
   if (store.totalUncompactedTokens() !== 50) {

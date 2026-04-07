@@ -24,7 +24,13 @@ export class MemoryRetrievalRouter {
   decide(query: string, context: RouteContext): RetrievalDecision {
     const normalized = query.trim();
     if (!normalized) {
-      return this.decision("recent_tail", "empty_query_defaults_to_recent_tail", false, false, true);
+      return this.decision(
+        "recent_tail",
+        "empty_query_defaults_to_recent_tail",
+        false,
+        false,
+        true,
+      );
     }
 
     const needsFacts = FACT_RECALL_RE.test(normalized);
@@ -35,17 +41,31 @@ export class MemoryRetrievalRouter {
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
 
     if (mentionsNavigation && !needsFacts) {
-      return this.decision("navigation", "recent_workflow_question", false, false, true);
+      return this.decision(
+        "navigation",
+        "recent_workflow_question",
+        false,
+        false,
+        true,
+      );
     }
 
     if (mentionsNavigation && needsFacts) {
-      return this.decision("dag", "navigation_hit_but_fact_recall_required", false, true, false);
+      return this.decision(
+        "dag",
+        "navigation_hit_but_fact_recall_required",
+        false,
+        true,
+        false,
+      );
     }
 
     if (mentionsInsights && (fuzzyLookup || !context.hasSharedInsightHint)) {
       return this.decision(
         context.memorySearchEnabled ? "vector_search" : "shared_insights",
-        context.memorySearchEnabled ? "shared_insights_fuzzy_lookup_with_embeddings" : "shared_insights_fuzzy_lookup_without_embeddings",
+        context.memorySearchEnabled
+          ? "shared_insights_fuzzy_lookup_with_embeddings"
+          : "shared_insights_fuzzy_lookup_without_embeddings",
         !context.memorySearchEnabled,
         false,
         context.memorySearchEnabled,
@@ -53,13 +73,21 @@ export class MemoryRetrievalRouter {
     }
 
     if (mentionsInsights) {
-      return this.decision("shared_insights", "shared_insights_route_hit", false, false, true);
+      return this.decision(
+        "shared_insights",
+        "shared_insights_route_hit",
+        false,
+        false,
+        true,
+      );
     }
 
     if (mentionsKb && (fuzzyLookup || !context.hasTopicIndexHit)) {
       return this.decision(
         context.memorySearchEnabled ? "vector_search" : "knowledge_base",
-        context.memorySearchEnabled ? "knowledge_base_fuzzy_lookup_with_embeddings" : "knowledge_base_fuzzy_lookup_without_embeddings",
+        context.memorySearchEnabled
+          ? "knowledge_base_fuzzy_lookup_with_embeddings"
+          : "knowledge_base_fuzzy_lookup_without_embeddings",
         !context.memorySearchEnabled,
         false,
         context.memorySearchEnabled,
@@ -67,14 +95,34 @@ export class MemoryRetrievalRouter {
     }
 
     if (mentionsKb) {
-      return this.decision("knowledge_base", "knowledge_base_route_hit", false, needsFacts, !needsFacts);
+      return this.decision(
+        "knowledge_base",
+        "knowledge_base_route_hit",
+        false,
+        needsFacts,
+        !needsFacts,
+      );
     }
 
     if (mentionsDag || needsFacts) {
-      return this.decision("dag", needsFacts ? "fact_question_requires_source_recall" : "historical_dialog_recall", false, true, false);
+      return this.decision(
+        "dag",
+        needsFacts
+          ? "fact_question_requires_source_recall"
+          : "historical_dialog_recall",
+        false,
+        true,
+        false,
+      );
     }
 
-    return this.decision("recent_tail", "default_recent_tail", false, false, true);
+    return this.decision(
+      "recent_tail",
+      "default_recent_tail",
+      false,
+      false,
+      true,
+    );
   }
 
   private decision(

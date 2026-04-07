@@ -7,7 +7,7 @@ import { RawMessageStore } from "../src/stores/RawMessageStore";
 import { SummaryIndexStore } from "../src/stores/SummaryIndexStore";
 
 async function main(): Promise<void> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "lossless-lite-recall-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-recall-"));
   const rawStore = new RawMessageStore(dir, "test-session");
   const summaryStore = new SummaryIndexStore(dir, "test-session");
   const resolver = new RecallResolver();
