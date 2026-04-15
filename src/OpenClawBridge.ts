@@ -22,6 +22,14 @@ import {
 } from "./types";
 import { estimateTokens } from "./utils/tokenizer";
 import { hashRawMessages } from "./utils/integrity";
+
+type RuntimeMessageLike = {
+  id?: string;
+  role: RawMessage["role"];
+  content: unknown;
+  timestamp?: number | string;
+  metadata?: Record<string, unknown>;
+};
 const DEFAULT_CONFIG: BridgeConfig = {
   dataDir: path.join(process.cwd(), ".chaunyoms"),
   sessionId: "default-session",
@@ -39,9 +47,9 @@ const DEFAULT_CONFIG: BridgeConfig = {
   summaryMaxOutputTokens: 300,
 };
 const EMBEDDINGS_API_PROMPT =
-  "当前任务需要启用 embeddings 检索。要现在配置 API 吗？可选 OpenAI 或 SiliconFlow；也可以回复忽略继续。";
+  "Current retrieval path needs embeddings search. Ask the user whether to configure an embeddings API now (for example OpenAI or SiliconFlow), or let them skip for now.";
 const EMBEDDINGS_BOOTSTRAP_PROMPT =
-  "ChaunyOMS 检测到当前还没有可用的 embeddings 检索能力。请主动询问用户是否现在配置 OpenClaw 的 memorySearch embeddings；如果用户同意，再指导其完成配置。";
+  "ChaunyOMS detected that memorySearch embeddings are not configured yet. Proactively ask the user whether they want to configure memorySearch embeddings for OpenClaw now, and only guide setup if they agree.";
 class ConsoleLogger implements LoggerLike {
   info(message: string, meta?: Record<string, unknown>): void {
     console.log(`[chaunyoms] ${message}`, meta ?? {});
@@ -608,7 +616,7 @@ export class OpenClawBridge {
   }
   async ingest(payload?: any): Promise<{ ingested: boolean }> {
     const sessionId = this.resolveSessionId(payload);
-    await this.ensureStores(sessionId);
+    await this.ensureStores(sessionId, payload);
     const role = this.resolveRole(payload);
     const content = this.resolveContent(payload);
     const turnNumber = this.resolveTurnNumber(payload);
@@ -632,7 +640,8 @@ export class OpenClawBridge {
     systemPromptAddition?: string;
   }> {
     const sessionId = this.resolveSessionId(payload);
-    await this.ensureStores(sessionId);
+    await this.ensureStores(sessionId, payload);
+    const syncedRuntime = await this.syncRuntimeMessages(payload);
     const embeddingsPrompt =
       this.consumeEmbeddingsSetupPrompt(sessionId)
         ? EMBEDDINGS_BOOTSTRAP_PROMPT
@@ -643,16 +652,12 @@ export class OpenClawBridge {
         (sum, message) => sum + estimateTokens(this.extractTextFromContent(message.content)),
         0,
       );
-      this.logger.info("assemble_passthrough_runtime_messages", {
+      this.logger.info("assemble_runtime_messages_observed", {
         sessionId,
         messageCount: runtimeMessages.length,
         estimatedTokens,
+        importedMessages: syncedRuntime.importedMessages,
       });
-      return {
-        messages: runtimeMessages,
-        estimatedTokens,
-        systemPromptAddition: embeddingsPrompt,
-      };
     }
     const totalBudget = this.resolveContextWindow(payload);
     const systemPromptTokens = this.resolveSystemPromptTokens(payload);
@@ -713,7 +718,8 @@ export class OpenClawBridge {
     };
   }> {
     const sessionId = this.resolveSessionId(payload);
-    await this.ensureStores(sessionId);
+    await this.ensureStores(sessionId, payload);
+    await this.syncRuntimeMessages(payload);
     const tokensBefore = (
       this.rawStore as RawMessageStore
     ).totalUncompactedTokens();
@@ -755,7 +761,12 @@ export class OpenClawBridge {
   }
   async afterTurn(payload?: any): Promise<{ ok: true }> {
     const sessionId = this.resolveSessionId(payload);
-    await this.ensureStores(sessionId);
+    await this.ensureStores(sessionId, payload);
+    const syncedRuntime = await this.syncRuntimeMessages(payload);
+    const compactionResult = await this.runBestEffortCompaction(
+      payload,
+      sessionId,
+    );
     const rawStore = this.rawStore as RawMessageStore;
     const summaryStore = this.summaryStore as SummaryIndexStore;
     const contextWindow = this.resolveContextWindow(payload);
@@ -768,7 +779,8 @@ export class OpenClawBridge {
       summaryCount: summaryStore.getAllSummaries().length,
       summaryTokens: summaryStore.getTotalTokens(),
       contextItems: this.contextViewStore.getItems().length,
-      compactedThisTurn: false,
+      compactedThisTurn: compactionResult.compacted,
+      importedMessages: syncedRuntime.importedMessages,
     };
     this.logger.info("after_turn_stats", stats);
     await this.writeStatsLog(sessionId, stats);
@@ -788,15 +800,19 @@ export class OpenClawBridge {
     }
     return { ok: true };
   }
-  private async ensureStores(sessionId: string): Promise<void> {
+  private async ensureStores(sessionId: string, payload?: any): Promise<void> {
+    const nextConfig = this.resolveConfig(payload);
     if (
       this.rawStore &&
       this.summaryStore &&
-      this.config.sessionId === sessionId
+      this.config.sessionId === sessionId &&
+      this.config.dataDir === nextConfig.dataDir &&
+      this.config.workspaceDir === nextConfig.workspaceDir &&
+      this.config.sharedDataDir === nextConfig.sharedDataDir
     ) {
       return;
     }
-    this.config = { ...this.config, sessionId };
+    this.config = nextConfig;
     this.rawStore = new RawMessageStore(this.config.dataDir, sessionId);
     this.summaryStore = new SummaryIndexStore(this.config.dataDir, sessionId);
     await this.rawStore.init();
@@ -860,30 +876,31 @@ export class OpenClawBridge {
   }
   private resolveConfig(payload?: any): BridgeConfig {
     const pluginConfig = payload?.config ?? this.api?.config ?? {};
+    const baseConfig = this.config ?? DEFAULT_CONFIG;
     return {
-      dataDir: pluginConfig.dataDir ?? DEFAULT_CONFIG.dataDir,
+      dataDir: pluginConfig.dataDir ?? baseConfig.dataDir,
       sessionId: this.resolveSessionId(payload),
-      workspaceDir: pluginConfig.workspaceDir ?? DEFAULT_CONFIG.workspaceDir,
-      sharedDataDir: pluginConfig.sharedDataDir ?? DEFAULT_CONFIG.sharedDataDir,
+      workspaceDir: pluginConfig.workspaceDir ?? baseConfig.workspaceDir,
+      sharedDataDir: pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir,
       contextWindow: Number(
         pluginConfig.contextWindow ??
           payload?.contextWindow ??
-          DEFAULT_CONFIG.contextWindow,
+          baseConfig.contextWindow,
       ),
       contextThreshold: Number(
-        pluginConfig.contextThreshold ?? DEFAULT_CONFIG.contextThreshold,
+        pluginConfig.contextThreshold ?? baseConfig.contextThreshold,
       ),
       freshTailTokens: Number(
         pluginConfig.freshTailTokens ??
           pluginConfig.recentTailTurns ??
-          DEFAULT_CONFIG.freshTailTokens,
+          baseConfig.freshTailTokens,
       ),
       maxFreshTailTurns: Number(
-        pluginConfig.maxFreshTailTurns ?? DEFAULT_CONFIG.maxFreshTailTurns,
+        pluginConfig.maxFreshTailTurns ?? baseConfig.maxFreshTailTurns,
       ),
       compactionBatchTurns: Number(
         pluginConfig.compactionBatchTurns ??
-          DEFAULT_CONFIG.compactionBatchTurns,
+          baseConfig.compactionBatchTurns,
       ),
       summaryModel:
         typeof pluginConfig.summaryModel === "string" &&
@@ -892,7 +909,7 @@ export class OpenClawBridge {
           : undefined,
       summaryMaxOutputTokens: Number(
         pluginConfig.summaryMaxOutputTokens ??
-          DEFAULT_CONFIG.summaryMaxOutputTokens,
+          baseConfig.summaryMaxOutputTokens,
       ),
     };
   }
@@ -1182,12 +1199,19 @@ export class OpenClawBridge {
     });
   }
 
-  private extractRuntimeMessages(payload?: any): Array<Record<string, unknown>> {
-    const messages = payload?.messages;
+  private extractRuntimeMessages(payload?: any): RuntimeMessageLike[] {
+    const candidates = [
+      payload?.messages,
+      payload?.conversation?.messages,
+      payload?.turn?.messages,
+      payload?.context?.messages,
+      payload?.input?.messages,
+    ];
+    const messages = candidates.find((value) => Array.isArray(value));
     if (!Array.isArray(messages)) {
       return [];
     }
-    const allowedRoles = new Set(["system", "user", "assistant"]);
+    const allowedRoles = new Set(["system", "user", "assistant", "tool"]);
     return messages
       .filter(
         (message): message is Record<string, unknown> =>
@@ -1198,12 +1222,178 @@ export class OpenClawBridge {
           "content" in message,
       )
       .map((message) => ({
-        role: message.role,
+        id:
+          typeof message.id === "string" && message.id.trim().length > 0
+            ? message.id
+            : undefined,
+        role: message.role as RawMessage["role"],
         content: message.content,
+        ...(typeof message.metadata === "object" &&
+        message.metadata &&
+        !Array.isArray(message.metadata)
+          ? { metadata: message.metadata as Record<string, unknown> }
+          : {}),
         ...(typeof message.timestamp === "number"
           ? { timestamp: message.timestamp }
-          : {}),
+          : typeof message.createdAt === "string"
+            ? { timestamp: message.createdAt }
+            : {}),
       }));
+  }
+
+  private async syncRuntimeMessages(
+    payload?: any,
+  ): Promise<{ importedMessages: number }> {
+    if (!this.rawStore) {
+      return { importedMessages: 0 };
+    }
+    const runtimeMessages = this.extractRuntimeMessages(payload)
+      .filter(
+        (message) =>
+          (message.role === "user" ||
+            message.role === "assistant" ||
+            message.role === "tool") &&
+          this.extractTextFromContent(message.content).trim().length > 0,
+      )
+      .map((message) => ({
+        ...message,
+        text: this.extractTextFromContent(message.content).trim(),
+      }));
+
+    if (runtimeMessages.length === 0) {
+      return { importedMessages: 0 };
+    }
+
+    const existingMessages = (this.rawStore as RawMessageStore)
+      .getAll()
+      .filter(
+        (message) =>
+          message.role === "user" ||
+          message.role === "assistant" ||
+          message.role === "tool",
+      );
+    const overlap = this.findRuntimeOverlap(existingMessages, runtimeMessages);
+    const pendingMessages = runtimeMessages.slice(overlap);
+    if (pendingMessages.length === 0) {
+      return { importedMessages: 0 };
+    }
+
+    let currentTurn =
+      existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
+
+    for (let index = 0; index < pendingMessages.length; index += 1) {
+      const message = pendingMessages[index];
+      if (message.role === "user") {
+        currentTurn = Math.max(currentTurn + 1, 1);
+      } else if (currentTurn <= 0) {
+        currentTurn = 1;
+      }
+
+      await (this.rawStore as RawMessageStore).append({
+        id:
+          message.id ??
+          this.buildRuntimeMessageId(
+            this.config.sessionId,
+            message.role,
+            message.text,
+            currentTurn,
+            overlap + index,
+          ),
+        sessionId: this.config.sessionId,
+        role: message.role,
+        content: message.text,
+        turnNumber: currentTurn,
+        createdAt: this.resolveRuntimeTimestamp(message.timestamp),
+        tokenCount: estimateTokens(message.text),
+        compacted: false,
+        metadata: {
+          ...(message.metadata ?? {}),
+          importedFromRuntimeMessages: true,
+          runtimeIndex: overlap + index,
+        },
+      });
+    }
+
+    return { importedMessages: pendingMessages.length };
+  }
+
+  private findRuntimeOverlap(
+    existingMessages: RawMessage[],
+    runtimeMessages: Array<{ role: RawMessage["role"]; text: string }>,
+  ): number {
+    const maxOverlap = Math.min(existingMessages.length, runtimeMessages.length);
+    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+      let matched = true;
+      for (let index = 0; index < overlap; index += 1) {
+        const existing = existingMessages[existingMessages.length - overlap + index];
+        const runtime = runtimeMessages[index];
+        if (
+          existing.role !== runtime.role ||
+          this.normalizeMessageText(existing.content) !==
+            this.normalizeMessageText(runtime.text)
+        ) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        return overlap;
+      }
+    }
+    return 0;
+  }
+
+  private normalizeMessageText(content: string): string {
+    return content.replace(/\\s+/g, " ").trim();
+  }
+
+  private buildRuntimeMessageId(
+    sessionId: string,
+    role: RawMessage["role"],
+    content: string,
+    turnNumber: number,
+    runtimeIndex: number,
+  ): string {
+    const digest = Buffer.from(
+      `${sessionId}|${role}|${turnNumber}|${runtimeIndex}|${this.normalizeMessageText(content)}`,
+      "utf8",
+    )
+      .toString("base64")
+      .replace(/[+/=]/g, "")
+      .slice(0, 24);
+    return `runtime-${digest}`;
+  }
+
+  private resolveRuntimeTimestamp(timestamp?: number | string): string {
+    if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+      return new Date(timestamp).toISOString();
+    }
+    if (typeof timestamp === "string" && timestamp.trim().length > 0) {
+      const parsed = new Date(timestamp);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString();
+      }
+    }
+    return new Date().toISOString();
+  }
+
+  private async runBestEffortCompaction(
+    payload: any,
+    sessionId: string,
+  ): Promise<{ compacted: boolean }> {
+    const entry = await this.compactionEngine.runCompaction(
+      this.rawStore as RawMessageStore,
+      this.summaryStore as SummaryIndexStore,
+      this.resolveContextWindow(payload),
+      this.config.contextThreshold,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+      this.resolveSummaryModelForCompaction(payload),
+      this.config.summaryMaxOutputTokens,
+      sessionId,
+      this.config.compactionBatchTurns,
+    );
+    return { compacted: Boolean(entry) };
   }
 
   private extractTextFromContent(content: unknown): string {

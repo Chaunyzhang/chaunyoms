@@ -24,7 +24,8 @@
     "test:stable-prefix": "node dist/scripts/test-stable-prefix.js",
     "test:compaction-integrity": "node dist/scripts/test-compaction-integrity.js",
     "test:memory-retrieve-auto-recall": "node dist/scripts/test-memory-retrieve-auto-recall.js",
-    "test:embedding-bootstrap": "node dist/scripts/test-embedding-bootstrap.js"
+    "test:embedding-bootstrap": "node dist/scripts/test-embedding-bootstrap.js",
+    "test:runtime-fallback-lifecycle": "node dist/scripts/test-runtime-fallback-lifecycle.js"
   },
   "license": "MIT",
   "dependencies": {
