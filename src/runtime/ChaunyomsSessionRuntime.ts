@@ -497,6 +497,21 @@ export class ChaunyomsSessionRuntime {
     const latestAssistant =
       [...latestMessages].reverse().find((item) => item.role === "assistant")?.content ?? "(none)";
     const latestSummary = summaryStore.getAllSummaries().at(-1);
+    const blocker =
+      [...latestMessages]
+        .reverse()
+        .find((item) =>
+          /(blocker|blocked|error|fail|issue|risk|阻塞|卡住|失败|报错)/i.test(item.content),
+        )
+        ?.content ?? "none recorded";
+    const pending =
+      latestUser !== "(none)"
+        ? latestUser
+        : "review outstanding work from the latest session";
+    const nextAction =
+      latestAssistant !== "(none)"
+        ? latestAssistant
+        : "continue the active thread from the latest user request";
     const today = new Date();
     const dateLabel = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
     return [
@@ -504,6 +519,10 @@ export class ChaunyomsSessionRuntime {
       `- active: ${this.truncateNavigationLine(latestUser)}`,
       `- decision: ${this.truncateNavigationLine(latestAssistant)}`,
       `- todo: review follow-up actions from latest turn`,
+      `- next: ${this.truncateNavigationLine(nextAction)}`,
+      `- pending: ${this.truncateNavigationLine(pending)}`,
+      `- blocker: ${this.truncateNavigationLine(blocker)}`,
+      `- risk: ${blocker === "none recorded" ? "none recorded" : "latest blocker needs follow-up"}`,
       `- recall: ${latestSummary ? `summary:${latestSummary.id} turns ${latestSummary.startTurn}-${latestSummary.endTurn}` : "none"}`,
     ].join("\n");
   }

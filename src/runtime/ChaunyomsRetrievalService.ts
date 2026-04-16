@@ -134,7 +134,7 @@ export class ChaunyomsRetrievalService {
     }
 
     if (decision.route === "navigation") {
-      const hit = await this.stablePrefixStore.getNavigationHit(
+      const hit = await this.stablePrefixStore.getNavigationStateHit(
         context.config.workspaceDir,
         query,
       );

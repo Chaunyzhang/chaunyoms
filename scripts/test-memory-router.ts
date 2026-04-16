@@ -9,7 +9,7 @@ function assert(condition: unknown, message: string): void {
 function main(): void {
   const router = new MemoryRetrievalRouter();
 
-  const kbRoute = router.decide("去 knowledge-base 里找一下类似之前那个缓存方案", {
+  const kbRoute = router.decide("find something related in the knowledge-base", {
     memorySearchEnabled: false,
   });
   assert(
@@ -21,19 +21,19 @@ function main(): void {
     "expected embeddings request for fuzzy knowledge-base lookup",
   );
 
-  const navRoute = router.decide("最近我们主线在做什么", {
+  const stateRoute = router.decide("what should we do next on this project?", {
     memorySearchEnabled: false,
   });
   assert(
-    navRoute.route === "navigation",
-    "expected navigation for recent workflow question",
+    stateRoute.route === "navigation",
+    "expected navigation for project state question",
   );
   assert(
-    navRoute.canAnswerDirectly === true,
-    "expected direct answer for navigation route",
+    stateRoute.reason === "project_state_question",
+    "expected state-specific navigation reason",
   );
 
-  const factRoute = router.decide("把上次那个配置参数的原话找出来", {
+  const factRoute = router.decide("what was the exact parameter we used before", {
     memorySearchEnabled: true,
   });
   assert(
@@ -46,7 +46,7 @@ function main(): void {
   );
 
   const vectorRoute = router.decide(
-    "我记得有篇 knowledge-base 文档讲过缓存方案，帮我找相关资料",
+    "find something related about the knowledge-base cache plan",
     {
       memorySearchEnabled: true,
       hasTopicIndexHit: false,

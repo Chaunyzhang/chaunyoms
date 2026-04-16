@@ -22,7 +22,19 @@ async function main(): Promise<void> {
   const sharedDataDir = path.join(dir, "openclaw-data");
 
   await mkdir(path.join(workspaceDir, "memory"), { recursive: true });
-  await writeFile(path.join(workspaceDir, "memory", "2026-04-02.md"), "recent active topic: plugin rollout", "utf8");
+  await writeFile(
+    path.join(workspaceDir, "memory", "2026-04-02.md"),
+    [
+      "2026-04-02:",
+      "- active: plugin rollout",
+      "- decision: keep tools disabled until smoke test passes",
+      "- todo: verify runtime fallback compaction",
+      "- next: run the safest smoke test first",
+      "- pending: decide when to enable tools",
+      "- blocker: none recorded",
+    ].join("\n"),
+    "utf8",
+  );
 
   const tools = new Map<string, RegisteredTool>();
   const api = {
@@ -87,6 +99,17 @@ async function main(): Promise<void> {
   });
   assert(navResult?.details?.autoRecall === false, "expected autoRecall=false for navigation query");
   assert(navResult?.details?.retrievalHitType === "route_hit", "expected route_hit for navigation query");
+
+  const nextResult = await memoryRetrieve!.execute("tool-3", {
+    sessionId: "test-session",
+    query: "what should we do next",
+  });
+  assert(nextResult?.details?.route === "navigation", "expected navigation route for next-step state query");
+  assert(
+    typeof nextResult?.content?.[0]?.text === "string" &&
+      nextResult.content[0].text.includes("- next: run the safest smoke test first"),
+    "expected state-first navigation response to prioritize next action",
+  );
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-memory-retrieve-auto-recall passed");

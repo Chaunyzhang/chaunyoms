@@ -47,6 +47,26 @@ async function main(): Promise<void> {
     throw new Error("Knowledge-base source document fallback failed");
   }
 
+  await writeFile(
+    path.join(memoryDir, "2026-04-02-12-30.md"),
+    [
+      "2026-04-02:",
+      "- active: shipping the plugin rollout",
+      "- decision: keep tools disabled by default",
+      "- todo: verify runtime fallback compaction",
+      "- next: run the safest smoke test first",
+      "- pending: decide when to enable tools",
+      "- blocker: none recorded",
+      "- recall: summary:test turns 1-4",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const stateHit = await store.getNavigationStateHit(workspaceDir, "what should we do next");
+  if (!stateHit || !stateHit.content.includes("- next: run the safest smoke test first")) {
+    throw new Error("Navigation state prioritization failed");
+  }
+
   await rm(dir, { recursive: true, force: true });
   console.log("test-stable-prefix passed");
 }
