@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import path from "node:path";
 
 import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
@@ -7,7 +6,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(process.cwd(), ".chaunyoms"),
   sessionId: "default-session",
   workspaceDir: path.join(
-    homedir(),
+    process.env.USERPROFILE ?? "C:\\Users\\28227",
     ".openclaw",
     "workspace",
   ),
@@ -236,7 +235,13 @@ export class OpenClawLlmCaller implements LlmCaller {
     if (typeof apiKey !== "string" || !apiKey.trim()) {
       return null;
     }
-    return apiKey.trim();
+    const trimmed = apiKey.trim();
+    const envMatch = trimmed.match(/^\$\{(.+)\}$/);
+    if (envMatch) {
+      const envValue = process.env[envMatch[1]];
+      return typeof envValue === "string" && envValue.trim() ? envValue.trim() : null;
+    }
+    return trimmed;
   }
 
   private extractTextResult(result: unknown): string | null {
