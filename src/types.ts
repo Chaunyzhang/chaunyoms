@@ -96,6 +96,18 @@ export interface RecallResult {
   consumedTokens: number;
 }
 
+export interface ProjectStateSnapshot {
+  dateLabel: string;
+  active: string;
+  decision: string;
+  todo: string;
+  next: string;
+  pending: string;
+  blocker: string;
+  risk: string;
+  recall: string;
+}
+
 export type RetrievalRoute =
   | "recent_tail"
   | "navigation"

@@ -3,7 +3,7 @@ import { RetrievalDecision } from "../types";
 const FACT_RECALL_RE =
   /(原话|原文|精确|准确|参数|细节|约束|配置|当时怎么说|quote|exact|verbatim|parameter|constraint|detail)/i;
 const STATE_RE =
-  /(当前状态|项目状态|现在在做|在做什么|进度|下一步|next step|next action|what should we do next|where did we leave off|待办|todo|pending|未解决|unresolved|open thread|阻塞|blocker|blocked|卡点|decision|决策|status|state|progress|working on|follow[- ]?up|dependency|dependencies|risk)/i;
+  /(当前状态|项目状态|现在在做|在做什么|进度|下一步|待办|未解决|阻塞|卡住|决策|状态|what should we do next|where did we leave off|next step|next action|todo|pending|unresolved|blocker|blocked|decision|status|state|progress|working on|follow[- ]?up|dependency|dependencies|risk)/i;
 const NAVIGATION_RE =
   /(active topic|recent|current|navigation|current focus|status|state|progress|todo|decision|next step|blocker)/i;
 const SHARED_INSIGHTS_RE =
@@ -14,12 +14,21 @@ const DAG_RE =
   /(还记得吗|之前有个|历史对话|旧对话|压缩前|摘要|dag|summary|history)/i;
 const FUZZY_SEARCH_RE =
   /(有篇|好像有个|我记得有|类似那个|相关资料|找一下相关|搜一下相关|something about|something related)/i;
+const COMPLEX_TASK_RE =
+  /(怎么推进|怎么做|如何处理|怎么拆|计划|方案|顺序|依赖|风险|取舍|tradeoff|compare|versus| vs |plan|sequence|dependency|dependencies|risk|rollout|migration|what's left|what remains|how should)/i;
+const CURRENT_WORK_RE =
+  /(这个项目|当前任务|这件事|这个问题|我们现在|当前工作|当前主线|this project|current task|current work|our work|we are|we're|what we are doing|where we left off)/i;
 
 export interface RouteContext {
   memorySearchEnabled: boolean;
   hasTopicIndexHit?: boolean;
   hasSharedInsightHint?: boolean;
   hasNavigationHint?: boolean;
+  hasStructuredNavigationState?: boolean;
+  hasCompactedHistory?: boolean;
+  recentAssistantUncertainty?: boolean;
+  queryComplexity?: "low" | "medium" | "high";
+  referencesCurrentWork?: boolean;
 }
 
 export class MemoryRetrievalRouter {
@@ -42,6 +51,13 @@ export class MemoryRetrievalRouter {
     const mentionsKb = KNOWLEDGE_BASE_RE.test(normalized);
     const mentionsDag = DAG_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
+    const asksComplexTask = COMPLEX_TASK_RE.test(normalized);
+    const referencesCurrentWork =
+      context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
+    const queryComplexity =
+      context.queryComplexity ?? (asksComplexTask ? "high" : "low");
+    const stateAvailable =
+      context.hasStructuredNavigationState || context.hasNavigationHint;
 
     if ((mentionsNavigation || asksForState) && !needsFacts) {
       return this.decision(
@@ -62,6 +78,34 @@ export class MemoryRetrievalRouter {
         false,
         true,
         false,
+      );
+    }
+
+    if (
+      stateAvailable &&
+      referencesCurrentWork &&
+      (queryComplexity === "high" || asksComplexTask)
+    ) {
+      return this.decision(
+        "navigation",
+        "complex_task_state_upgrade",
+        false,
+        false,
+        true,
+      );
+    }
+
+    if (
+      context.recentAssistantUncertainty &&
+      stateAvailable &&
+      (referencesCurrentWork || context.hasCompactedHistory)
+    ) {
+      return this.decision(
+        "navigation",
+        "assistant_uncertainty_state_upgrade",
+        false,
+        false,
+        true,
       );
     }
 

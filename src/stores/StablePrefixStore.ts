@@ -2,6 +2,10 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ContextItem } from "../types";
+import {
+  parseProjectStateSnapshot,
+  prioritizeProjectStateSnapshot,
+} from "../utils/projectState";
 import { estimateTokens } from "../utils/tokenizer";
 
 interface SharedInsightIndex {
@@ -25,11 +29,6 @@ export interface RouteHit {
   kind: "navigation" | "shared_insights" | "knowledge_base";
   filePath?: string;
   title: string;
-  content: string;
-}
-
-interface NavigationStateEntry {
-  label: string;
   content: string;
 }
 
@@ -136,8 +135,8 @@ export class StablePrefixStore {
     const latest = await this.getLatestNavigation(workspaceDir);
     if (!latest.content) return null;
 
-    const stateEntries = this.extractNavigationStateEntries(latest.content);
-    if (stateEntries.length === 0) {
+    const snapshot = parseProjectStateSnapshot(latest.content);
+    if (!snapshot) {
       return {
         kind: "navigation",
         filePath: latest.filePath,
@@ -146,12 +145,11 @@ export class StablePrefixStore {
       };
     }
 
-    const prioritized = this.prioritizeNavigationEntries(stateEntries, query);
     return {
       kind: "navigation",
       filePath: latest.filePath,
       title: path.basename(latest.filePath ?? "navigation"),
-      content: prioritized.join("\n"),
+      content: prioritizeProjectStateSnapshot(snapshot, query),
     };
   }
 
@@ -189,6 +187,12 @@ export class StablePrefixStore {
     if (!content) return false;
     const haystack = content.toLowerCase();
     return this.queryTerms(query).some((term) => haystack.includes(term));
+  }
+
+  async hasStructuredNavigationState(workspaceDir: string): Promise<boolean> {
+    const latest = await this.getLatestNavigation(workspaceDir);
+    if (!latest.content) return false;
+    return parseProjectStateSnapshot(latest.content) !== null;
   }
 
   async load(
@@ -293,84 +297,6 @@ export class StablePrefixStore {
   private async readNavigation(workspaceDir: string): Promise<string> {
     const latest = await this.getLatestNavigation(workspaceDir);
     return latest.content;
-  }
-
-  private extractNavigationStateEntries(content: string): NavigationStateEntry[] {
-    return content
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .flatMap((line) => {
-        const match = line.match(/^-\s*([a-z_ ]+):\s*(.+)$/i);
-        if (!match) {
-          return [];
-        }
-        return [
-          {
-            label: match[1].trim().toLowerCase(),
-            content: line,
-          },
-        ];
-      });
-  }
-
-  private prioritizeNavigationEntries(
-    entries: NavigationStateEntry[],
-    query: string,
-  ): string[] {
-    const normalizedQuery = query.toLowerCase();
-    const preferredLabels = this.navigationLabelsForQuery(normalizedQuery);
-    const orderedLabels = [
-      ...preferredLabels,
-      "active",
-      "decision",
-      "todo",
-      "next",
-      "pending",
-      "blocker",
-      "risk",
-      "recall",
-    ];
-
-    const seen = new Set<string>();
-    const prioritized: string[] = [];
-    for (const label of orderedLabels) {
-      const entry = entries.find((item) => item.label === label);
-      if (!entry || seen.has(entry.content)) {
-        continue;
-      }
-      prioritized.push(entry.content);
-      seen.add(entry.content);
-    }
-
-    for (const entry of entries) {
-      if (seen.has(entry.content)) {
-        continue;
-      }
-      prioritized.push(entry.content);
-      seen.add(entry.content);
-    }
-
-    return prioritized;
-  }
-
-  private navigationLabelsForQuery(query: string): string[] {
-    if (/(next|下一步|next action|next step|follow[- ]?up)/i.test(query)) {
-      return ["next", "todo", "pending", "active"];
-    }
-    if (/(blocker|blocked|阻塞|卡点|dependency|risk)/i.test(query)) {
-      return ["blocker", "risk", "pending", "todo"];
-    }
-    if (/(pending|未解决|unresolved|open thread)/i.test(query)) {
-      return ["pending", "todo", "next", "active"];
-    }
-    if (/(decision|决策|why)/i.test(query)) {
-      return ["decision", "active", "recall"];
-    }
-    if (/(status|state|progress|当前状态|项目状态|active|current)/i.test(query)) {
-      return ["active", "decision", "todo", "next", "pending"];
-    }
-    return ["active", "decision", "todo", "next"];
   }
 
   private async getLatestNavigation(

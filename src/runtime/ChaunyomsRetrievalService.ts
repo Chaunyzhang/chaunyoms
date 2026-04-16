@@ -217,7 +217,8 @@ export class ChaunyomsRetrievalService {
     context: LifecycleContext,
   ): Promise<{ decision: RetrievalDecision; promptForApi: boolean }> {
     const memorySearchEnabled = this.payloadAdapter.hasEmbeddingsRetrievalReady();
-    const [hasTopicIndexHit, hasSharedInsightHint, hasNavigationHint] =
+    const { rawStore, summaryStore } = await this.runtime.getSessionStores(context);
+    const [hasTopicIndexHit, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
       await Promise.all([
         this.stablePrefixStore.hasKnowledgeBaseTopicHit(
           context.config.sharedDataDir,
@@ -231,17 +232,79 @@ export class ChaunyomsRetrievalService {
           context.config.workspaceDir,
           query,
         ),
+        this.stablePrefixStore.hasStructuredNavigationState(
+          context.config.workspaceDir,
+        ),
       ]);
     const decision = this.retrievalRouter.decide(query, {
       memorySearchEnabled,
       hasTopicIndexHit,
       hasSharedInsightHint,
       hasNavigationHint,
+      hasStructuredNavigationState,
+      hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
+      recentAssistantUncertainty: this.hasRecentAssistantUncertainty(rawStore),
+      queryComplexity: this.classifyQueryComplexity(query),
+      referencesCurrentWork: this.referencesCurrentWork(query),
     });
     return {
       decision,
       promptForApi: decision.requiresEmbeddings && !memorySearchEnabled,
     };
+  }
+
+  private classifyQueryComplexity(query: string): "low" | "medium" | "high" {
+    const normalized = query.toLowerCase();
+    const highSignals = [
+      /how should/i,
+      /tradeoff/i,
+      /compare/i,
+      /versus/i,
+      /\bvs\b/i,
+      /sequence/i,
+      /migration/i,
+      /dependency/i,
+      /dependencies/i,
+      /rollout/i,
+      /取舍|方案|顺序|依赖|风险|怎么推进|怎么做/i,
+    ];
+    if (
+      normalized.length > 120 ||
+      highSignals.some((pattern) => pattern.test(query)) ||
+      (query.match(/\?/g)?.length ?? 0) >= 2
+    ) {
+      return "high";
+    }
+
+    if (
+      normalized.length > 60 ||
+      /(next|status|state|blocker|pending|decision|plan|steps|progress|当前|状态|下一步)/i.test(
+        query,
+      )
+    ) {
+      return "medium";
+    }
+
+    return "low";
+  }
+
+  private referencesCurrentWork(query: string): boolean {
+    return /(this project|current task|current work|our work|what we are doing|where we left off|这个项目|当前任务|当前工作|这件事|我们现在|当前主线)/i.test(
+      query,
+    );
+  }
+
+  private hasRecentAssistantUncertainty(rawStore: { getAll(): Array<{ role: string; content: string }> }): boolean {
+    return rawStore
+      .getAll()
+      .slice(-6)
+      .some(
+        (message) =>
+          message.role === "assistant" &&
+          /(not sure|unclear|need more context|need context|I may be missing|might need|不确定|不清楚|需要更多上下文|可能需要更多信息)/i.test(
+            message.content,
+          ),
+      );
   }
 
   private formatRecallText(query: string, items: ContextItem[]): string {

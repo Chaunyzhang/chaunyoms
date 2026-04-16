@@ -111,6 +111,29 @@ async function main(): Promise<void> {
     "expected state-first navigation response to prioritize next action",
   );
 
+  await bridge.ingest({
+    sessionId: "test-session",
+    message: {
+      id: "a-uncertain",
+      role: "assistant",
+      content: "I am not sure yet; I need more context before I can sequence this well.",
+      turnNumber: 7,
+    },
+  });
+
+  const complexUpgradeResult = await memoryRetrieve!.execute("tool-4", {
+    sessionId: "test-session",
+    query: "how should we sequence the rollout for this project",
+  });
+  assert(
+    complexUpgradeResult?.details?.route === "navigation",
+    "expected complex current-work query to upgrade into navigation state recall",
+  );
+  assert(
+    complexUpgradeResult?.details?.retrievalHitType === "route_hit",
+    "expected state upgrade to stay in the route-hit lane",
+  );
+
   await rm(dir, { recursive: true, force: true });
   console.log("test-memory-retrieve-auto-recall passed");
 }
