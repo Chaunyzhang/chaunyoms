@@ -174,7 +174,16 @@ export class OpenClawPayloadAdapter {
     payload: any,
     currentConfig: BridgeConfig,
   ): BridgeConfig {
-    const pluginConfig = payload?.config ?? this.getApi()?.config ?? {};
+    const pluginConfig =
+      payload?.config ??
+      this.getApi()?.pluginConfig ??
+      this.getApi()?.context?.pluginConfig ??
+      this.getApi()?.runtime?.pluginConfig ??
+      this.getApi()?.config?.plugins?.entries?.chaunyoms?.config ??
+      this.getApi()?.context?.config?.plugins?.entries?.chaunyoms?.config ??
+      this.getApi()?.runtime?.config?.plugins?.entries?.chaunyoms?.config ??
+      this.getApi()?.config ??
+      {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
     return {
       dataDir: pluginConfig.dataDir ?? baseConfig.dataDir,
@@ -248,7 +257,22 @@ export class OpenClawPayloadAdapter {
     payload: any,
     config: BridgeConfig,
   ): number {
-    return Number(payload?.tokenBudget ?? payload?.contextWindow ?? config.contextWindow);
+    const runtimeBudget = Number(
+      payload?.tokenBudget ?? payload?.contextWindow ?? config.contextWindow,
+    );
+    const configuredBudget = Number(config.contextWindow);
+    if (
+      Number.isFinite(runtimeBudget) &&
+      runtimeBudget > 0 &&
+      Number.isFinite(configuredBudget) &&
+      configuredBudget > 0
+    ) {
+      return Math.min(runtimeBudget, configuredBudget);
+    }
+    if (Number.isFinite(runtimeBudget) && runtimeBudget > 0) {
+      return runtimeBudget;
+    }
+    return configuredBudget;
   }
 
   private resolveSystemPromptTokens(payload: any): number {

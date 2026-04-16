@@ -25,7 +25,12 @@
     "test:compaction-integrity": "node dist/scripts/test-compaction-integrity.js",
     "test:memory-retrieve-auto-recall": "node dist/scripts/test-memory-retrieve-auto-recall.js",
     "test:embedding-bootstrap": "node dist/scripts/test-embedding-bootstrap.js",
-    "test:runtime-fallback-lifecycle": "node dist/scripts/test-runtime-fallback-lifecycle.js"
+    "test:runtime-fallback-lifecycle": "node dist/scripts/test-runtime-fallback-lifecycle.js",
+    "test:project-state": "node dist/scripts/test-project-state.js",
+    "test:payload-adapter": "node dist/scripts/test-payload-adapter.js",
+    "test:fallback-summary-quality": "node dist/scripts/test-fallback-summary-quality.js",
+    "test:recall-prioritization": "node dist/scripts/test-recall-prioritization.js",
+    "test:host-summary-parsing": "node dist/scripts/test-host-summary-parsing.js"
   },
   "license": "MIT",
   "dependencies": {

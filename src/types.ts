@@ -97,6 +97,7 @@ export interface RecallResult {
 }
 
 export interface ProjectStateSnapshot {
+  schemaVersion: 1;
   dateLabel: string;
   active: string;
   decision: string;

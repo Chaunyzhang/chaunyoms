@@ -88,7 +88,15 @@ async function main(): Promise<void> {
   const summaryContent = await readFile(summaryPath, "utf8");
 
   const rawMessages = rawContent.split(/\r?\n/).filter(Boolean);
-  const summaries = JSON.parse(summaryContent) as Array<Record<string, unknown>>;
+  const parsed = JSON.parse(summaryContent) as {
+    schemaVersion?: number;
+    summaries?: Array<Record<string, unknown>>;
+  };
+  const summaries = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed.summaries)
+      ? parsed.summaries
+      : [];
 
   assert(rawMessages.length >= transcript.length, "expected runtime transcript import to create raw message entries");
   assert(summaries.length > 0, "expected afterTurn fallback compaction to create summaries");

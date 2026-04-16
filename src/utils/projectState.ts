@@ -4,6 +4,7 @@ import { ProjectStateSnapshot } from "../types";
 
 const LINE_RE = /^-\s*([a-z_ ]+):\s*(.+)$/i;
 const DEFAULT_NONE = "none recorded";
+const PROJECT_STATE_HEADER = "# chaunyoms-project-state:v1";
 
 function truncate(input: string, maxChars = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
@@ -55,6 +56,7 @@ export function buildProjectStateSnapshot(
     blocker === DEFAULT_NONE ? DEFAULT_NONE : "latest blocker needs follow-up";
 
   return {
+    schemaVersion: 1,
     dateLabel,
     active: truncate(active),
     decision: truncate(decision),
@@ -73,6 +75,7 @@ export function formatProjectStateSnapshot(
   snapshot: ProjectStateSnapshot,
 ): string {
   return [
+    PROJECT_STATE_HEADER,
     `${snapshot.dateLabel}:`,
     `- active: ${snapshot.active}`,
     `- decision: ${snapshot.decision}`,
@@ -93,9 +96,15 @@ export function parseProjectStateSnapshot(
     return null;
   }
 
-  const dateLabel = lines[0].replace(/:$/, "").trim();
+  const dataLines =
+    lines[0].toLowerCase() === PROJECT_STATE_HEADER ? lines.slice(1) : lines;
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const dateLabel = dataLines[0].replace(/:$/, "").trim();
   const fields = new Map<string, string>();
-  for (const line of lines.slice(1)) {
+  for (const line of dataLines.slice(1)) {
     const match = line.match(LINE_RE);
     if (!match) {
       continue;
@@ -108,6 +117,7 @@ export function parseProjectStateSnapshot(
   }
 
   return {
+    schemaVersion: 1,
     dateLabel,
     active: fields.get("active") ?? DEFAULT_NONE,
     decision: fields.get("decision") ?? DEFAULT_NONE,
@@ -139,9 +149,9 @@ export function prioritizeProjectStateSnapshot(
   ];
 
   const seen = new Set<keyof ProjectStateSnapshot>();
-  const lines = [`${snapshot.dateLabel}:`];
+  const lines = [PROJECT_STATE_HEADER, `${snapshot.dateLabel}:`];
   for (const key of orderedKeys) {
-    if (key === "dateLabel" || seen.has(key)) {
+    if (key === "dateLabel" || key === "schemaVersion" || seen.has(key)) {
       continue;
     }
     lines.push(`- ${key}: ${snapshot[key]}`);

@@ -3,6 +3,11 @@ import path from "node:path";
 
 import { SummaryEntry } from "../types";
 
+interface SummaryIndexFileV1 {
+  schemaVersion: 1;
+  summaries: SummaryEntry[];
+}
+
 export class SummaryIndexStore {
   private readonly filePath: string;
   private summaries: SummaryEntry[] = [];
@@ -16,7 +21,7 @@ export class SummaryIndexStore {
 
     try {
       const content = await readFile(this.filePath, "utf8");
-      this.summaries = JSON.parse(content) as SummaryEntry[];
+      this.summaries = this.parsePersistedContent(content);
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code !== "ENOENT") {
@@ -57,6 +62,28 @@ export class SummaryIndexStore {
   }
 
   private async flush(): Promise<void> {
-    await writeFile(this.filePath, JSON.stringify(this.summaries, null, 2), "utf8");
+    const payload: SummaryIndexFileV1 = {
+      schemaVersion: 1,
+      summaries: this.summaries,
+    };
+    await writeFile(this.filePath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
+  private parsePersistedContent(content: string): SummaryEntry[] {
+    const parsed = JSON.parse(content) as SummaryEntry[] | SummaryIndexFileV1;
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed.schemaVersion === 1 &&
+      Array.isArray(parsed.summaries)
+    ) {
+      return parsed.summaries;
+    }
+
+    throw new Error("Unsupported summary index schema");
   }
 }

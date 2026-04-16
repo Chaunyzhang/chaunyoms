@@ -58,24 +58,23 @@ export class CompactionEngine {
       return this.buildFallbackSummary(messages);
     }
 
-    const prompt = this.buildPrompt(messages);
-
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
+        const attemptMaxOutputTokens = Math.min(
+          Math.max(maxOutputTokens * attempt, maxOutputTokens),
+          1024,
+        );
+        const prompt = this.buildPrompt(messages, attempt);
         const raw = await this.llmCaller.call({
           model: summaryModel,
           prompt,
           temperature: 0.1,
-          maxOutputTokens,
+          maxOutputTokens: attemptMaxOutputTokens,
           responseFormat: "json",
         });
-        const parsed = JSON.parse(this.extractJson(raw)) as Partial<SummaryResult>;
-        if (parsed.summary && Array.isArray(parsed.keywords) && typeof parsed.toneTag === "string") {
-          return {
-            summary: parsed.summary,
-            keywords: parsed.keywords.map((keyword) => String(keyword)),
-            toneTag: parsed.toneTag,
-          };
+        const parsed = this.parseSummaryResult(raw);
+        if (parsed) {
+          return parsed;
         }
       } catch (error) {
         this.logger.warn("summary_generation_failed", {
@@ -136,7 +135,7 @@ export class CompactionEngine {
     }
   }
 
-  private buildPrompt(messages: RawMessage[]): string {
+  private buildPrompt(messages: RawMessage[], attempt: number): string {
     const transcript = messages
       .map((message) => `Turn ${message.turnNumber} | ${message.role}\n${message.content}`)
       .join("\n\n");
@@ -144,6 +143,11 @@ export class CompactionEngine {
     return [
       "You are generating a compact transcript summary for a context engine.",
       "Return JSON with exactly these keys: summary, keywords, toneTag.",
+      "Output only one JSON object. Do not wrap it in markdown.",
+      "Do not output any extra commentary before or after the JSON object.",
+      attempt > 1
+        ? "Important: suppress reasoning and emit the final JSON object immediately."
+        : "",
       "summary must be concise and fact-preserving.",
       "keywords must be an array of short search terms.",
       "toneTag must be a short phrase describing the dialogue tone.",
@@ -152,22 +156,219 @@ export class CompactionEngine {
     ].join("\n");
   }
 
+  private parseSummaryResult(raw: string): SummaryResult | null {
+    const direct = this.normalizeSummaryCandidate(this.tryParseJsonObject(raw));
+    if (direct) {
+      return direct;
+    }
+
+    const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]+?)```/i);
+    if (fencedMatch) {
+      const fenced = this.normalizeSummaryCandidate(
+        this.tryParseJsonObject(fencedMatch[1]),
+      );
+      if (fenced) {
+        return fenced;
+      }
+    }
+
+    const embedded = this.normalizeSummaryCandidate(
+      this.tryParseJsonObject(this.extractJson(raw)),
+    );
+    if (embedded) {
+      return embedded;
+    }
+
+    const labeled = this.parseLabeledSummary(raw);
+    if (labeled) {
+      return labeled;
+    }
+
+    return null;
+  }
+
+  private tryParseJsonObject(raw: string): unknown {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeSummaryCandidate(candidate: unknown): SummaryResult | null {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+
+    const candidateRecord = candidate as Record<string, unknown>;
+    if (
+      typeof candidateRecord.summary === "string" &&
+      Array.isArray(candidateRecord.keywords) &&
+      typeof candidateRecord.toneTag === "string"
+    ) {
+      return {
+        summary: candidateRecord.summary,
+        keywords: candidateRecord.keywords.map((keyword) => String(keyword)),
+        toneTag: candidateRecord.toneTag,
+      };
+    }
+
+    if (Array.isArray(candidateRecord.content)) {
+      const text = candidateRecord.content
+        .flatMap((part) => {
+          if (
+            part &&
+            typeof part === "object" &&
+            "text" in part &&
+            typeof (part as { text?: unknown }).text === "string"
+          ) {
+            return [(part as { text: string }).text];
+          }
+          return [];
+        })
+        .join("\n");
+      if (!text.trim()) {
+        return null;
+      }
+      return this.parseSummaryResult(text);
+    }
+
+    return null;
+  }
+
   private extractJson(raw: string): string {
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
     return start >= 0 && end > start ? raw.slice(start, end + 1) : raw;
   }
 
+  private parseLabeledSummary(raw: string): SummaryResult | null {
+    const summaryMatch = raw.match(/summary\s*[:：]\s*(.+)/i);
+    const keywordsMatch = raw.match(/keywords?\s*[:：]\s*(.+)/i);
+    const toneMatch = raw.match(/toneTag\s*[:：]\s*(.+)/i);
+    if (!summaryMatch || !keywordsMatch) {
+      return null;
+    }
+
+    const keywords = keywordsMatch[1]
+      .split(/[,\uFF0C|]/)
+      .map((keyword) => keyword.trim())
+      .filter(Boolean);
+    if (keywords.length === 0) {
+      return null;
+    }
+
+    return {
+      summary: summaryMatch[1].trim(),
+      keywords,
+      toneTag: toneMatch?.[1]?.trim() || "neutral",
+    };
+  }
+
   private buildFallbackSummary(messages: RawMessage[]): SummaryResult {
-    const content = messages.map((message) => message.content).join(" ");
-    const keywords = [...new Set(content.split(/\W+/).map((term) => term.toLowerCase()).filter((term) => term.length >= 4))].slice(0, 8);
     const startTurn = messages[0]?.turnNumber ?? 0;
     const endTurn = messages[messages.length - 1]?.turnNumber ?? startTurn;
+    const sentences = messages.flatMap((message) =>
+      this.extractSentences(message.content).map((sentence) => ({
+        role: message.role,
+        sentence,
+      })),
+    );
+    const constraints = this.pickFallbackHighlights(
+      sentences,
+      /(constraint|must|must not|do not|don't|should not|require|need to|不要|必须|约束|禁用|disable)/i,
+    );
+    const decisions = this.pickFallbackHighlights(
+      sentences,
+      /(decision|decided|keep|we will|recorded|选择|决定|保留|采用)/i,
+    );
+    const blockers = this.pickFallbackHighlights(
+      sentences,
+      /(blocker|blocked|error|fail|issue|risk|cannot|can't|not installed|阻塞|卡住|失败|报错|风险)/i,
+    );
+    const nextActions = this.pickFallbackHighlights(
+      sentences,
+      /(next action|next step|follow-up|todo|pending|下一步|待办|后续|接下来)/i,
+    );
+    const exactFacts = this.pickFallbackHighlights(
+      sentences,
+      /(\b\d{2,}\b|port|gateway|profile|config|parameter|exact|具体|端口|配置|参数)/i,
+    );
+    const summaryParts = [
+      `Fallback transcript summary for turns ${startTurn}-${endTurn}.`,
+      constraints.length > 0 ? `Constraints: ${constraints.join(" | ")}` : "",
+      decisions.length > 0 ? `Decisions: ${decisions.join(" | ")}` : "",
+      blockers.length > 0 ? `Blockers: ${blockers.join(" | ")}` : "",
+      nextActions.length > 0 ? `Next: ${nextActions.join(" | ")}` : "",
+      exactFacts.length > 0 ? `Facts: ${exactFacts.join(" | ")}` : "",
+    ].filter(Boolean);
+    const content = summaryParts.join("\n");
+    const keywords = this.buildFallbackKeywords([
+      ...constraints,
+      ...decisions,
+      ...blockers,
+      ...nextActions,
+      ...exactFacts,
+    ]);
     return {
-      summary: `Transcript summary for turns ${startTurn}-${endTurn}: ${content.slice(0, 400)}`,
+      summary: content,
       keywords,
       toneTag: "neutral",
     };
+  }
+
+  private extractSentences(content: string): string[] {
+    return content
+      .split(/(?<=[.!?。！？])\s+/)
+      .map((sentence) => sentence.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+  }
+
+  private pickFallbackHighlights(
+    sentences: Array<{ role: RawMessage["role"]; sentence: string }>,
+    pattern: RegExp,
+    limit = 2,
+  ): string[] {
+    const picked: string[] = [];
+    for (const { sentence } of sentences) {
+      if (!pattern.test(sentence)) {
+        continue;
+      }
+      if (picked.includes(sentence)) {
+        continue;
+      }
+      picked.push(sentence);
+      if (picked.length >= limit) {
+        break;
+      }
+    }
+    return picked;
+  }
+
+  private buildFallbackKeywords(highlights: string[]): string[] {
+    const keywords = new Set<string>();
+    for (const highlight of highlights) {
+      const exactAnchors = highlight.match(/\b\d{2,}\b/g) ?? [];
+      for (const anchor of exactAnchors) {
+        keywords.add(anchor.toLowerCase());
+        if (keywords.size >= 10) {
+          return [...keywords];
+        }
+      }
+    }
+    for (const highlight of highlights) {
+      const terms = highlight
+        .split(/[^a-zA-Z0-9\u4e00-\u9fff]+/)
+        .map((term) => term.trim().toLowerCase())
+        .filter((term) => term.length >= 2);
+      for (const term of terms) {
+        keywords.add(term);
+        if (keywords.size >= 10) {
+          return [...keywords];
+        }
+      }
+    }
+    return [...keywords];
   }
 
   private resolveLastClosedTurn(messages: RawMessage[]): number {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -29,7 +29,39 @@ async function main(): Promise<void> {
     throw new Error("Summary token accounting failed");
   }
 
+  const persisted = JSON.parse(
+    await readFile(path.join(dir, "test-session.summaries.json"), "utf8"),
+  ) as { schemaVersion?: number; summaries?: unknown[] };
+  if (persisted.schemaVersion !== 1 || !Array.isArray(persisted.summaries)) {
+    throw new Error("Summary persistence should write schemaVersion=1 wrapper");
+  }
+
+  const legacyDir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-summary-legacy-"));
+  await writeFile(
+    path.join(legacyDir, "legacy-session.summaries.json"),
+    JSON.stringify([
+      {
+        id: "summary-legacy",
+        sessionId: "legacy-session",
+        summary: "Legacy format summary",
+        keywords: ["legacy"],
+        toneTag: "neutral",
+        startTurn: 1,
+        endTurn: 2,
+        tokenCount: 3,
+        createdAt: new Date().toISOString(),
+      },
+    ]),
+    "utf8",
+  );
+  const legacyStore = new SummaryIndexStore(legacyDir, "legacy-session");
+  await legacyStore.init();
+  if (legacyStore.getAllSummaries().length !== 1) {
+    throw new Error("Legacy summary persistence should remain readable");
+  }
+
   await rm(dir, { recursive: true, force: true });
+  await rm(legacyDir, { recursive: true, force: true });
   console.log("test-summary-store passed");
 }
 

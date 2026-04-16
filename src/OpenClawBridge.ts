@@ -313,13 +313,23 @@ export class OpenClawBridge {
       if (item.kind === "summary") {
         return {
           role: "system",
-          content: `[chaunyoms summary] ${item.content}`,
+          content: [
+            {
+              type: "text",
+              text: `[chaunyoms summary] ${item.content}`,
+            },
+          ],
           metadata: item.metadata,
         };
       }
       return {
         role: item.role ?? "user",
-        content: item.content,
+        content: [
+          {
+            type: "text",
+            text: item.content,
+          },
+        ],
         metadata: item.metadata,
       };
     });
