@@ -6,12 +6,17 @@ import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
 export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(process.cwd(), ".chaunyoms"),
   sessionId: "default-session",
+  agentId: "main",
   workspaceDir: path.join(
     homedir(),
     ".openclaw",
     "workspace",
   ),
   sharedDataDir: "C:\\openclaw-data",
+  memoryVaultDir: path.join(
+    "C:\\openclaw-data",
+    "chaunyoms-vault",
+  ),
   knowledgeBaseDir: path.join(
     homedir(),
     ".openclaw",

@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { DurableMemoryStore } from "../stores/DurableMemoryStore";
 import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
 import { ObservationStore } from "../stores/ObservationStore";
@@ -12,11 +14,13 @@ import {
   ObservationRepository,
   RawMessage,
   RawMessageRepository,
+  SummaryEntry,
   SummaryRepository,
 } from "../types";
 import { hashRawMessages } from "../utils/integrity";
 import { DataSchemaRegistry } from "./DataSchemaRegistry";
 import { SessionDataMigrationRunner } from "./SessionDataMigrationRunner";
+import { AgentVault } from "./AgentVault";
 
 export interface SessionDataStores {
   rawStore: RawMessageRepository;
@@ -42,60 +46,68 @@ export class SessionDataLayer {
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private schemaRegistry: DataSchemaRegistry | null = null;
   private migrationRunner: SessionDataMigrationRunner | null = null;
-  private boundSessionId: string | null = null;
-  private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir"> | null = null;
+  private agentVault: AgentVault | null = null;
+  private boundAgentId: string | null = null;
+  private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"> | null = null;
 
   constructor(private readonly logger: LoggerLike) {}
 
   async ensure(sessionId: string, config: BridgeConfig): Promise<SessionDataStores> {
+    const agentDataDir = this.resolveAgentDataDir(config);
+    const knowledgeDir = this.resolveSharedKnowledgeDir(config);
     if (
       this.rawStore &&
       this.summaryStore &&
       this.observationStore &&
       this.durableMemoryStore &&
       this.knowledgeStore &&
-      this.boundSessionId === sessionId &&
+      this.agentVault &&
+      this.boundAgentId === config.agentId &&
       this.boundConfig?.dataDir === config.dataDir &&
       this.boundConfig?.workspaceDir === config.workspaceDir &&
       this.boundConfig?.sharedDataDir === config.sharedDataDir &&
-      this.boundConfig?.knowledgeBaseDir === config.knowledgeBaseDir
+      this.boundConfig?.knowledgeBaseDir === config.knowledgeBaseDir &&
+      this.boundConfig?.memoryVaultDir === config.memoryVaultDir
     ) {
       return this.getStores();
     }
 
-    this.schemaRegistry = new DataSchemaRegistry(config.dataDir);
+    this.schemaRegistry = new DataSchemaRegistry(path.join(config.dataDir, "_state"));
     await this.schemaRegistry.init();
-    this.migrationRunner = new SessionDataMigrationRunner(config.dataDir, sessionId);
+    this.migrationRunner = new SessionDataMigrationRunner(agentDataDir, config.agentId);
     const migrated = await this.migrationRunner.runAll();
     if (migrated.length > 0) {
       this.logger.info("session_data_migrations_applied", {
-        sessionId,
+        agentId: config.agentId,
         migrated,
       });
     }
-    this.rawStore = new RawMessageStore(config.dataDir, sessionId);
-    this.summaryStore = new SummaryIndexStore(config.dataDir, sessionId);
-    this.observationStore = new ObservationStore(config.dataDir, sessionId);
-    this.durableMemoryStore = new DurableMemoryStore(config.dataDir, sessionId);
-    this.knowledgeStore = new KnowledgeMarkdownStore(config.knowledgeBaseDir);
+    this.rawStore = new RawMessageStore(agentDataDir, config.agentId);
+    this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
+    this.observationStore = new ObservationStore(agentDataDir, config.agentId);
+    this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
+    this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
+    this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
     await this.summaryStore.init();
     await this.observationStore.init();
     await this.durableMemoryStore.init();
     await this.knowledgeStore.init();
+    await this.agentVault.ensureLayout();
     const upgraded = await this.schemaRegistry.ensureCurrentVersions();
     if (upgraded.length > 0) {
       this.logger.info("session_data_schema_registry_updated", {
-        sessionId,
+        agentId: config.agentId,
         upgraded,
       });
     }
-    this.boundSessionId = sessionId;
+    this.boundAgentId = config.agentId;
     this.boundConfig = {
       dataDir: config.dataDir,
       workspaceDir: config.workspaceDir,
       sharedDataDir: config.sharedDataDir,
       knowledgeBaseDir: config.knowledgeBaseDir,
+      memoryVaultDir: config.memoryVaultDir,
     };
     return this.getStores();
   }
@@ -123,6 +135,27 @@ export class SessionDataLayer {
 
   async addDurableEntries(entries: DurableMemoryEntry[]): Promise<number> {
     return await this.getStores().durableMemoryStore.addEntries(entries);
+  }
+
+  async writeNavigationSnapshot(snapshot: string): Promise<string | null> {
+    if (!this.agentVault || !snapshot.trim()) {
+      return null;
+    }
+    return await this.agentVault.writeNavigation(snapshot);
+  }
+
+  async appendSummaryArtifact(entry: SummaryEntry): Promise<string | null> {
+    if (!this.agentVault) {
+      return null;
+    }
+    return await this.agentVault.appendSummary(entry);
+  }
+
+  async writeDurableMemoryArtifacts(): Promise<void> {
+    if (!this.agentVault) {
+      return;
+    }
+    await this.agentVault.writeDurableMemoryMirror(this.getStores().durableMemoryStore.getAll());
   }
 
   inspectSummaryIntegrity(): SummaryIntegrityInspection {
@@ -181,5 +214,13 @@ export class SessionDataLayer {
         repairedRanges,
       });
     }
+  }
+
+  private resolveAgentDataDir(config: BridgeConfig): string {
+    return path.join(config.dataDir, "agents", config.agentId);
+  }
+
+  private resolveSharedKnowledgeDir(config: BridgeConfig): string {
+    return path.join(config.memoryVaultDir, "shared", "knowledge");
   }
 }

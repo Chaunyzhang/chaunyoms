@@ -3,6 +3,7 @@ export type MessageRole = "system" | "user" | "assistant" | "tool";
 export interface RawMessage {
   id: string;
   sessionId: string;
+  agentId?: string;
   role: MessageRole;
   content: string;
   turnNumber: number;
@@ -30,6 +31,7 @@ export interface RawMessageRepository {
 export interface ObservationEntry {
   id: string;
   sessionId: string;
+  agentId?: string;
   role: MessageRole;
   classification: string;
   content: string;
@@ -49,6 +51,7 @@ export interface ObservationRepository {
 export interface DurableMemoryEntry {
   id: string;
   sessionId: string;
+  agentId?: string;
   kind: "user_fact" | "assistant_decision" | "project_state" | "solution" | "diagnostic" | "constraint";
   text: string;
   fingerprint: string;
@@ -70,6 +73,7 @@ export interface DurableMemoryRepository {
 export interface SummaryEntry {
   id: string;
   sessionId: string;
+  agentId?: string;
   summary: string;
   keywords: string[];
   toneTag: string;
@@ -273,9 +277,11 @@ export interface LlmCaller {
 export interface BridgeConfig {
   dataDir: string;
   sessionId: string;
+  agentId: string;
   workspaceDir: string;
   sharedDataDir: string;
   knowledgeBaseDir: string;
+  memoryVaultDir: string;
   contextWindow: number;
   contextThreshold: number;
   freshTailTokens: number;

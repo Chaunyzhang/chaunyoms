@@ -250,8 +250,12 @@ export class OpenClawPayloadAdapter {
     return {
       dataDir: pluginConfig.dataDir ?? baseConfig.dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
+      agentId: this.resolveAgentId(payload, baseConfig),
       workspaceDir,
       sharedDataDir: pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir,
+      memoryVaultDir:
+        pluginConfig.memoryVaultDir ??
+        path.join(pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir, "chaunyoms-vault"),
       knowledgeBaseDir,
       contextWindow: Number(
         pluginConfig.contextWindow ?? payload?.contextWindow ?? baseConfig.contextWindow,
@@ -324,6 +328,25 @@ export class OpenClawPayloadAdapter {
       currentConfig.sessionId ??
       DEFAULT_BRIDGE_CONFIG.sessionId
     );
+  }
+
+  private resolveAgentId(
+    payload: any,
+    currentConfig: BridgeConfig,
+  ): string {
+    const direct =
+      payload?.agentId ??
+      payload?.agent?.id ??
+      payload?.session?.agentId ??
+      this.getApi()?.agent?.id ??
+      this.getApi()?.runtime?.agent?.id ??
+      this.getApi()?.context?.agent?.id ??
+      currentConfig.agentId ??
+      DEFAULT_BRIDGE_CONFIG.agentId;
+
+    return typeof direct === "string" && direct.trim().length > 0
+      ? direct.trim()
+      : DEFAULT_BRIDGE_CONFIG.agentId;
   }
 
   private resolveMessageId(payload: any): string {

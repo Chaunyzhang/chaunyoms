@@ -138,6 +138,7 @@ export class CompactionEngine {
     summaryModel: string | undefined,
     maxOutputTokens: number,
     sessionId: string,
+    agentId: string,
     maxTurns: number,
     bypassThreshold = false,
   ): Promise<SummaryEntry | null> {
@@ -202,6 +203,7 @@ export class CompactionEngine {
       const entry: SummaryEntry = {
         id: randomUUID(),
         sessionId,
+        agentId,
         summary: summary.summary,
         keywords: summary.keywords,
         toneTag: summary.toneTag,

@@ -6,6 +6,10 @@ export const pluginConfigSchema = {
       type: "string",
       description: "Directory for ChaunyOMS runtime data.",
     },
+    agentId: {
+      type: "string",
+      description: "Canonical agent identity used for long-term memory boundaries.",
+    },
     workspaceDir: {
       type: "string",
       description: "OpenClaw workspace directory used for navigation snapshots and local knowledge paths.",
@@ -13,6 +17,10 @@ export const pluginConfigSchema = {
     sharedDataDir: {
       type: "string",
       description: "Shared data root for insights and knowledge-base indexes.",
+    },
+    memoryVaultDir: {
+      type: "string",
+      description: "Git-friendly Markdown memory vault root. Defaults to sharedDataDir/chaunyoms-vault.",
     },
     knowledgeBaseDir: {
       type: "string",

@@ -6,8 +6,10 @@
     "additionalProperties": true,
     "properties": {
       "dataDir": { "type": "string" },
+      "agentId": { "type": "string" },
       "workspaceDir": { "type": "string" },
       "sharedDataDir": { "type": "string" },
+      "memoryVaultDir": { "type": "string" },
       "knowledgeBaseDir": { "type": "string" },
       "enableTools": { "type": "boolean" },
       "contextWindow": { "type": "number" },

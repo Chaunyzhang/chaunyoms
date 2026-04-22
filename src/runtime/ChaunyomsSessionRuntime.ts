@@ -146,6 +146,7 @@ export class ChaunyomsSessionRuntime {
     const message: RawMessage = {
       id: payload.id,
       sessionId: payload.sessionId,
+      agentId: payload.config.agentId,
       role: payload.role,
       content: payload.content,
       turnNumber,
@@ -159,6 +160,7 @@ export class ChaunyomsSessionRuntime {
       durableMemoryStore,
       this.extractionEngine.extractFromRawMessage(message),
     );
+    await this.sessionData.writeDurableMemoryArtifacts();
     return { ingested: true };
   }
 
@@ -287,6 +289,7 @@ export class ChaunyomsSessionRuntime {
 
     if (compactionResult.entry) {
       await this.promoteSummaryToKnowledge(compactionResult.entry, rawStore, context);
+      await this.sessionData.appendSummaryArtifact(compactionResult.entry);
     }
 
     const { knowledgeStore } = await this.ensureSession(
@@ -336,7 +339,9 @@ export class ChaunyomsSessionRuntime {
           navigationSnapshot,
         );
         await this.persistDurableMemories(durableMemoryStore, [projectStateMemory]);
+        await this.sessionData.writeDurableMemoryArtifacts();
       }
+      await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
     }
 
     return {
@@ -462,8 +467,9 @@ export class ChaunyomsSessionRuntime {
             message.text,
             currentTurn,
             overlap + index,
-          ),
+        ),
         sessionId,
+        agentId: config.agentId,
         role: message.role,
         content: message.text,
         turnNumber: currentTurn,
@@ -493,6 +499,7 @@ export class ChaunyomsSessionRuntime {
           message.id ??
           `observation-${this.buildRuntimeMessageId(sessionId, message.role, message.text, 0, index)}`,
         sessionId,
+        agentId: config.agentId,
         role: message.role,
         classification:
           typeof message.metadata?.runtimeClassification === "string"
@@ -514,6 +521,7 @@ export class ChaunyomsSessionRuntime {
         durableMemoryStore,
         this.extractionEngine.extractFromObservation(observation),
       );
+      await this.sessionData.writeDurableMemoryArtifacts();
       existingObservationSourceKeys.add(message.sourceKey);
       importedMessages += 1;
     }
@@ -884,6 +892,7 @@ export class ChaunyomsSessionRuntime {
       context.summaryModel,
       this.config.summaryMaxOutputTokens,
       context.sessionId,
+      this.config.agentId,
       this.config.compactionBatchTurns,
       bypassThreshold,
     );
