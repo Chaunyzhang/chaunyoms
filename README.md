@@ -23,7 +23,7 @@ Lightweight OMS context-engine plugin for OpenClaw.
 - recent-tail assembly works as the safe baseline
 - OMS compaction / recall stores remain available to the context engine
 - if compaction pressure crosses the trigger threshold, ChaunyOMS compacts before assemble continues and only resumes after pressure returns to the healthy range
-- navigation snapshots keep writing after each turn
+- navigation snapshots write only after a compaction event produces a new compressed boundary
 - retrieval tools exist in code, but are only registered when `enableTools=true`
 - if embeddings retrieval is not ready, ChaunyOMS now injects a one-shot bootstrap guidance into the next assembled prompt so OpenClaw will ask the user whether to configure `memorySearch` embeddings
 - embeddings readiness is considered satisfied when either:

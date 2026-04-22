@@ -90,6 +90,7 @@ export class ChaunyomsSessionRuntime {
   private compactionEngine: CompactionEngine;
   private llmCaller: LlmCaller | null;
   private compactionInFlight: Promise<SummaryEntry | null> | null = null;
+  private navigationSnapshotPending = false;
   private readonly runtimeIngress = new RuntimeMessageIngress();
   private readonly hostFixedEstimator = new HostFixedContextEstimator();
 
@@ -221,7 +222,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async compact(context: LifecycleContext): Promise<CompactResult> {
-    const { rawStore, summaryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, durableMemoryStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -255,6 +256,13 @@ export class ChaunyomsSessionRuntime {
     }
 
     await this.promoteSummaryToKnowledge(entry, rawStore, context);
+    await this.writeNavigationArtifactsIfPending(
+      context,
+      rawStore,
+      summaryStore,
+      durableMemoryStore,
+      true,
+    );
 
     return {
       ok: true,
@@ -321,28 +329,13 @@ export class ChaunyomsSessionRuntime {
     this.logger.info("after_turn_stats", stats);
     await this.writeStatsLog(context.sessionId, stats);
 
-    if (!this.config.emergencyBrake) {
-      const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
-      const navigationWrite = await this.prefixAdapter.writeNavigationSnapshot(
-        this.config.workspaceDir,
-        navigationSnapshot,
-      );
-      if (navigationWrite.written) {
-        this.logger.info("navigation_snapshot_written", {
-          filePath: navigationWrite.filePath,
-        });
-      }
-      if (this.config.durableMemoryEnabled) {
-        const projectStateMemory = this.extractionEngine.buildProjectStateMemory(
-          context.sessionId,
-          new Date().toISOString(),
-          navigationSnapshot,
-        );
-        await this.persistDurableMemories(durableMemoryStore, [projectStateMemory]);
-        await this.sessionData.writeDurableMemoryArtifacts();
-      }
-      await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
-    }
+    await this.writeNavigationArtifactsIfPending(
+      context,
+      rawStore,
+      summaryStore,
+      durableMemoryStore,
+      compactionResult.compacted,
+    );
 
     return {
       stats,
@@ -899,12 +892,55 @@ export class ChaunyomsSessionRuntime {
     this.compactionInFlight = run;
 
     try {
-      return await run;
+      const entry = await run;
+      if (entry) {
+        this.navigationSnapshotPending = true;
+      }
+      return entry;
     } finally {
       if (this.compactionInFlight === run) {
         this.compactionInFlight = null;
       }
     }
+  }
+
+  private async writeNavigationArtifactsIfPending(
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    durableMemoryStore: DurableMemoryRepository,
+    compactionTriggeredThisStep: boolean,
+  ): Promise<void> {
+    if (this.config.emergencyBrake) {
+      this.navigationSnapshotPending = false;
+      return;
+    }
+
+    if (!this.navigationSnapshotPending && !compactionTriggeredThisStep) {
+      return;
+    }
+
+    const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
+    const navigationWrite = await this.prefixAdapter.writeNavigationSnapshot(
+      this.config.workspaceDir,
+      navigationSnapshot,
+    );
+    if (navigationWrite.written) {
+      this.logger.info("navigation_snapshot_written", {
+        filePath: navigationWrite.filePath,
+      });
+    }
+    if (this.config.durableMemoryEnabled) {
+      const projectStateMemory = this.extractionEngine.buildProjectStateMemory(
+        context.sessionId,
+        new Date().toISOString(),
+        navigationSnapshot,
+      );
+      await this.persistDurableMemories(durableMemoryStore, [projectStateMemory]);
+      await this.sessionData.writeDurableMemoryArtifacts();
+    }
+    await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
+    this.navigationSnapshotPending = false;
   }
 
   private getActiveStores(): SessionDataStores {
