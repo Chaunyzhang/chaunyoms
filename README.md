@@ -6,6 +6,11 @@ Lightweight OMS context-engine plugin for OpenClaw.
 
 - `chaunyoms` now installs in a **safe mode** by default.
 - Context-engine lifecycle is enabled.
+- runtime data no longer follows the gateway working directory; defaults now resolve to:
+  - `dataDir = C:\openclaw-data\data\chaunyoms`
+  - `sharedDataDir = C:\openclaw-data`
+  - `memoryVaultDir = C:\openclaw-data\vaults\chaunyoms`
+  - `knowledgeBaseDir = C:\openclaw-data\knowledge-base`
 - plugin tools are **disabled by default** with `plugins.entries.chaunyoms.config.enableTools = false`.
 - strict compaction is **enabled by default**:
   - trigger threshold: `0.70`
@@ -132,6 +137,10 @@ Set:
       "chaunyoms": {
         "enabled": true,
         "config": {
+          "dataDir": "C:\\openclaw-data\\data\\chaunyoms",
+          "sharedDataDir": "C:\\openclaw-data",
+          "memoryVaultDir": "C:\\openclaw-data\\vaults\\chaunyoms",
+          "knowledgeBaseDir": "C:\\openclaw-data\\knowledge-base",
           "enableTools": false,
           "contextThreshold": 0.70,
           "strictCompaction": true,
@@ -167,6 +176,7 @@ Then set:
 ## Notes
 
 - plugin-specific config belongs under `plugins.entries.chaunyoms.config`, not top-level `chaunyoms`
+- if `sharedDataDir` is overridden and `dataDir`/`memoryVaultDir` are omitted, ChaunyOMS derives them under that shared root instead of using `process.cwd()`
 - the bridge is defensive because hook payloads can vary by OpenClaw version
 - if assembly fails, the plugin falls back to recent-tail behavior
 - vector dimensions are delegated to OpenClaw `memorySearch`; ChaunyOMS does not hard-code its own embedding dimension schema

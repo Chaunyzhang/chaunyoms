@@ -4,7 +4,7 @@ export const pluginConfigSchema = {
   properties: {
     dataDir: {
       type: "string",
-      description: "Directory for ChaunyOMS runtime data.",
+      description: "Directory for ChaunyOMS runtime data. Defaults to sharedDataDir/data/chaunyoms.",
     },
     agentId: {
       type: "string",
@@ -16,15 +16,15 @@ export const pluginConfigSchema = {
     },
     sharedDataDir: {
       type: "string",
-      description: "Shared data root for insights and knowledge-base indexes.",
+      description: "Shared data root for insights, indexes, and stable external plugin storage.",
     },
     memoryVaultDir: {
       type: "string",
-      description: "Git-friendly Markdown memory vault root. Defaults to sharedDataDir/chaunyoms-vault.",
+      description: "Git-friendly Markdown memory vault root. Defaults to sharedDataDir/vaults/chaunyoms.",
     },
     knowledgeBaseDir: {
       type: "string",
-      description: "Optional git-friendly markdown knowledge directory. Promotion is disabled by default.",
+      description: "Optional git-friendly markdown knowledge directory. Defaults to sharedDataDir/knowledge-base.",
     },
     enableTools: {
       type: "boolean",

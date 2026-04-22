@@ -186,6 +186,36 @@ export class OpenClawPayloadAdapter {
       this.getApi()?.config ??
       {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
+    const sharedDataDir = this.resolveDirectoryValue(
+      pluginConfig.sharedDataDir,
+      baseConfig.sharedDataDir,
+    );
+    const workspaceDir = this.resolveDirectoryValue(
+      pluginConfig.workspaceDir,
+      baseConfig.workspaceDir,
+    );
+    const hasExplicitSharedDataDir = this.hasDirectoryValue(
+      pluginConfig.sharedDataDir,
+    );
+    const dataDir = this.resolveDirectoryValue(
+      pluginConfig.dataDir,
+      hasExplicitSharedDataDir
+        ? this.buildDataDir(sharedDataDir)
+        : baseConfig.dataDir,
+    );
+    const knowledgeBaseDir = this.resolveDirectoryValue(
+      pluginConfig.knowledgeBaseDir,
+      pluginConfig.knowledgeDir,
+      hasExplicitSharedDataDir
+        ? this.buildKnowledgeBaseDir(sharedDataDir)
+        : baseConfig.knowledgeBaseDir,
+    );
+    const memoryVaultDir = this.resolveDirectoryValue(
+      pluginConfig.memoryVaultDir,
+      hasExplicitSharedDataDir
+        ? this.buildMemoryVaultDir(sharedDataDir)
+        : baseConfig.memoryVaultDir,
+    );
 
     const emergencyBrake = this.resolveBooleanFlag(
       [
@@ -241,21 +271,13 @@ export class OpenClawPayloadAdapter {
           baseConfig.knowledgePromotionEnabled,
         );
 
-    const workspaceDir = pluginConfig.workspaceDir ?? baseConfig.workspaceDir;
-    const knowledgeBaseDir =
-      pluginConfig.knowledgeBaseDir ??
-      pluginConfig.knowledgeDir ??
-      path.join(workspaceDir, "knowledge-base");
-
     return {
-      dataDir: pluginConfig.dataDir ?? baseConfig.dataDir,
+      dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
       agentId: this.resolveAgentId(payload, baseConfig),
       workspaceDir,
-      sharedDataDir: pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir,
-      memoryVaultDir:
-        pluginConfig.memoryVaultDir ??
-        path.join(pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir, "chaunyoms-vault"),
+      sharedDataDir,
+      memoryVaultDir,
       knowledgeBaseDir,
       contextWindow: Number(
         pluginConfig.contextWindow ?? payload?.contextWindow ?? baseConfig.contextWindow,
@@ -315,6 +337,31 @@ export class OpenClawPayloadAdapter {
       knowledgePromotionEnabled,
       emergencyBrake,
     };
+  }
+
+  private hasDirectoryValue(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+  }
+
+  private resolveDirectoryValue(...values: unknown[]): string {
+    for (const value of values) {
+      if (this.hasDirectoryValue(value)) {
+        return value.trim();
+      }
+    }
+    return "";
+  }
+
+  private buildDataDir(sharedDataDir: string): string {
+    return path.join(sharedDataDir, "data", "chaunyoms");
+  }
+
+  private buildMemoryVaultDir(sharedDataDir: string): string {
+    return path.join(sharedDataDir, "vaults", "chaunyoms");
+  }
+
+  private buildKnowledgeBaseDir(sharedDataDir: string): string {
+    return path.join(sharedDataDir, "knowledge-base");
   }
 
   private resolveSessionId(

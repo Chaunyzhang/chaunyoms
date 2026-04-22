@@ -3,24 +3,26 @@ import path from "node:path";
 
 import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
 
+const DEFAULT_SHARED_DATA_DIR = "C:\\openclaw-data";
+const DEFAULT_WORKSPACE_DIR = path.join(
+  homedir(),
+  ".openclaw",
+  "workspace",
+);
+
 export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
-  dataDir: path.join(process.cwd(), ".chaunyoms"),
+  dataDir: path.join(DEFAULT_SHARED_DATA_DIR, "data", "chaunyoms"),
   sessionId: "default-session",
   agentId: "main",
-  workspaceDir: path.join(
-    homedir(),
-    ".openclaw",
-    "workspace",
-  ),
-  sharedDataDir: "C:\\openclaw-data",
+  workspaceDir: DEFAULT_WORKSPACE_DIR,
+  sharedDataDir: DEFAULT_SHARED_DATA_DIR,
   memoryVaultDir: path.join(
-    "C:\\openclaw-data",
-    "chaunyoms-vault",
+    DEFAULT_SHARED_DATA_DIR,
+    "vaults",
+    "chaunyoms",
   ),
   knowledgeBaseDir: path.join(
-    homedir(),
-    ".openclaw",
-    "workspace",
+    DEFAULT_SHARED_DATA_DIR,
     "knowledge-base",
   ),
   contextWindow: 32000,
