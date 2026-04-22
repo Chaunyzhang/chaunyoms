@@ -1,10 +1,10 @@
-import { readdir, readFile } from "node:fs/promises";
+﻿import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
-import { StablePrefixStore } from "../stores/StablePrefixStore";
-import { ContextItem, RetrievalDecision } from "../types";
+import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
+import { ContextItem, DurableMemoryEntry, FixedPrefixProvider, NavigationRepository, RetrievalDecision } from "../types";
 import {
   LifecycleContext,
   OpenClawPayloadAdapter,
@@ -22,13 +22,20 @@ interface ToolResponse {
 export class ChaunyomsRetrievalService {
   private readonly recallResolver = new RecallResolver();
   private readonly retrievalRouter = new MemoryRetrievalRouter();
-  private readonly stablePrefixStore = new StablePrefixStore();
+  private readonly fixedPrefixProvider: FixedPrefixProvider;
+  private readonly navigationRepository: NavigationRepository;
 
   constructor(
     private readonly runtime: ChaunyomsSessionRuntime,
     private readonly payloadAdapter: OpenClawPayloadAdapter,
     private readonly getApi: () => any,
-  ) {}
+    fixedPrefixProvider?: FixedPrefixProvider,
+    navigationRepository?: NavigationRepository,
+  ) {
+    const sharedAdapter = new StablePrefixAdapter();
+    this.fixedPrefixProvider = fixedPrefixProvider ?? sharedAdapter;
+    this.navigationRepository = navigationRepository ?? sharedAdapter;
+  }
 
   async executeMemoryRoute(args: any): Promise<ToolResponse> {
     const context = this.resolveContext(args);
@@ -48,11 +55,13 @@ export class ChaunyomsRetrievalService {
               requiresEmbeddings: decision.requiresEmbeddings,
               requiresSourceRecall: decision.requiresSourceRecall,
               canAnswerDirectly: decision.canAnswerDirectly,
-              shouldAutoRecall: this.shouldAutoRecall(decision),
-              autoRecallReason: this.explainAutoRecall(decision),
+              shouldAutoRecall: this.shouldAutoRecall(decision, context),
+              autoRecallReason: this.explainAutoRecall(decision, context),
               promptForApi,
               retrievalHitType: this.getRetrievalHitType(decision),
               apiPrompt: promptForApi ? EMBEDDINGS_API_PROMPT : null,
+              autoRecallEnabled: context.config.autoRecallEnabled,
+              emergencyBrake: context.config.emergencyBrake,
             },
             null,
             2,
@@ -64,16 +73,18 @@ export class ChaunyomsRetrievalService {
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
         retrievalHitType: this.getRetrievalHitType(decision),
-        shouldAutoRecall: this.shouldAutoRecall(decision),
-        autoRecallReason: this.explainAutoRecall(decision),
+        shouldAutoRecall: this.shouldAutoRecall(decision, context),
+        autoRecallReason: this.explainAutoRecall(decision, context),
         promptForApi,
+        autoRecallEnabled: context.config.autoRecallEnabled,
+        emergencyBrake: context.config.emergencyBrake,
       },
     };
   }
 
   async executeRecallDetail(args: any): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const { rawStore, summaryStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("recall_detail");
@@ -82,6 +93,11 @@ export class ChaunyomsRetrievalService {
     const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
     if (promptForApi) {
       return this.buildEmbeddingsPromptResponse(decision);
+    }
+
+    if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
+      const durableHits = durableMemoryStore.search(query, 5);
+      return this.buildRecallDisabledResponse(query, durableHits, context, decision);
     }
 
     const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
@@ -103,18 +119,27 @@ export class ChaunyomsRetrievalService {
 
   async executeMemoryRetrieve(args: any): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const { rawStore, summaryStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
 
     const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
+    const durableHits = durableMemoryStore.search(query, 3);
     if (promptForApi) {
       return this.buildEmbeddingsPromptResponse(decision);
     }
 
-    if (this.shouldAutoRecall(decision)) {
+    if ((decision.requiresSourceRecall || decision.route === "dag") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
+      return this.buildRecallDisabledResponse(query, durableHits, context, decision);
+    }
+
+    if (this.shouldAutoRecall(decision, context)) {
+      if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
+        return this.buildRecallDisabledResponse(query, durableHits, context, decision);
+      }
+
       const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
       const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
       return {
@@ -128,13 +153,13 @@ export class ChaunyomsRetrievalService {
           hitCount: result.items.length,
           retrievalHitType: "dag_recall",
           autoRecall: true,
-          autoRecallReason: this.explainAutoRecall(decision),
+          autoRecallReason: this.explainAutoRecall(decision, context),
         },
       };
     }
 
     if (decision.route === "navigation") {
-      const hit = await this.stablePrefixStore.getNavigationStateHit(
+      const hit = await this.navigationRepository.getNavigationStateHit(
         context.config.workspaceDir,
         query,
       );
@@ -142,7 +167,7 @@ export class ChaunyomsRetrievalService {
     }
 
     if (decision.route === "shared_insights") {
-      const hit = await this.stablePrefixStore.getSharedInsightHit(
+      const hit = await this.fixedPrefixProvider.getSharedInsightHit(
         context.config.sharedDataDir,
         query,
       );
@@ -150,7 +175,7 @@ export class ChaunyomsRetrievalService {
     }
 
     if (decision.route === "knowledge_base") {
-      const hit = await this.stablePrefixStore.getKnowledgeBaseHit(
+      const hit = await this.fixedPrefixProvider.getKnowledgeBaseHit(
         context.config.sharedDataDir,
         query,
       );
@@ -175,6 +200,22 @@ export class ChaunyomsRetrievalService {
           },
         };
       }
+    }
+
+    if (durableHits.length > 0) {
+      return {
+        content: [{ type: "text", text: this.formatDurableMemoryText(query, durableHits) }],
+        details: {
+          ok: true,
+          route: decision.route,
+          retrievalLabel: this.describeRetrievalRoute(decision),
+          query,
+          hitCount: durableHits.length,
+          retrievalHitType: "durable_memory",
+          autoRecall: false,
+          autoRecallReason: null,
+        },
+      };
     }
 
     const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
@@ -220,19 +261,19 @@ export class ChaunyomsRetrievalService {
     const { rawStore, summaryStore } = await this.runtime.getSessionStores(context);
     const [hasTopicIndexHit, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
       await Promise.all([
-        this.stablePrefixStore.hasKnowledgeBaseTopicHit(
+        this.fixedPrefixProvider.hasKnowledgeBaseTopicHit(
           context.config.sharedDataDir,
           query,
         ),
-        this.stablePrefixStore.hasSharedInsightHint(
+        this.fixedPrefixProvider.hasSharedInsightHint(
           context.config.sharedDataDir,
           query,
         ),
-        this.stablePrefixStore.hasNavigationHint(
+        this.navigationRepository.hasNavigationHint(
           context.config.workspaceDir,
           query,
         ),
-        this.stablePrefixStore.hasStructuredNavigationState(
+        this.navigationRepository.hasStructuredNavigationState(
           context.config.workspaceDir,
         ),
       ]);
@@ -319,6 +360,13 @@ export class ChaunyomsRetrievalService {
       .join("\n\n");
   }
 
+  private formatDurableMemoryText(query: string, items: DurableMemoryEntry[]): string {
+    return [
+      `Durable memory hits for: ${query}`,
+      ...items.map((item, index) => `${index + 1}. [${item.kind}] ${item.text}`),
+    ].join("\n");
+  }
+
   private buildMissingQueryResponse(toolName: string): ToolResponse {
     return {
       content: [
@@ -341,6 +389,32 @@ export class ChaunyomsRetrievalService {
         promptForApi: true,
         requiresEmbeddings: true,
         retrievalHitType: this.getRetrievalHitType(decision),
+      },
+    };
+  }
+
+  private buildRecallDisabledResponse(
+    query: string,
+    durableHits: DurableMemoryEntry[],
+    context: LifecycleContext,
+    decision: RetrievalDecision,
+  ): ToolResponse {
+    const text = durableHits.length > 0
+      ? `${this.formatDurableMemoryText(query, durableHits)}\n\nSource recall is currently disabled by safety policy.`
+      : `Source recall is currently disabled${context.config.emergencyBrake ? " because emergency brake is enabled" : " by configuration"}.`;
+    return {
+      content: [{ type: "text", text }],
+      details: {
+        ok: true,
+        route: decision.route,
+        retrievalLabel: this.describeRetrievalRoute(decision),
+        query,
+        hitCount: durableHits.length,
+        retrievalHitType: durableHits.length > 0 ? "durable_memory" : this.getRetrievalHitType(decision),
+        autoRecall: false,
+        autoRecallReason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
+        emergencyBrake: context.config.emergencyBrake,
+        autoRecallEnabled: context.config.autoRecallEnabled,
       },
     };
   }
@@ -473,12 +547,21 @@ export class ChaunyomsRetrievalService {
     return best;
   }
 
-  private shouldAutoRecall(decision: RetrievalDecision): boolean {
+  private shouldAutoRecall(decision: RetrievalDecision, context: LifecycleContext): boolean {
+    if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
+      return false;
+    }
     return decision.requiresSourceRecall || decision.route === "dag";
   }
 
-  private explainAutoRecall(decision: RetrievalDecision): string | null {
-    if (!this.shouldAutoRecall(decision)) {
+  private explainAutoRecall(decision: RetrievalDecision, context: LifecycleContext): string | null {
+    if (context.config.emergencyBrake) {
+      return "emergency_brake_enabled";
+    }
+    if (!context.config.autoRecallEnabled) {
+      return "auto_recall_disabled";
+    }
+    if (!this.shouldAutoRecall(decision, context)) {
       return null;
     }
     if (decision.requiresSourceRecall) {
@@ -553,3 +636,5 @@ export class ChaunyomsRetrievalService {
     };
   }
 }
+
+

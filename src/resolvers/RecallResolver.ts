@@ -1,12 +1,14 @@
-import { RecallResult } from "../types";
-import { RawMessageStore } from "../stores/RawMessageStore";
-import { SummaryIndexStore } from "../stores/SummaryIndexStore";
+import {
+  RawMessageRepository,
+  RecallResult,
+  SummaryRepository,
+} from "../types";
 
 export class RecallResolver {
   resolve(
     query: string,
-    summaryStore: SummaryIndexStore,
-    rawStore: RawMessageStore,
+    summaryStore: SummaryRepository,
+    rawStore: RawMessageRepository,
     recallBudget: number,
   ): RecallResult {
     const queryTerms = this.queryTerms(query);
@@ -17,7 +19,7 @@ export class RecallResolver {
 
     for (const hit of hits) {
       const messages = this.prioritizeMessages(
-        rawStore.getByRange(hit.startTurn, hit.endTurn),
+        this.resolveSourceMessages(rawStore, hit),
         queryTerms,
         numericAnchors,
       );
@@ -41,11 +43,38 @@ export class RecallResolver {
     return { items, consumedTokens };
   }
 
+  private resolveSourceMessages(
+    rawStore: RawMessageRepository,
+    hit: ReturnType<SummaryRepository["getAllSummaries"]>[number],
+  ): ReturnType<RawMessageRepository["getAll"]> {
+    if (Array.isArray(hit.sourceMessageIds) && hit.sourceMessageIds.length > 0) {
+      const byIds = rawStore.getByIds(hit.sourceMessageIds);
+      if (byIds.length > 0) {
+        return byIds;
+      }
+    }
+
+    if (
+      Number.isFinite(hit.sourceSequenceMin) &&
+      Number.isFinite(hit.sourceSequenceMax)
+    ) {
+      const bySequence = rawStore.getBySequenceRange(
+        hit.sourceSequenceMin as number,
+        hit.sourceSequenceMax as number,
+      );
+      if (bySequence.length > 0) {
+        return bySequence;
+      }
+    }
+
+    return rawStore.getByRange(hit.startTurn, hit.endTurn);
+  }
+
   private prioritizeMessages(
-    messages: ReturnType<RawMessageStore["getByRange"]>,
+    messages: ReturnType<RawMessageRepository["getByRange"]>,
     queryTerms: string[],
     numericAnchors: string[],
-  ): ReturnType<RawMessageStore["getByRange"]> {
+  ): ReturnType<RawMessageRepository["getByRange"]> {
     const scored = messages.map((message, index) => ({
       message,
       index,

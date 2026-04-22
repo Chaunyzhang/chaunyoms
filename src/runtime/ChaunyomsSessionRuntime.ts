@@ -1,21 +1,33 @@
 import { appendFile, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
+import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
+import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
+import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
+import {
+  SessionDataLayer,
+  SessionDataStores,
+  SummaryIntegrityInspection,
+} from "../data/SessionDataLayer";
 import { ContextViewStore } from "../stores/ContextViewStore";
-import { RawMessageStore } from "../stores/RawMessageStore";
-import { StablePrefixStore } from "../stores/StablePrefixStore";
-import { SummaryIndexStore } from "../stores/SummaryIndexStore";
 import { ExternalSystemBootstrap } from "../system/ExternalSystemBootstrap";
 import {
   BridgeConfig,
   ContextItem,
+  DurableMemoryRepository,
+  DurableMemoryEntry,
   LlmCaller,
   LoggerLike,
+  ObservationRepository,
+  ObservationEntry,
   RawMessage,
+  RawMessageRepository,
+  SummaryEntry,
+  SummaryRepository,
 } from "../types";
-import { hashRawMessages } from "../utils/integrity";
 import { estimateTokens } from "../utils/tokenizer";
 import {
   IngestPayload,
@@ -26,10 +38,19 @@ import {
   buildProjectStateSnapshot,
   formatProjectStateSnapshot,
 } from "../utils/projectState";
+import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
+import { HostFixedContextEstimator } from "./HostFixedContextEstimator";
 
-interface SessionStores {
-  rawStore: RawMessageStore;
-  summaryStore: SummaryIndexStore;
+interface CompactionBudgetState {
+  availableBudget: number;
+  hostFixedTokens: number;
+  hostFixedTokenSource: "systemPromptTokens" | "workspaceBootstrapEstimate";
+  pluginFixedTokens: number;
+  triggerBudget: number;
+  freshTailTokens: number;
+  compressibleHistoryTokens: number;
+  compressibleHistoryBudget: number;
+  triggerExceeded: boolean;
 }
 
 export interface AssembleResult {
@@ -59,13 +80,18 @@ export interface AfterTurnResult {
 export class ChaunyomsSessionRuntime {
   private config: BridgeConfig;
   private logger: LoggerLike;
-  private rawStore: RawMessageStore | null = null;
-  private summaryStore: SummaryIndexStore | null = null;
+  private readonly sessionData: SessionDataLayer;
   private readonly contextViewStore = new ContextViewStore();
-  private readonly assembler = new ContextAssembler(this.contextViewStore);
-  private readonly stablePrefixStore = new StablePrefixStore();
+  private readonly prefixAdapter = new StablePrefixAdapter();
+  private readonly assembler = new ContextAssembler(this.contextViewStore, this.prefixAdapter);
+  private readonly extractionEngine = new MemoryExtractionEngine();
+  private knowledgePromotionEngine: KnowledgePromotionEngine;
   private externalSystemBootstrap: ExternalSystemBootstrap;
   private compactionEngine: CompactionEngine;
+  private llmCaller: LlmCaller | null;
+  private compactionInFlight: Promise<SummaryEntry | null> | null = null;
+  private readonly runtimeIngress = new RuntimeMessageIngress();
+  private readonly hostFixedEstimator = new HostFixedContextEstimator();
 
   constructor(
     logger: LoggerLike,
@@ -74,14 +100,19 @@ export class ChaunyomsSessionRuntime {
   ) {
     this.logger = logger;
     this.config = initialConfig;
+    this.llmCaller = llmCaller;
+    this.sessionData = new SessionDataLayer(this.logger);
     this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
+    this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
   }
 
   updateHost(logger: LoggerLike, llmCaller: LlmCaller | null): void {
     this.logger = logger;
+    this.llmCaller = llmCaller;
     this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
+    this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
   }
 
   getConfig(): BridgeConfig {
@@ -100,7 +131,9 @@ export class ChaunyomsSessionRuntime {
     this.config = context.config;
     await this.externalSystemBootstrap.ensure(this.config.sharedDataDir);
     await this.ensureSession(context.sessionId, context.config);
-    const integrity = this.validateSummaryIntegrity();
+    const integrityInspection = this.inspectSummaryIntegrity();
+    await this.repairCompactedFlagsFromSummaries(integrityInspection.verifiedEntries);
+    const integrity = this.toIntegrityStats(integrityInspection);
     if (integrity.mismatched > 0) {
       this.logger.warn("summary_integrity_mismatch_detected", integrity);
     }
@@ -108,7 +141,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
-    const { rawStore } = await this.ensureSession(payload.sessionId, payload.config);
+    const { rawStore, durableMemoryStore } = await this.ensureSession(payload.sessionId, payload.config);
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
     const message: RawMessage = {
       id: payload.id,
@@ -122,11 +155,15 @@ export class ChaunyomsSessionRuntime {
       metadata: payload.metadata,
     };
     await rawStore.append(message);
+    await this.persistDurableMemories(
+      durableMemoryStore,
+      this.extractionEngine.extractFromRawMessage(message),
+    );
     return { ingested: true };
   }
 
   async assemble(context: LifecycleContext): Promise<AssembleResult> {
-    const { rawStore, summaryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, durableMemoryStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -136,16 +173,26 @@ export class ChaunyomsSessionRuntime {
       context.runtimeMessages,
     );
 
+    if (!this.config.emergencyBrake && this.config.compactionBarrierEnabled) {
+      await this.runCompactionBarrier(context, rawStore, summaryStore);
+    }
+
     try {
       const result = await this.assembler.assemble(
         rawStore,
         summaryStore,
+        durableMemoryStore,
         context.totalBudget,
         context.systemPromptTokens,
         this.config.freshTailTokens,
         this.config.maxFreshTailTurns,
         this.config.sharedDataDir,
         this.config.workspaceDir,
+        {
+          includeStablePrefix: !this.config.emergencyBrake,
+          includeSummaries: !this.config.emergencyBrake,
+          includeDurableMemory: !this.config.emergencyBrake,
+        },
       );
       return {
         items: result.items,
@@ -176,23 +223,25 @@ export class ChaunyomsSessionRuntime {
       context.sessionId,
       context.config,
     );
+
+    if (this.config.emergencyBrake) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "emergency_brake_enabled",
+      };
+    }
+
     await this.syncRuntimeMessages(
       context.sessionId,
       context.config,
       context.runtimeMessages,
     );
     const tokensBefore = rawStore.totalUncompactedTokens();
-    const entry = await this.compactionEngine.runCompaction(
+    const entry = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
-      context.totalBudget,
-      this.config.contextThreshold,
-      this.config.freshTailTokens,
-      this.config.maxFreshTailTurns,
-      context.summaryModel,
-      this.config.summaryMaxOutputTokens,
-      context.sessionId,
-      this.config.compactionBatchTurns,
+      context,
     );
 
     if (!entry) {
@@ -202,6 +251,8 @@ export class ChaunyomsSessionRuntime {
         reason: "threshold_not_met_or_no_candidate",
       };
     }
+
+    await this.promoteSummaryToKnowledge(entry, rawStore, context);
 
     return {
       ok: true,
@@ -220,7 +271,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async afterTurn(context: LifecycleContext): Promise<AfterTurnResult> {
-    const { rawStore, summaryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, observationStore, durableMemoryStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -229,31 +280,63 @@ export class ChaunyomsSessionRuntime {
       context.config,
       context.runtimeMessages,
     );
-    const compactionResult = await this.runBestEffortCompaction(context, rawStore, summaryStore);
+
+    const compactionResult = this.config.emergencyBrake
+      ? { compacted: false, entry: null as SummaryEntry | null }
+      : await this.runBestEffortCompaction(context, rawStore, summaryStore);
+
+    if (compactionResult.entry) {
+      await this.promoteSummaryToKnowledge(compactionResult.entry, rawStore, context);
+    }
+
+    const { knowledgeStore } = await this.ensureSession(
+      context.sessionId,
+      context.config,
+    );
     const stats = {
       timestamp: new Date().toISOString(),
       sessionId: context.sessionId,
       contextWindow: context.totalBudget,
-      contextThreshold: this.config.contextThreshold,
+      compactionTriggerThreshold: this.config.contextThreshold,
       uncompactedTokens: rawStore.totalUncompactedTokens(),
       summaryCount: summaryStore.getAllSummaries().length,
       summaryTokens: summaryStore.getTotalTokens(),
+      observationCount: observationStore.count(),
+      durableMemoryCount: durableMemoryStore.count(),
+      knowledgeBaseDir: this.config.knowledgePromotionEnabled ? knowledgeStore.getBaseDir() : null,
       contextItems: this.contextViewStore.getItems().length,
       compactedThisTurn: compactionResult.compacted,
       importedMessages: synced.importedMessages,
+      strictCompaction: this.config.strictCompaction,
+      compactionBarrierEnabled: this.config.compactionBarrierEnabled,
+      runtimeCaptureEnabled: this.config.runtimeCaptureEnabled,
+      durableMemoryEnabled: this.config.durableMemoryEnabled,
+      autoRecallEnabled: this.config.autoRecallEnabled,
+      knowledgePromotionEnabled: this.config.knowledgePromotionEnabled,
+      emergencyBrake: this.config.emergencyBrake,
     };
     this.logger.info("after_turn_stats", stats);
     await this.writeStatsLog(context.sessionId, stats);
 
-    const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
-    const navigationWrite = await this.stablePrefixStore.writeNavigationSnapshot(
-      this.config.workspaceDir,
-      navigationSnapshot,
-    );
-    if (navigationWrite.written) {
-      this.logger.info("navigation_snapshot_written", {
-        filePath: navigationWrite.filePath,
-      });
+    if (!this.config.emergencyBrake) {
+      const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
+      const navigationWrite = await this.prefixAdapter.writeNavigationSnapshot(
+        this.config.workspaceDir,
+        navigationSnapshot,
+      );
+      if (navigationWrite.written) {
+        this.logger.info("navigation_snapshot_written", {
+          filePath: navigationWrite.filePath,
+        });
+      }
+      if (this.config.durableMemoryEnabled) {
+        const projectStateMemory = this.extractionEngine.buildProjectStateMemory(
+          context.sessionId,
+          new Date().toISOString(),
+          navigationSnapshot,
+        );
+        await this.persistDurableMemories(durableMemoryStore, [projectStateMemory]);
+      }
     }
 
     return {
@@ -263,56 +346,75 @@ export class ChaunyomsSessionRuntime {
     };
   }
 
-  async getSessionStores(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SessionStores> {
+  async getSessionStores(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SessionDataStores> {
     return await this.ensureSession(context.sessionId, context.config);
   }
 
   private async ensureSession(
     sessionId: string,
     config: BridgeConfig,
-  ): Promise<SessionStores> {
-    if (
-      this.rawStore &&
-      this.summaryStore &&
-      this.config.sessionId === sessionId &&
-      this.config.dataDir === config.dataDir &&
-      this.config.workspaceDir === config.workspaceDir &&
-      this.config.sharedDataDir === config.sharedDataDir
-    ) {
-      return {
-        rawStore: this.rawStore,
-        summaryStore: this.summaryStore,
-      };
-    }
-
+  ): Promise<SessionDataStores> {
     this.config = config;
-    this.rawStore = new RawMessageStore(this.config.dataDir, sessionId);
-    this.summaryStore = new SummaryIndexStore(this.config.dataDir, sessionId);
-    await this.rawStore.init();
-    await this.summaryStore.init();
-    return {
-      rawStore: this.rawStore,
-      summaryStore: this.summaryStore,
-    };
+    return await this.sessionData.ensure(sessionId, config);
   }
-
   private async syncRuntimeMessages(
     sessionId: string,
     config: BridgeConfig,
     runtimeMessages: RuntimeMessageSnapshot[],
   ): Promise<{ importedMessages: number }> {
-    const { rawStore } = await this.ensureSession(sessionId, config);
-    const normalizedMessages = runtimeMessages.filter(
-      (message) =>
-        (message.role === "user" ||
-          message.role === "assistant" ||
-          message.role === "tool") &&
-        message.text.length > 0,
-    );
+    if (!config.runtimeCaptureEnabled || config.emergencyBrake) {
+      if (runtimeMessages.length > 0) {
+        this.logger.info("runtime_message_ingress_bypassed", {
+          sessionId,
+          reason: config.emergencyBrake ? "emergency_brake_enabled" : "runtime_capture_disabled",
+          runtimeMessageCount: runtimeMessages.length,
+        });
+      }
+      return { importedMessages: 0 };
+    }
+
+    const { rawStore, observationStore, durableMemoryStore } = await this.ensureSession(sessionId, config);
+    const inspectedMessages = runtimeMessages.map((message) => ({
+      message,
+      decision: this.runtimeIngress.inspect(message),
+    }));
+    const skippedCounts = new Map<string, number>();
+    for (const { decision } of inspectedMessages) {
+      if (decision.persist) {
+        continue;
+      }
+      skippedCounts.set(
+        decision.classification,
+        (skippedCounts.get(decision.classification) ?? 0) + 1,
+      );
+    }
+
+    if (skippedCounts.size > 0) {
+      this.logger.info("runtime_message_ingress_filtered", {
+        sessionId,
+        skipped: Object.fromEntries(skippedCounts),
+      });
+    }
+
+    const normalizedMessages = inspectedMessages
+      .filter(({ decision }) => decision.persist)
+      .map(({ message, decision }) => ({
+        ...message,
+        text: decision.normalizedText,
+        storageTarget: decision.storageTarget,
+        metadata: {
+          ...(message.metadata ?? {}),
+          runtimeClassification: decision.classification,
+          runtimePersistenceReason: decision.reason,
+        },
+      }));
 
     if (normalizedMessages.length === 0) {
       return { importedMessages: 0 };
     }
+
+    const rawCandidates = normalizedMessages.filter((message) => message.storageTarget === "raw_message");
+    const observationCandidates = normalizedMessages.filter((message) => message.storageTarget === "observation");
 
     const existingMessages = rawStore
       .getAll()
@@ -322,17 +424,36 @@ export class ChaunyomsSessionRuntime {
           message.role === "assistant" ||
           message.role === "tool",
       );
-    const overlap = this.findRuntimeOverlap(existingMessages, normalizedMessages);
-    const pendingMessages = normalizedMessages.slice(overlap);
-    if (pendingMessages.length === 0) {
-      return { importedMessages: 0 };
-    }
+    const existingSourceKeys = new Set(
+      existingMessages
+        .map((message) => {
+          const sourceKey = message.metadata?.importedSourceKey;
+          return typeof sourceKey === "string" ? sourceKey : null;
+        })
+        .filter((value): value is string => Boolean(value)),
+    );
 
+    const existingObservationSourceKeys = new Set(
+      observationStore
+        .getAll()
+        .map((item) => item.sourceKey),
+    );
+
+    const overlap = this.findRuntimeOverlap(existingMessages, rawCandidates);
+    const pendingRawMessages = rawCandidates
+      .slice(overlap)
+      .filter((message) => !existingSourceKeys.has(message.sourceKey));
+    const pendingObservationMessages = observationCandidates.filter(
+      (message) => !existingObservationSourceKeys.has(message.sourceKey),
+    );
+
+    let importedMessages = 0;
     let currentTurn = existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
-    for (let index = 0; index < pendingMessages.length; index += 1) {
-      const message = pendingMessages[index];
+
+    for (let index = 0; index < pendingRawMessages.length; index += 1) {
+      const message = pendingRawMessages[index];
       currentTurn = this.resolveRuntimeTurnNumber(currentTurn, message.role);
-      await rawStore.append({
+      const rawMessage: RawMessage = {
         id:
           message.id ??
           this.buildRuntimeMessageId(
@@ -352,12 +473,62 @@ export class ChaunyomsSessionRuntime {
         metadata: {
           ...(message.metadata ?? {}),
           importedFromRuntimeMessages: true,
+          importedSourceKey: message.sourceKey,
           runtimeIndex: overlap + index,
         },
-      });
+      };
+      await this.sessionData.appendRawMessage(rawMessage);
+      await this.persistDurableMemories(
+        durableMemoryStore,
+        this.extractionEngine.extractFromRawMessage(rawMessage),
+      );
+      existingSourceKeys.add(message.sourceKey);
+      importedMessages += 1;
     }
 
-    return { importedMessages: pendingMessages.length };
+    for (let index = 0; index < pendingObservationMessages.length; index += 1) {
+      const message = pendingObservationMessages[index];
+      const observation: ObservationEntry = {
+        id:
+          message.id ??
+          `observation-${this.buildRuntimeMessageId(sessionId, message.role, message.text, 0, index)}`,
+        sessionId,
+        role: message.role,
+        classification:
+          typeof message.metadata?.runtimeClassification === "string"
+            ? String(message.metadata.runtimeClassification)
+            : "tool_output",
+        content: message.text,
+        sourceKey: message.sourceKey,
+        createdAt: this.resolveRuntimeTimestamp(message.timestamp),
+        tokenCount: estimateTokens(message.text),
+        metadata: {
+          ...(message.metadata ?? {}),
+          importedFromRuntimeMessages: true,
+          importedSourceKey: message.sourceKey,
+          runtimeIndex: index,
+        },
+      };
+      await this.sessionData.appendObservation(observation);
+      await this.persistDurableMemories(
+        durableMemoryStore,
+        this.extractionEngine.extractFromObservation(observation),
+      );
+      existingObservationSourceKeys.add(message.sourceKey);
+      importedMessages += 1;
+    }
+
+    return { importedMessages };
+  }
+
+  private async persistDurableMemories(
+    durableMemoryStore: DurableMemoryRepository,
+    entries: DurableMemoryEntry[],
+  ): Promise<void> {
+    if (!this.config.durableMemoryEnabled || this.config.emergencyBrake || entries.length === 0) {
+      return;
+    }
+    await this.sessionData.addDurableEntries(entries);
   }
 
   private resolveRuntimeTurnNumber(
@@ -371,7 +542,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   private resolveNextTurnNumber(
-    rawStore: RawMessageStore,
+    rawStore: RawMessageRepository,
     role: RawMessage["role"],
   ): number {
     const messages = rawStore.getAll();
@@ -381,7 +552,7 @@ export class ChaunyomsSessionRuntime {
 
   private findRuntimeOverlap(
     existingMessages: RawMessage[],
-    runtimeMessages: RuntimeMessageSnapshot[],
+    runtimeMessages: Array<RuntimeMessageSnapshot & { storageTarget?: string }>,
   ): number {
     const maxOverlap = Math.min(existingMessages.length, runtimeMessages.length);
     for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
@@ -415,12 +586,12 @@ export class ChaunyomsSessionRuntime {
     turnNumber: number,
     runtimeIndex: number,
   ): string {
-    const digest = Buffer.from(
-      `${sessionId}|${role}|${turnNumber}|${runtimeIndex}|${this.normalizeMessageText(content)}`,
-      "utf8",
-    )
-      .toString("base64")
-      .replace(/[+/=]/g, "")
+    const digest = createHash("sha256")
+      .update(
+        `${sessionId}|${role}|${turnNumber}|${runtimeIndex}|${this.normalizeMessageText(content)}`,
+        "utf8",
+      )
+      .digest("hex")
       .slice(0, 24);
     return `runtime-${digest}`;
   }
@@ -440,60 +611,233 @@ export class ChaunyomsSessionRuntime {
 
   private async runBestEffortCompaction(
     context: LifecycleContext,
-    rawStore: RawMessageStore,
-    summaryStore: SummaryIndexStore,
-  ): Promise<{ compacted: boolean }> {
-    const entry = await this.compactionEngine.runCompaction(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+  ): Promise<{ compacted: boolean; entry: SummaryEntry | null }> {
+    const entry = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
-      context.totalBudget,
-      this.config.contextThreshold,
-      this.config.freshTailTokens,
-      this.config.maxFreshTailTurns,
-      context.summaryModel,
-      this.config.summaryMaxOutputTokens,
-      context.sessionId,
-      this.config.compactionBatchTurns,
+      context,
     );
-    return { compacted: Boolean(entry) };
+    return { compacted: Boolean(entry), entry };
   }
 
-  private validateSummaryIntegrity(): {
+  private async runCompactionBarrier(
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+  ): Promise<void> {
+    let budgetState = await this.measureCompactionBudgetState(
+      context,
+      rawStore,
+      summaryStore,
+    );
+    if (!budgetState.triggerExceeded) {
+      return;
+    }
+
+    const tokensBefore = budgetState.compressibleHistoryTokens;
+    const maxPasses = 12;
+    let passes = 0;
+
+    while (budgetState.compressibleHistoryTokens > budgetState.compressibleHistoryBudget) {
+      passes += 1;
+      if (passes > maxPasses) {
+        throw new Error(
+          `Compaction barrier exceeded max passes before structural recovery (session=${context.sessionId})`,
+        );
+      }
+
+      const entry = await this.runSerializedCompaction(
+        rawStore,
+        summaryStore,
+        context,
+        true,
+      );
+      if (!entry) {
+        throw new Error(
+          `Compaction barrier could not recover compressible history budget (session=${context.sessionId}, compressibleTokens=${budgetState.compressibleHistoryTokens}, budget=${budgetState.compressibleHistoryBudget})`,
+        );
+      }
+
+      await this.promoteSummaryToKnowledge(entry, rawStore, context);
+      budgetState = await this.measureCompactionBudgetState(context, rawStore, summaryStore);
+    }
+
+    if (budgetState.hostFixedTokens + budgetState.pluginFixedTokens + budgetState.freshTailTokens > context.totalBudget) {
+      this.logger.warn("compaction_fixed_and_fresh_over_trigger_budget", {
+        sessionId: context.sessionId,
+        hostFixedTokens: budgetState.hostFixedTokens,
+        hostFixedTokenSource: budgetState.hostFixedTokenSource,
+        pluginFixedTokens: budgetState.pluginFixedTokens,
+        freshTailTokens: budgetState.freshTailTokens,
+        triggerBudget: budgetState.triggerBudget,
+        totalBudget: context.totalBudget,
+      });
+    }
+
+    this.logger.info("compaction_barrier_recovered_context", {
+      sessionId: context.sessionId,
+      tokensBefore,
+      tokensAfter: budgetState.compressibleHistoryTokens,
+      triggerThreshold: this.config.contextThreshold,
+      hostFixedTokens: budgetState.hostFixedTokens,
+      hostFixedTokenSource: budgetState.hostFixedTokenSource,
+      pluginFixedTokens: budgetState.pluginFixedTokens,
+      freshTailTokens: budgetState.freshTailTokens,
+      compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+      passes,
+      strictCompaction: this.config.strictCompaction,
+    });
+  }
+
+  private async measureCompactionBudgetState(
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+  ): Promise<CompactionBudgetState> {
+    const { durableMemoryStore } = this.getActiveStores();
+    const budget = this.assembler.allocateBudget(
+      context.totalBudget,
+      context.systemPromptTokens,
+    );
+    const stablePrefix = await this.prefixAdapter.load(
+      this.config.sharedDataDir,
+      this.config.workspaceDir,
+      budget.stablePrefixBudget,
+    );
+    const recallGuidance = this.assembler.buildRecallGuidance(summaryStore);
+    const durableMemory = this.assembler.assembleDurableMemory(
+      durableMemoryStore,
+      budget.recallBudget,
+    );
+    const pluginFixedTokens = [
+      ...stablePrefix,
+      ...(recallGuidance ? [recallGuidance] : []),
+      ...durableMemory,
+    ].reduce((sum, item) => sum + item.tokenCount, 0);
+
+    const effectiveTailBudget = Math.min(
+      budget.recentTailBudget,
+      this.config.freshTailTokens,
+    );
+    const freshTail = this.assembler.assembleRecentTail(
+      rawStore,
+      effectiveTailBudget,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+    );
+    const freshTailTokens = freshTail.reduce(
+      (sum, item) => sum + item.tokenCount,
+      0,
+    );
+
+    const compressibleHistoryTokens =
+      this.compactionEngine.measureCompressibleHistoryTokens(
+        rawStore,
+        summaryStore,
+        this.config.freshTailTokens,
+        this.config.maxFreshTailTurns,
+      );
+    const hostFixedResolved =
+      context.systemPromptTokens > 0
+        ? {
+            tokens: context.systemPromptTokens,
+            source: "systemPromptTokens" as const,
+          }
+        : {
+            tokens: await this.hostFixedEstimator.estimateWorkspaceBootstrapTokens(
+              this.config.workspaceDir,
+            ),
+            source: "workspaceBootstrapEstimate" as const,
+          };
+    const hostFixedTokens = hostFixedResolved.tokens;
+    const availableBudget = Math.max(
+      context.totalBudget - hostFixedTokens,
+      0,
+    );
+    const triggerBudget = Math.floor(availableBudget * this.config.contextThreshold);
+    const compressibleHistoryBudget = Math.max(
+      triggerBudget - pluginFixedTokens - freshTailTokens,
+      0,
+    );
+
+    return {
+      availableBudget,
+      hostFixedTokens,
+      hostFixedTokenSource: hostFixedResolved.source,
+      pluginFixedTokens,
+      triggerBudget,
+      freshTailTokens,
+      compressibleHistoryTokens,
+      compressibleHistoryBudget,
+      triggerExceeded:
+        pluginFixedTokens + freshTailTokens + compressibleHistoryTokens > triggerBudget,
+    };
+  }
+
+  private async promoteSummaryToKnowledge(
+    entry: SummaryEntry,
+    rawStore: RawMessageRepository,
+    context: LifecycleContext,
+  ): Promise<void> {
+    if (!this.config.knowledgePromotionEnabled || this.config.emergencyBrake) {
+      return;
+    }
+
+    try {
+      const { knowledgeStore } = await this.ensureSession(
+        context.sessionId,
+        context.config,
+      );
+      const sourceMessages = rawStore.getByRange(entry.startTurn, entry.endTurn);
+      const result = await this.knowledgePromotionEngine.promote({
+        summaryEntry: entry,
+        messages: sourceMessages,
+        sessionId: context.sessionId,
+        summaryModel: context.summaryModel,
+        knowledgePromotionModel: this.config.knowledgePromotionModel,
+        knowledgeStore,
+      });
+      this.logger.info("knowledge_markdown_promotion_result", {
+        summaryId: entry.id,
+        status: result.status,
+        reason: result.reason,
+        slug: result.slug,
+        version: result.version,
+        filePath: result.filePath,
+      });
+    } catch (error) {
+      this.logger.warn("knowledge_markdown_promotion_failed", {
+        summaryId: entry.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private inspectSummaryIntegrity(): SummaryIntegrityInspection {
+    return this.sessionData.inspectSummaryIntegrity();
+  }
+
+  private toIntegrityStats(
+    inspection: SummaryIntegrityInspection,
+  ): {
     total: number;
     verified: number;
     mismatched: number;
     unchecked: number;
   } {
-    const { rawStore, summaryStore } = this.getActiveStores();
-    const summaries = summaryStore.getAllSummaries();
-    let verified = 0;
-    let mismatched = 0;
-    let unchecked = 0;
-
-    for (const summary of summaries) {
-      if (!summary.sourceHash || typeof summary.sourceMessageCount !== "number") {
-        unchecked += 1;
-        continue;
-      }
-      const sourceMessages = rawStore.getByRange(summary.startTurn, summary.endTurn);
-      const actualHash = hashRawMessages(sourceMessages);
-      const actualCount = sourceMessages.length;
-      if (
-        actualHash !== summary.sourceHash ||
-        actualCount !== summary.sourceMessageCount
-      ) {
-        mismatched += 1;
-      } else {
-        verified += 1;
-      }
-    }
-
-    return { total: summaries.length, verified, mismatched, unchecked };
+    return {
+      total: inspection.total,
+      verified: inspection.verified,
+      mismatched: inspection.mismatched,
+      unchecked: inspection.unchecked,
+    };
   }
 
   private buildNavigationSnapshot(
-    rawStore: RawMessageStore,
-    summaryStore: SummaryIndexStore,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
   ): string {
     return formatProjectStateSnapshot(
       buildProjectStateSnapshot(rawStore, summaryStore),
@@ -513,13 +857,48 @@ export class ChaunyomsSessionRuntime {
     );
   }
 
-  private getActiveStores(): SessionStores {
-    if (!this.rawStore || !this.summaryStore) {
-      throw new Error("Chaunyoms runtime stores are not initialized");
+  private async repairCompactedFlagsFromSummaries(
+    verifiedEntries: Array<{ startTurn: number; endTurn: number }>,
+  ): Promise<void> {
+    await this.sessionData.repairCompactedFlagsFromSummaries(verifiedEntries);
+  }
+
+  private async runSerializedCompaction(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    context: LifecycleContext,
+    bypassThreshold = false,
+  ): Promise<SummaryEntry | null> {
+    if (this.compactionInFlight) {
+      return await this.compactionInFlight;
     }
-    return {
-      rawStore: this.rawStore,
-      summaryStore: this.summaryStore,
-    };
+
+    const run = this.compactionEngine.runCompaction(
+      rawStore,
+      summaryStore,
+      context.totalBudget,
+      this.config.contextThreshold,
+      this.config.strictCompaction,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+      context.summaryModel,
+      this.config.summaryMaxOutputTokens,
+      context.sessionId,
+      this.config.compactionBatchTurns,
+      bypassThreshold,
+    );
+    this.compactionInFlight = run;
+
+    try {
+      return await run;
+    } finally {
+      if (this.compactionInFlight === run) {
+        this.compactionInFlight = null;
+      }
+    }
+  }
+
+  private getActiveStores(): SessionDataStores {
+    return this.sessionData.getStores();
   }
 }

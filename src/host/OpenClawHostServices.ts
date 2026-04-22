@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import path from "node:path";
 
 import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
@@ -6,17 +7,30 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(process.cwd(), ".chaunyoms"),
   sessionId: "default-session",
   workspaceDir: path.join(
-    process.env.USERPROFILE ?? "C:\\Users\\28227",
+    homedir(),
     ".openclaw",
     "workspace",
   ),
   sharedDataDir: "C:\\openclaw-data",
+  knowledgeBaseDir: path.join(
+    homedir(),
+    ".openclaw",
+    "workspace",
+    "knowledge-base",
+  ),
   contextWindow: 32000,
-  contextThreshold: 0.75,
+  contextThreshold: 0.7,
   freshTailTokens: 6000,
   maxFreshTailTurns: 8,
   compactionBatchTurns: 12,
   summaryMaxOutputTokens: 300,
+  strictCompaction: true,
+  compactionBarrierEnabled: true,
+  runtimeCaptureEnabled: true,
+  durableMemoryEnabled: true,
+  autoRecallEnabled: true,
+  knowledgePromotionEnabled: false,
+  emergencyBrake: false,
 };
 
 export class ConsoleLogger implements LoggerLike {
@@ -155,8 +169,7 @@ export class OpenClawLlmCaller implements LlmCaller {
       name: "config.models.providers",
       invoke: async (params: LlmCallParams) => {
         const modelRef =
-          this.resolveRequestedModelRef(params) ??
-          this.resolveDefaultModelRef(apiConfig);
+          this.resolvePreferredConfiguredModelRef(apiConfig, params);
         if (!modelRef) {
           throw new Error("No configured model ref available for summary generation");
         }
@@ -210,6 +223,35 @@ export class OpenClawLlmCaller implements LlmCaller {
     };
   }
 
+  private resolvePreferredConfiguredModelRef(
+    apiConfig: any,
+    params: LlmCallParams,
+  ): string | null {
+    const requested = this.resolveRequestedModelRef(params);
+    const candidates = [
+      requested,
+      this.resolveDefaultModelRef(apiConfig),
+      ...this.resolveFallbackModelRefs(apiConfig),
+    ].filter((value, index, list): value is string =>
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      list.indexOf(value) === index,
+    );
+
+    for (const candidate of candidates) {
+      const providerId = this.resolveProviderId(candidate);
+      if (!providerId) {
+        continue;
+      }
+      const providerConfig = apiConfig?.models?.providers?.[providerId];
+      if (providerConfig && typeof providerConfig === "object") {
+        return candidate;
+      }
+    }
+
+    return candidates[0] ?? null;
+  }
+
   private resolveRequestedModelRef(params: LlmCallParams): string | null {
     if (typeof params.model === "string" && params.model.trim().length > 0) {
       return params.model.trim();
@@ -224,6 +266,25 @@ export class OpenClawLlmCaller implements LlmCaller {
       : null;
   }
 
+  private resolveFallbackModelRefs(apiConfig: any): string[] {
+    const fallbacks = apiConfig?.agents?.defaults?.model?.fallbacks;
+    if (!Array.isArray(fallbacks)) {
+      return [];
+    }
+    return fallbacks
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  private resolveProviderId(modelRef: string): string | null {
+    const slashIndex = modelRef.indexOf("/");
+    if (slashIndex <= 0) {
+      return null;
+    }
+    return modelRef.slice(0, slashIndex);
+  }
+
   private resolveConfiguredBaseUrl(providerConfig: any): string | null {
     return typeof providerConfig?.baseUrl === "string" && providerConfig.baseUrl.trim()
       ? providerConfig.baseUrl.trim()
@@ -235,13 +296,7 @@ export class OpenClawLlmCaller implements LlmCaller {
     if (typeof apiKey !== "string" || !apiKey.trim()) {
       return null;
     }
-    const trimmed = apiKey.trim();
-    const envMatch = trimmed.match(/^\$\{(.+)\}$/);
-    if (envMatch) {
-      const envValue = process.env[envMatch[1]];
-      return typeof envValue === "string" && envValue.trim() ? envValue.trim() : null;
-    }
-    return trimmed;
+    return apiKey.trim();
   }
 
   private extractTextResult(result: unknown): string | null {

@@ -1,4 +1,5 @@
 import { OpenClawBridge } from "./src/OpenClawBridge";
+import { pluginConfigSchema } from "./src/pluginConfigSchema";
 
 const bridge = new OpenClawBridge();
 
@@ -7,11 +8,7 @@ const plugin = {
   name: "Chaunyoms",
   description: "Lightweight oms context engine plugin for OpenClaw",
   kind: "context-engine",
-  configSchema: {
-    type: "object",
-    additionalProperties: true,
-    properties: {},
-  },
+  configSchema: pluginConfigSchema,
   register(api: unknown): void {
     bridge.register(api);
   },

@@ -1,6 +1,8 @@
-import { RawMessageStore } from "../stores/RawMessageStore";
-import { SummaryIndexStore } from "../stores/SummaryIndexStore";
-import { ProjectStateSnapshot } from "../types";
+import {
+  ProjectStateSnapshot,
+  RawMessageRepository,
+  SummaryRepository,
+} from "../types";
 
 const LINE_RE = /^-\s*([a-z_ ]+):\s*(.+)$/i;
 const DEFAULT_NONE = "none recorded";
@@ -15,8 +17,8 @@ function truncate(input: string, maxChars = 120): string {
 }
 
 export function buildProjectStateSnapshot(
-  rawStore: RawMessageStore,
-  summaryStore: SummaryIndexStore,
+  rawStore: RawMessageRepository,
+  summaryStore: SummaryRepository,
   now = new Date(),
 ): ProjectStateSnapshot {
   const latestMessages = rawStore.getAll().slice(-12);
@@ -66,7 +68,7 @@ export function buildProjectStateSnapshot(
     blocker: truncate(blocker),
     risk: truncate(risk),
     recall: latestSummary
-      ? `summary:${latestSummary.id} turns ${latestSummary.startTurn}-${latestSummary.endTurn}`
+      ? `summary:${latestSummary.id} messages ${latestSummary.sourceFirstMessageId ?? "unknown"}..${latestSummary.sourceLastMessageId ?? "unknown"}`
       : "none",
   };
 }

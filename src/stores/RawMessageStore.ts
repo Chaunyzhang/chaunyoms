@@ -18,8 +18,19 @@ export class RawMessageStore {
       const content = await readFile(this.filePath, "utf8");
       const lines = content.split(/\r?\n/).filter(Boolean);
       this.messages.length = 0;
+      let mutated = false;
+      let nextSequence = 1;
       for (const line of lines) {
-        this.messages.push(JSON.parse(line) as RawMessage);
+        const parsed = JSON.parse(line) as RawMessage;
+        if (!Number.isFinite(parsed.sequence)) {
+          parsed.sequence = nextSequence;
+          mutated = true;
+        }
+        nextSequence = Math.max(nextSequence, (parsed.sequence ?? 0) + 1);
+        this.messages.push(parsed);
+      }
+      if (mutated) {
+        await this.flush();
       }
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
@@ -30,6 +41,9 @@ export class RawMessageStore {
   }
 
   async append(message: RawMessage): Promise<void> {
+    if (!Number.isFinite(message.sequence)) {
+      message.sequence = this.nextSequence();
+    }
     this.messages.push(message);
     await this.flush();
   }
@@ -42,6 +56,24 @@ export class RawMessageStore {
     return this.messages.filter(
       (message) => message.turnNumber >= startTurn && message.turnNumber <= endTurn,
     );
+  }
+
+  getByIds(ids: string[]): RawMessage[] {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const wanted = new Set(ids);
+    return this.messages.filter((message) => wanted.has(message.id));
+  }
+
+  getBySequenceRange(startSequence: number, endSequence: number): RawMessage[] {
+    return this.messages.filter((message) => {
+      if (!Number.isFinite(message.sequence)) {
+        return false;
+      }
+      return (message.sequence as number) >= startSequence && (message.sequence as number) <= endSequence;
+    });
   }
 
   getRecentTail(turnCount: number): RawMessage[] {
@@ -113,5 +145,10 @@ export class RawMessageStore {
   private async flush(): Promise<void> {
     const serialized = this.messages.map((message) => JSON.stringify(message)).join("\n");
     await writeFile(this.filePath, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+  }
+
+  private nextSequence(): number {
+    const lastSequence = this.messages[this.messages.length - 1]?.sequence;
+    return Number.isFinite(lastSequence) ? (lastSequence as number) + 1 : 1;
   }
 }

@@ -1,27 +1,62 @@
 import { randomUUID } from "node:crypto";
 
-import { LlmCaller, LoggerLike, RawMessage, SummaryEntry, SummaryResult } from "../types";
+import {
+  LlmCaller,
+  LoggerLike,
+  RawMessage,
+  RawMessageRepository,
+  SummaryEntry,
+  SummaryRepository,
+  SummaryResult,
+} from "../types";
 import { estimateTokens } from "../utils/tokenizer";
 import { hashRawMessages } from "../utils/integrity";
-import { RawMessageStore } from "../stores/RawMessageStore";
-import { SummaryIndexStore } from "../stores/SummaryIndexStore";
-
 export class CompactionEngine {
   constructor(
     private readonly llmCaller: LlmCaller | null,
     private readonly logger: LoggerLike,
   ) {}
 
-  shouldCompact(rawStore: RawMessageStore, contextWindow: number, contextThreshold: number): boolean {
-    const normalizedThreshold =
-      Number.isFinite(contextThreshold) && contextThreshold > 0 && contextThreshold < 1
-        ? contextThreshold
-        : 0.75;
-    return rawStore.totalUncompactedTokens() > Math.floor(contextWindow * normalizedThreshold);
+  shouldCompact(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    contextWindow: number,
+    contextThreshold: number,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+  ): boolean {
+    const normalizedThreshold = this.normalizeThresholdRatio(contextThreshold, 0.7);
+    return (
+      this.getCompactionPressureTokens(
+        rawStore,
+        summaryStore,
+        freshTailTokens,
+        maxFreshTailTurns,
+      ) > Math.floor(contextWindow * normalizedThreshold)
+    );
+  }
+
+  measureCompressibleHistoryTokens(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+  ): number {
+    return this.getCompactionPressureTokens(
+      rawStore,
+      summaryStore,
+      freshTailTokens,
+      maxFreshTailTurns,
+    );
+  }
+
+  canUseLlmSummary(): boolean {
+    return this.llmCaller !== null;
   }
 
   selectTurnsForCompaction(
-    rawStore: RawMessageStore,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
     freshTailTokens: number,
     maxFreshTailTurns: number,
     maxTurns = 20,
@@ -32,9 +67,14 @@ export class CompactionEngine {
       return null;
     }
 
+    const coveredTurns = summaryStore.getCoveredTurns();
     const uncompacted = rawStore
       .getUncompactedMessages()
-      .filter((message) => message.turnNumber <= lastClosedTurn);
+      .filter(
+        (message) =>
+          message.turnNumber <= lastClosedTurn &&
+          !coveredTurns.has(message.turnNumber),
+      );
     const turnNumbers = [...new Set(uncompacted.map((message) => message.turnNumber))];
     if (turnNumbers.length === 0) {
       return null;
@@ -88,40 +128,100 @@ export class CompactionEngine {
   }
 
   async runCompaction(
-    rawStore: RawMessageStore,
-    summaryStore: SummaryIndexStore,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
     contextWindow: number,
     contextThreshold: number,
+    strictCompaction: boolean,
     freshTailTokens: number,
     maxFreshTailTurns: number,
     summaryModel: string | undefined,
     maxOutputTokens: number,
     sessionId: string,
     maxTurns: number,
+    bypassThreshold = false,
   ): Promise<SummaryEntry | null> {
-    if (!this.shouldCompact(rawStore, contextWindow, contextThreshold)) {
+    if (
+      !bypassThreshold &&
+      !this.shouldCompact(
+        rawStore,
+        summaryStore,
+        contextWindow,
+        contextThreshold,
+        freshTailTokens,
+        maxFreshTailTurns,
+      )
+    ) {
       return null;
     }
 
-    const candidate = this.selectTurnsForCompaction(rawStore, freshTailTokens, maxFreshTailTurns, maxTurns);
+    const candidate = this.selectTurnsForCompaction(
+      rawStore,
+      summaryStore,
+      freshTailTokens,
+      maxFreshTailTurns,
+      maxTurns,
+    );
     if (!candidate) {
       return null;
     }
 
     try {
-      const summary = await this.generateSummary(candidate.messages, summaryModel, maxOutputTokens);
+      if (strictCompaction && !this.canUseLlmSummary()) {
+        this.logger.warn("strict_compaction_requires_llm", {
+          sessionId,
+          reason: "llm_unavailable",
+        });
+        return null;
+      }
+
+      const sourceHash = hashRawMessages(candidate.messages);
+      const sourceMessageCount = candidate.messages.length;
+      const existing = summaryStore.findBySourceCoverage(
+        candidate.startTurn,
+        candidate.endTurn,
+        sourceHash,
+        sourceMessageCount,
+      );
+      if (existing) {
+        await rawStore.markCompacted(candidate.startTurn, candidate.endTurn);
+        return existing;
+      }
+
+      const summary = strictCompaction
+        ? await this.generateStrictSummary(candidate.messages, summaryModel, maxOutputTokens)
+        : await this.generateSummary(candidate.messages, summaryModel, maxOutputTokens);
+      if (!summary) {
+        this.logger.warn("strict_compaction_summary_unavailable", {
+          sessionId,
+          startTurn: candidate.startTurn,
+          endTurn: candidate.endTurn,
+        });
+        return null;
+      }
       const entry: SummaryEntry = {
         id: randomUUID(),
         sessionId,
         summary: summary.summary,
         keywords: summary.keywords,
         toneTag: summary.toneTag,
+        constraints: summary.constraints,
+        decisions: summary.decisions,
+        blockers: summary.blockers,
+        exactFacts: summary.exactFacts,
         startTurn: candidate.startTurn,
         endTurn: candidate.endTurn,
+        sourceFirstMessageId: candidate.messages[0]?.id,
+        sourceLastMessageId: candidate.messages[candidate.messages.length - 1]?.id,
+        sourceMessageIds: candidate.messages.map((message) => message.id),
+        sourceStartTimestamp: candidate.messages[0]?.createdAt,
+        sourceEndTimestamp: candidate.messages[candidate.messages.length - 1]?.createdAt,
+        sourceSequenceMin: candidate.messages[0]?.sequence,
+        sourceSequenceMax: candidate.messages[candidate.messages.length - 1]?.sequence,
         tokenCount: estimateTokens(summary.summary),
         createdAt: new Date().toISOString(),
-        sourceHash: hashRawMessages(candidate.messages),
-        sourceMessageCount: candidate.messages.length,
+        sourceHash,
+        sourceMessageCount,
       };
 
       await summaryStore.addSummary(entry);
@@ -142,7 +242,7 @@ export class CompactionEngine {
 
     return [
       "You are generating a compact transcript summary for a context engine.",
-      "Return JSON with exactly these keys: summary, keywords, toneTag.",
+      "Return JSON with exactly these keys: summary, keywords, toneTag, constraints, decisions, blockers, exactFacts.",
       "Output only one JSON object. Do not wrap it in markdown.",
       "Do not output any extra commentary before or after the JSON object.",
       attempt > 1
@@ -151,6 +251,10 @@ export class CompactionEngine {
       "summary must be concise and fact-preserving.",
       "keywords must be an array of short search terms.",
       "toneTag must be a short phrase describing the dialogue tone.",
+      "constraints must list explicit limits, requirements, and must-not rules.",
+      "decisions must list concrete decisions or settled implementation choices.",
+      "blockers must list concrete failures, risks, or unresolved blockers.",
+      "exactFacts must list exact numbers, ports, file names, config keys, parameter values, and other precise anchors that should survive compression.",
       "",
       transcript,
     ].join("\n");
@@ -195,6 +299,44 @@ export class CompactionEngine {
     }
   }
 
+  private async generateStrictSummary(
+    messages: RawMessage[],
+    summaryModel: string | undefined,
+    maxOutputTokens: number,
+  ): Promise<SummaryResult | null> {
+    if (!this.llmCaller) {
+      return null;
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const attemptMaxOutputTokens = Math.min(
+          Math.max(maxOutputTokens * attempt, maxOutputTokens),
+          1024,
+        );
+        const prompt = this.buildPrompt(messages, attempt);
+        const raw = await this.llmCaller.call({
+          model: summaryModel,
+          prompt,
+          temperature: 0.1,
+          maxOutputTokens: attemptMaxOutputTokens,
+          responseFormat: "json",
+        });
+        const parsed = this.parseSummaryResult(raw);
+        if (parsed) {
+          return parsed;
+        }
+      } catch (error) {
+        this.logger.warn("strict_summary_generation_failed", {
+          attempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return null;
+  }
+
   private normalizeSummaryCandidate(candidate: unknown): SummaryResult | null {
     if (!candidate || typeof candidate !== "object") {
       return null;
@@ -210,6 +352,18 @@ export class CompactionEngine {
         summary: candidateRecord.summary,
         keywords: candidateRecord.keywords.map((keyword) => String(keyword)),
         toneTag: candidateRecord.toneTag,
+        constraints: Array.isArray(candidateRecord.constraints)
+          ? candidateRecord.constraints.map((item) => String(item))
+          : [],
+        decisions: Array.isArray(candidateRecord.decisions)
+          ? candidateRecord.decisions.map((item) => String(item))
+          : [],
+        blockers: Array.isArray(candidateRecord.blockers)
+          ? candidateRecord.blockers.map((item) => String(item))
+          : [],
+        exactFacts: Array.isArray(candidateRecord.exactFacts)
+          ? candidateRecord.exactFacts.map((item) => String(item))
+          : [],
       };
     }
 
@@ -262,6 +416,10 @@ export class CompactionEngine {
       summary: summaryMatch[1].trim(),
       keywords,
       toneTag: toneMatch?.[1]?.trim() || "neutral",
+      constraints: [],
+      decisions: [],
+      blockers: [],
+      exactFacts: [],
     };
   }
 
@@ -314,6 +472,10 @@ export class CompactionEngine {
       summary: content,
       keywords,
       toneTag: "neutral",
+      constraints,
+      decisions,
+      blockers,
+      exactFacts,
     };
   }
 
@@ -379,6 +541,46 @@ export class CompactionEngine {
       }
     }
     return maxClosedTurn;
+  }
+
+  private normalizeThresholdRatio(value: number, fallback: number): number {
+    return Number.isFinite(value) && value > 0 && value < 1 ? value : fallback;
+  }
+
+  private getCompactionPressureTokens(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+  ): number {
+    const allMessages = rawStore.getAll();
+    const lastClosedTurn = this.resolveLastClosedTurn(allMessages);
+    if (lastClosedTurn <= 0) {
+      return 0;
+    }
+
+    const coveredTurns = summaryStore.getCoveredTurns();
+    const uncompacted = rawStore
+      .getUncompactedMessages()
+      .filter(
+        (message) =>
+          message.turnNumber <= lastClosedTurn &&
+          !coveredTurns.has(message.turnNumber),
+      );
+
+    if (uncompacted.length === 0) {
+      return 0;
+    }
+
+    const protectedTurns = this.selectProtectedTailTurns(
+      uncompacted,
+      freshTailTokens,
+      maxFreshTailTurns,
+    );
+
+    return uncompacted.reduce((sum, message) => {
+      return protectedTurns.has(message.turnNumber) ? sum : sum + message.tokenCount;
+    }, 0);
   }
 
   private selectProtectedTailTurns(

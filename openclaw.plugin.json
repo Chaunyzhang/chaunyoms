@@ -4,6 +4,26 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": true,
-    "properties": {}
+    "properties": {
+      "dataDir": { "type": "string" },
+      "workspaceDir": { "type": "string" },
+      "sharedDataDir": { "type": "string" },
+      "knowledgeBaseDir": { "type": "string" },
+      "enableTools": { "type": "boolean" },
+      "contextWindow": { "type": "number" },
+      "contextThreshold": { "type": "number" },
+      "strictCompaction": { "type": "boolean" },
+      "compactionBarrierEnabled": { "type": "boolean" },
+      "freshTailTokens": { "type": "number" },
+      "maxFreshTailTurns": { "type": "number" },
+      "compactionBatchTurns": { "type": "number" },
+      "summaryModel": { "type": "string" },
+      "summaryMaxOutputTokens": { "type": "number" },
+      "runtimeCaptureEnabled": { "type": "boolean" },
+      "durableMemoryEnabled": { "type": "boolean" },
+      "autoRecallEnabled": { "type": "boolean" },
+      "knowledgePromotionEnabled": { "type": "boolean" },
+      "emergencyBrake": { "type": "boolean" }
+    }
   }
 }

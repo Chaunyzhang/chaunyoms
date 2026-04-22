@@ -13,6 +13,7 @@ export interface ToolConfigResult {
 
 export interface RuntimeMessageSnapshot {
   id?: string;
+  sourceKey: string;
   role: RawMessage["role"];
   content: unknown;
   text: string;
@@ -185,16 +186,80 @@ export class OpenClawPayloadAdapter {
       this.getApi()?.config ??
       {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
+
+    const emergencyBrake = this.resolveBooleanFlag(
+      [
+        pluginConfig.emergencyBrake,
+        pluginConfig.memoryEmergencyBrake,
+        pluginConfig.memoryEmergencyStop,
+        pluginConfig.isolationMode,
+      ],
+      baseConfig.emergencyBrake,
+    );
+
+    const runtimeCaptureEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.runtimeCaptureEnabled,
+            this.inverseBoolean(pluginConfig.pauseRuntimeCapture),
+            this.inverseBoolean(pluginConfig.stopRuntimeCapture),
+          ],
+          baseConfig.runtimeCaptureEnabled,
+        );
+
+    const durableMemoryEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.durableMemoryEnabled,
+            this.inverseBoolean(pluginConfig.stopDurableWrites),
+            this.inverseBoolean(pluginConfig.pauseDurableMemory),
+          ],
+          baseConfig.durableMemoryEnabled,
+        );
+
+    const autoRecallEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.autoRecallEnabled,
+            this.inverseBoolean(pluginConfig.disableAutoRecall),
+            this.inverseBoolean(pluginConfig.stopAutoRecall),
+          ],
+          baseConfig.autoRecallEnabled,
+        );
+
+    const knowledgePromotionEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.knowledgePromotionEnabled,
+            this.inverseBoolean(pluginConfig.disableKnowledgePromotion),
+            this.inverseBoolean(pluginConfig.stopKnowledgePromotion),
+          ],
+          baseConfig.knowledgePromotionEnabled,
+        );
+
+    const workspaceDir = pluginConfig.workspaceDir ?? baseConfig.workspaceDir;
+    const knowledgeBaseDir =
+      pluginConfig.knowledgeBaseDir ??
+      pluginConfig.knowledgeDir ??
+      path.join(workspaceDir, "knowledge-base");
+
     return {
       dataDir: pluginConfig.dataDir ?? baseConfig.dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
-      workspaceDir: pluginConfig.workspaceDir ?? baseConfig.workspaceDir,
+      workspaceDir,
       sharedDataDir: pluginConfig.sharedDataDir ?? baseConfig.sharedDataDir,
+      knowledgeBaseDir,
       contextWindow: Number(
         pluginConfig.contextWindow ?? payload?.contextWindow ?? baseConfig.contextWindow,
       ),
       contextThreshold: Number(
-        pluginConfig.contextThreshold ?? baseConfig.contextThreshold,
+        pluginConfig.contextThreshold ??
+          pluginConfig.compactionTriggerRatio ??
+          baseConfig.contextThreshold,
       ),
       freshTailTokens: Number(
         pluginConfig.freshTailTokens ??
@@ -212,9 +277,39 @@ export class OpenClawPayloadAdapter {
         pluginConfig.summaryModel.trim().length > 0
           ? pluginConfig.summaryModel
           : undefined,
+      knowledgePromotionModel:
+        typeof pluginConfig.knowledgePromotionModel === "string" &&
+        pluginConfig.knowledgePromotionModel.trim().length > 0
+          ? pluginConfig.knowledgePromotionModel
+          : typeof pluginConfig.knowledgeModel === "string" &&
+              pluginConfig.knowledgeModel.trim().length > 0
+            ? pluginConfig.knowledgeModel
+            : undefined,
       summaryMaxOutputTokens: Number(
         pluginConfig.summaryMaxOutputTokens ?? baseConfig.summaryMaxOutputTokens,
       ),
+      strictCompaction: this.resolveBooleanFlag(
+        [
+          pluginConfig.strictCompaction,
+          pluginConfig.requireLlmSummary,
+          this.inverseBoolean(pluginConfig.allowFallbackSummary),
+          this.inverseBoolean(pluginConfig.enableFallbackSummary),
+        ],
+        baseConfig.strictCompaction,
+      ),
+      compactionBarrierEnabled: this.resolveBooleanFlag(
+        [
+          pluginConfig.compactionBarrierEnabled,
+          pluginConfig.compressBeforeAssemble,
+          this.inverseBoolean(pluginConfig.disableCompactionBarrier),
+        ],
+        baseConfig.compactionBarrierEnabled,
+      ),
+      runtimeCaptureEnabled,
+      durableMemoryEnabled,
+      autoRecallEnabled,
+      knowledgePromotionEnabled,
+      emergencyBrake,
     };
   }
 
@@ -323,6 +418,7 @@ export class OpenClawPayloadAdapter {
     }
 
     const allowedRoles = new Set(["system", "user", "assistant", "tool"]);
+    const occurrenceCounts = new Map<string, number>();
     return messages
       .filter(
         (message): message is Record<string, unknown> =>
@@ -332,29 +428,160 @@ export class OpenClawPayloadAdapter {
           allowedRoles.has(String(message.role)) &&
           "content" in message,
       )
-      .map((message) => ({
-        id:
-          typeof message.id === "string" && message.id.trim().length > 0
-            ? message.id
-            : undefined,
-        role: message.role as RawMessage["role"],
-        content: message.content,
-        text: this.extractTextFromContent(message.content).trim(),
-        ...(typeof message.metadata === "object" &&
-        message.metadata &&
-        !Array.isArray(message.metadata)
-          ? { metadata: message.metadata as Record<string, unknown> }
-          : {}),
-        ...(typeof message.timestamp === "number"
-          ? { timestamp: message.timestamp }
-          : typeof message.createdAt === "string"
-            ? { timestamp: message.createdAt }
+      .map((message) => {
+        const role = message.role as RawMessage["role"];
+        const text = this.normalizeRuntimeMessageText(
+          this.extractTextFromContent(message.content),
+        );
+        const occurrenceKey = `${role}:${this.normalizeWhitespace(text)}`;
+        const occurrenceIndex = (occurrenceCounts.get(occurrenceKey) ?? 0) + 1;
+        occurrenceCounts.set(occurrenceKey, occurrenceIndex);
+
+        const mergedMetadata = this.mergeRuntimeMetadata(message);
+        return {
+          sourceKey: this.resolveRuntimeMessageSourceKey(
+            message,
+            role,
+            text,
+            occurrenceIndex,
+          ),
+          id:
+            typeof message.id === "string" && message.id.trim().length > 0
+              ? message.id
+              : undefined,
+          role,
+          content: message.content,
+          text,
+          ...(Object.keys(mergedMetadata).length > 0
+            ? { metadata: mergedMetadata }
             : {}),
-      }));
+          ...(typeof message.timestamp === "number"
+            ? { timestamp: message.timestamp }
+            : typeof message.createdAt === "string"
+              ? { timestamp: message.createdAt }
+              : {}),
+        };
+      });
+  }
+
+  private mergeRuntimeMetadata(
+    message: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const metadata: Record<string, unknown> =
+      typeof message.metadata === "object" && message.metadata && !Array.isArray(message.metadata)
+        ? { ...(message.metadata as Record<string, unknown>) }
+        : {};
+
+    const envelopeKeys = [
+      "type",
+      "kind",
+      "origin",
+      "source",
+      "channel",
+      "visibility",
+      "name",
+      "subtype",
+      "internal",
+      "hidden",
+      "ephemeral",
+      "controlPlane",
+      "hostGenerated",
+      "persist",
+      "status",
+    ] as const;
+
+    for (const key of envelopeKeys) {
+      const value = message[key];
+      if (value !== undefined && metadata[key] === undefined) {
+        metadata[key] = value;
+      }
+    }
+
+    return metadata;
+  }
+
+  private resolveRuntimeMessageSourceKey(
+    message: Record<string, unknown>,
+    role: RawMessage["role"],
+    text: string,
+    occurrenceIndex: number,
+  ): string {
+    const explicitId =
+      typeof message.id === "string" && message.id.trim().length > 0
+        ? message.id.trim()
+        : null;
+    if (explicitId) {
+      return `id:${explicitId}`;
+    }
+
+    return `derived:${role}:${occurrenceIndex}:${this.buildStableDigest(this.normalizeWhitespace(text))}`;
+  }
+
+  private buildStableDigest(text: string): string {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+
+  private normalizeRuntimeMessageText(text: string): string {
+    let normalized = text.trim();
+    const metadataPrefix =
+      /^(?:conversation|message)\s+info\s*\(untrusted metadata\):\s*```(?:json)?\s*[\s\S]*?```\s*/i;
+
+    while (normalized.length > 0) {
+      const stripped = normalized.replace(metadataPrefix, "").trim();
+      if (stripped === normalized) {
+        break;
+      }
+      normalized = stripped;
+    }
+
+    return normalized;
+  }
+
+  private normalizeWhitespace(text: string): string {
+    return text.replace(/\s+/g, " ").trim();
   }
 
   private estimateTokens(text: string): number {
     return Math.max(Math.ceil(text.length / 4), 1);
+  }
+
+  private resolveBooleanFlag(candidates: unknown[], fallback: boolean): boolean {
+    for (const candidate of candidates) {
+      if (typeof candidate === "boolean") {
+        return candidate;
+      }
+      if (typeof candidate === "string") {
+        const normalized = candidate.trim().toLowerCase();
+        if (["true", "1", "yes", "on", "enabled"].includes(normalized)) {
+          return true;
+        }
+        if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
+          return false;
+        }
+      }
+    }
+    return fallback;
+  }
+
+  private inverseBoolean(value: unknown): boolean | undefined {
+    if (typeof value === "boolean") {
+      return !value;
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["true", "1", "yes", "on", "enabled"].includes(normalized)) {
+        return false;
+      }
+      if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
+        return true;
+      }
+    }
+    return undefined;
   }
 
   private readEnableToolsFromOpenClawConfig(): unknown {
@@ -374,3 +601,4 @@ export class OpenClawPayloadAdapter {
     }
   }
 }
+
