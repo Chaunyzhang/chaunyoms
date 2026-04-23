@@ -16,6 +16,7 @@ Lightweight OMS context-engine plugin for OpenClaw.
   - trigger threshold: `0.70`
   - LLM summary required
   - summary / rollup / knowledge promotion are LLM-only paths
+  - bare host model ids such as `gpt-5.4` are normalized against configured provider-scoped refs when possible
 - This avoids the MiniMax Anthropic-compatible `tool call id is invalid (2013)` failure we reproduced during direct activation.
 - knowledge promotion is present in code but **disabled by default**.
 

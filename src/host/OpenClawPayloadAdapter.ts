@@ -455,23 +455,66 @@ export class OpenClawPayloadAdapter {
       return config.summaryModel;
     }
 
-    if (typeof payload?.model === "string" && payload.model.trim()) {
-      return payload.model;
+    const payloadModel = this.resolveModelRefCandidate(payload?.model);
+    if (payloadModel) {
+      return payloadModel;
     }
 
     const contextModel = this.getApi()?.context?.model;
-    if (typeof contextModel === "string" && contextModel.trim()) {
-      return contextModel;
-    }
-
-    if (
-      typeof contextModel?.id === "string" &&
-      contextModel.id.trim().length > 0
-    ) {
-      return contextModel.id;
+    const contextModelRef = this.resolveModelRefCandidate(contextModel);
+    if (contextModelRef) {
+      return contextModelRef;
     }
 
     return undefined;
+  }
+
+  private resolveModelRefCandidate(value: unknown): string | undefined {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+
+    if (!value || typeof value !== "object") {
+      return undefined;
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const directRefCandidates = [
+      candidate.ref,
+      candidate.modelRef,
+      candidate.fullRef,
+      candidate.name,
+    ];
+    for (const directRef of directRefCandidates) {
+      if (
+        typeof directRef === "string" &&
+        directRef.trim().length > 0 &&
+        directRef.includes("/")
+      ) {
+        return directRef.trim();
+      }
+    }
+
+    const provider =
+      typeof candidate.provider === "string" && candidate.provider.trim().length > 0
+        ? candidate.provider.trim()
+        : typeof candidate.providerId === "string" && candidate.providerId.trim().length > 0
+          ? candidate.providerId.trim()
+          : undefined;
+    const modelId =
+      typeof candidate.id === "string" && candidate.id.trim().length > 0
+        ? candidate.id.trim()
+        : typeof candidate.model === "string" && candidate.model.trim().length > 0
+          ? candidate.model.trim()
+          : typeof candidate.name === "string" && candidate.name.trim().length > 0
+            ? candidate.name.trim()
+            : undefined;
+
+    if (provider && modelId) {
+      return `${provider}/${modelId}`;
+    }
+
+    return modelId;
   }
 
   private extractRuntimeMessages(payload: any): RuntimeMessageSnapshot[] {

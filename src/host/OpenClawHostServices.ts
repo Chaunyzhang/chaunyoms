@@ -235,28 +235,33 @@ export class OpenClawLlmCaller implements LlmCaller {
     params: LlmCallParams,
   ): string | null {
     const requested = this.resolveRequestedModelRef(params);
+    const configuredModelRefs = this.collectConfiguredModelRefs(apiConfig);
+    const defaultModelRef = this.resolveDefaultModelRef(apiConfig);
     const candidates = [
       requested,
-      this.resolveDefaultModelRef(apiConfig),
+      defaultModelRef,
       ...this.resolveFallbackModelRefs(apiConfig),
+      ...configuredModelRefs,
     ].filter((value, index, list): value is string =>
       typeof value === "string" &&
       value.trim().length > 0 &&
       list.indexOf(value) === index,
     );
 
-    for (const candidate of candidates) {
-      const providerId = this.resolveProviderId(candidate);
-      if (!providerId) {
-        continue;
-      }
-      const providerConfig = apiConfig?.models?.providers?.[providerId];
-      if (providerConfig && typeof providerConfig === "object") {
-        return candidate;
-      }
+    const requestedMatch = this.resolveRequestedConfiguredModelRef(
+      requested,
+      configuredModelRefs,
+      defaultModelRef,
+      apiConfig,
+    );
+    if (requestedMatch) {
+      return requestedMatch;
     }
 
-    return candidates[0] ?? null;
+    const firstConfigured = candidates.find((candidate) =>
+      this.hasConfiguredProvider(apiConfig, candidate),
+    );
+    return firstConfigured ?? candidates[0] ?? null;
   }
 
   private resolveRequestedModelRef(params: LlmCallParams): string | null {
@@ -284,12 +289,83 @@ export class OpenClawLlmCaller implements LlmCaller {
       .filter(Boolean);
   }
 
+  private collectConfiguredModelRefs(apiConfig: any): string[] {
+    const declaredRefs = apiConfig?.agents?.defaults?.models;
+    const refs = declaredRefs && typeof declaredRefs === "object"
+      ? Object.keys(declaredRefs)
+      : [];
+    return refs
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
   private resolveProviderId(modelRef: string): string | null {
     const slashIndex = modelRef.indexOf("/");
     if (slashIndex <= 0) {
       return null;
     }
     return modelRef.slice(0, slashIndex);
+  }
+
+  private stripProviderId(modelRef: string): string {
+    const slashIndex = modelRef.indexOf("/");
+    return slashIndex <= 0 ? modelRef.trim() : modelRef.slice(slashIndex + 1).trim();
+  }
+
+  private hasConfiguredProvider(apiConfig: any, modelRef: string): boolean {
+    const providerId = this.resolveProviderId(modelRef);
+    if (!providerId) {
+      return false;
+    }
+    const providerConfig = apiConfig?.models?.providers?.[providerId];
+    return Boolean(providerConfig && typeof providerConfig === "object");
+  }
+
+  private resolveRequestedConfiguredModelRef(
+    requested: string | null,
+    configuredModelRefs: string[],
+    defaultModelRef: string | null,
+    apiConfig: any,
+  ): string | null {
+    if (!requested) {
+      return null;
+    }
+
+    if (this.hasConfiguredProvider(apiConfig, requested)) {
+      return requested;
+    }
+
+    const requestedModelId = this.stripProviderId(requested);
+    if (defaultModelRef &&
+      this.stripProviderId(defaultModelRef) === requestedModelId &&
+      this.hasConfiguredProvider(apiConfig, defaultModelRef)
+    ) {
+      return defaultModelRef;
+    }
+
+    const matchingConfiguredRefs = configuredModelRefs.filter(
+      (candidate) =>
+        this.stripProviderId(candidate) === requestedModelId &&
+        this.hasConfiguredProvider(apiConfig, candidate),
+    );
+    if (matchingConfiguredRefs.length > 0) {
+      return matchingConfiguredRefs[0];
+    }
+
+    const configuredProviderIds = Object.keys(apiConfig?.models?.providers ?? {})
+      .filter((providerId) => providerId.trim().length > 0);
+    const inferredProviderId =
+      this.resolveProviderId(defaultModelRef ?? "") ??
+      (configuredProviderIds.length === 1 ? configuredProviderIds[0] : null);
+    if (inferredProviderId) {
+      const inferredRef = `${inferredProviderId}/${requestedModelId}`;
+      if (this.hasConfiguredProvider(apiConfig, inferredRef)) {
+        return inferredRef;
+      }
+    }
+
+    return null;
   }
 
   private resolveConfiguredBaseUrl(providerConfig: any): string | null {
