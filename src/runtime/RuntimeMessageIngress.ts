@@ -115,7 +115,26 @@ export class RuntimeMessageIngress {
   }
 
   private normalize(text: string): string {
-    return text.replace(/\s+/g, " ").trim();
+    return this.stripHostMetadataEnvelope(text)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private stripHostMetadataEnvelope(text: string): string {
+    let normalized = text;
+    normalized = normalized.replace(
+      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*```json[\s\S]*?```\s*/i,
+      "",
+    );
+    normalized = normalized.replace(
+      /^\[[^\]\r\n]{0,80}\]\s*/i,
+      "",
+    );
+    normalized = normalized.replace(
+      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*/i,
+      "",
+    );
+    return normalized;
   }
 
   private looksLikeWrapperOnly(text: string): boolean {
