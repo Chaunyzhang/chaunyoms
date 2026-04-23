@@ -478,7 +478,9 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
     try {
       const raw = await readFile(this.documentIndexPath, "utf8");
       const parsed = JSON.parse(raw) as KnowledgeDocumentIndexFileV1;
-      return Array.isArray(parsed.documents) ? parsed.documents : [];
+      return Array.isArray(parsed.documents)
+        ? this.normalizeDocuments(parsed.documents)
+        : [];
     } catch {
       const docs = await this.rebuildDocumentsFromFilesystem();
       this.documents = docs;
@@ -589,7 +591,11 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         linkedSummaryIds: this.uniqueStrings(entry.linkedSummaryIds ?? []),
         sourceRefs: this.uniqueStrings(entry.sourceRefs ?? []),
         origin: entry.origin ?? "synthesized",
-        versions: [...entry.versions].sort((a, b) => a.version - b.version),
+        updatedAt:
+          typeof entry.updatedAt === "string" && entry.updatedAt.trim().length > 0
+            ? entry.updatedAt
+            : new Date(0).toISOString(),
+        versions: [...(entry.versions ?? [])].sort((a, b) => a.version - b.version),
       }))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
