@@ -57,6 +57,13 @@ export class DurableMemoryStore {
     return added;
   }
 
+  async replaceAll(entries: DurableMemoryEntry[]): Promise<void> {
+    this.memories = entries
+      .map((entry) => this.normalizeEntry(entry))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    await this.flush();
+  }
+
   search(query: string, limit = 5): DurableMemoryEntry[] {
     const terms = query
       .toLowerCase()

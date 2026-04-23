@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+﻿import { createHash } from "node:crypto";
 
 import { ProjectStateSnapshot, RawMessage, SummaryEntry } from "../types";
 
@@ -13,17 +13,21 @@ const DEFAULT_TEXT = "general-workstream";
 const STOPWORDS = new Set([
   "the", "and", "with", "that", "this", "from", "have", "will", "into", "about",
   "your", "just", "they", "them", "then", "than", "what", "when", "where", "which",
-  "当前", "这个", "那个", "然后", "已经", "需要", "一下", "我们", "你们", "他们", "现在",
+  "current", "project", "task", "work", "need", "please", "have", "been",
+  "当前", "这个", "那个", "然后", "已经", "需要", "一下", "我们", "你们", "他们", "现在", "项目", "任务", "工作",
 ]);
+
+const EXPLICIT_PROJECT_PATTERNS = [
+  /\bproject\s+([a-z0-9][a-z0-9_-]{1,40})\b/i,
+  /\bfor\s+([a-z0-9][a-z0-9_-]{1,40})\s+project\b/i,
+  /(?:项目|工程|计划)\s*[:：-]?\s*([a-z0-9\u4e00-\u9fff][a-z0-9_\-\u4e00-\u9fff]{1,40})/i,
+];
 
 export function deriveProjectIdentityFromMessages(
   messages: RawMessage[],
   fallbackScope: string,
 ): ProjectIdentity {
-  const candidates = messages
-    .map((message) => message.content)
-    .filter(Boolean)
-    .slice(-4);
+  const candidates = messages.map((message) => message.content).filter(Boolean).slice(-6);
   return deriveProjectIdentityFromText(candidates, fallbackScope);
 }
 
@@ -57,10 +61,10 @@ export function deriveProjectStatusFromSnapshot(
   snapshot: Pick<ProjectStateSnapshot, "blocker" | "risk" | "todo" | "next" | "active">,
 ): "active" | "blocked" | "planned" | "archived" {
   const blockerText = `${snapshot.blocker} ${snapshot.risk}`.toLowerCase();
-  if (/(block|risk|error|fail|issue|阻塞|失败|风险)/i.test(blockerText) && !/none recorded/i.test(blockerText)) {
+  if (/(block|risk|error|fail|issue|阻塞|失败|风险|报错|卡住)/i.test(blockerText) && !/none recorded/i.test(blockerText)) {
     return "blocked";
   }
-  if (/(todo|next|plan|pending|待办|下一步)/i.test(`${snapshot.todo} ${snapshot.next}`)) {
+  if (/(todo|next|plan|pending|待办|下一步|计划)/i.test(`${snapshot.todo} ${snapshot.next}`)) {
     return "planned";
   }
   if (!snapshot.active || /none recorded/i.test(snapshot.active)) {
@@ -78,9 +82,10 @@ export function deriveProjectIdentityFromText(
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
-  const informative = extractInformativeText(combined) || fallbackScope || DEFAULT_TEXT;
+  const explicit = extractExplicitProjectName(combined);
+  const informative = explicit || extractInformativeText(combined) || fallbackScope || DEFAULT_TEXT;
   const canonicalKey = slugify(informative) || slugify(fallbackScope) || DEFAULT_TEXT;
-  const title = toTitle(informative);
+  const title = toTitle(explicit ?? informative);
   return {
     projectId: `project-${canonicalKey}`,
     topicId: `topic-${canonicalKey}`,
@@ -91,6 +96,16 @@ export function deriveProjectIdentityFromText(
 
 export function buildStableEventId(scope: string, input: string): string {
   return `${scope}-${createHash("sha256").update(input, "utf8").digest("hex").slice(0, 20)}`;
+}
+
+function extractExplicitProjectName(input: string): string {
+  for (const pattern of EXPLICIT_PROJECT_PATTERNS) {
+    const match = input.match(pattern);
+    if (match?.[1]) {
+      return match[1].replace(/[_-]+/g, " ").trim();
+    }
+  }
+  return "";
 }
 
 function extractInformativeText(input: string): string {

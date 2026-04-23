@@ -76,6 +76,7 @@ export interface DurableMemoryEntry {
 export interface DurableMemoryRepository {
   init(): Promise<void>;
   addEntries(entries: DurableMemoryEntry[]): Promise<number>;
+  replaceAll(entries: DurableMemoryEntry[]): Promise<void>;
   search(query: string, limit?: number): DurableMemoryEntry[];
   getAll(): DurableMemoryEntry[];
   count(): number;
@@ -162,6 +163,7 @@ export interface ProjectRecord {
 export interface ProjectRegistryRepository {
   init(): Promise<void>;
   upsert(project: ProjectRecord): Promise<ProjectRecord>;
+  reconcileProjects(projects: ProjectRecord[]): Promise<void>;
   getAll(): ProjectRecord[];
   findById(id: string): ProjectRecord | null;
   findByCanonicalKey(canonicalKey: string): ProjectRecord | null;
@@ -378,8 +380,10 @@ export interface ProjectStateSnapshot {
 
 export type RetrievalRoute =
   | "recent_tail"
+  | "project_registry"
+  | "durable_memory"
+  | "summary_tree"
   | "navigation"
-  | "dag"
   | "shared_insights"
   | "knowledge_base"
   | "vector_search";
@@ -390,4 +394,8 @@ export interface RetrievalDecision {
   requiresEmbeddings: boolean;
   requiresSourceRecall: boolean;
   canAnswerDirectly: boolean;
+  routePlan: RetrievalRoute[];
+  explanation: string;
+  matchedProjectId?: string;
+  matchedProjectTitle?: string;
 }

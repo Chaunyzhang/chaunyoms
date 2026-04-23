@@ -4,7 +4,7 @@ import path from "node:path";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
 import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
-import { ContextItem, DurableMemoryEntry, FixedPrefixProvider, NavigationRepository, RetrievalDecision } from "../types";
+import { ContextItem, DurableMemoryEntry, FixedPrefixProvider, NavigationRepository, ProjectRecord, RetrievalDecision } from "../types";
 import {
   LifecycleContext,
   OpenClawPayloadAdapter,
@@ -55,6 +55,10 @@ export class ChaunyomsRetrievalService {
               requiresEmbeddings: decision.requiresEmbeddings,
               requiresSourceRecall: decision.requiresSourceRecall,
               canAnswerDirectly: decision.canAnswerDirectly,
+              routePlan: decision.routePlan,
+              explanation: decision.explanation,
+              matchedProjectId: decision.matchedProjectId ?? null,
+              matchedProjectTitle: decision.matchedProjectTitle ?? null,
               shouldAutoRecall: this.shouldAutoRecall(decision, context),
               autoRecallReason: this.explainAutoRecall(decision, context),
               promptForApi,
@@ -72,7 +76,11 @@ export class ChaunyomsRetrievalService {
         ok: true,
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
         retrievalHitType: this.getRetrievalHitType(decision),
+        matchedProjectId: decision.matchedProjectId ?? null,
+        matchedProjectTitle: decision.matchedProjectTitle ?? null,
         shouldAutoRecall: this.shouldAutoRecall(decision, context),
         autoRecallReason: this.explainAutoRecall(decision, context),
         promptForApi,
@@ -113,13 +121,15 @@ export class ChaunyomsRetrievalService {
         consumedTokens: result.consumedTokens,
         hitCount: result.items.length,
         retrievalHitType: this.getRetrievalHitType(decision),
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
       },
     };
   }
 
   async executeMemoryRetrieve(args: any): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const { rawStore, summaryStore, durableMemoryStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore, projectStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
@@ -131,8 +141,33 @@ export class ChaunyomsRetrievalService {
       return this.buildEmbeddingsPromptResponse(decision);
     }
 
-    if ((decision.requiresSourceRecall || decision.route === "dag") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
+    if ((decision.requiresSourceRecall || decision.route === "summary_tree") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
       return this.buildRecallDisabledResponse(query, durableHits, context, decision);
+    }
+
+    if (decision.route === "project_registry") {
+      const project = this.matchProject(query, projectStore.getAll());
+      return this.buildProjectRegistryResult(project, decision, query);
+    }
+
+    if (decision.route === "durable_memory" && durableHits.length > 0) {
+      return {
+        content: [{ type: "text", text: this.formatDurableMemoryText(query, durableHits) }],
+        details: {
+          ok: true,
+          route: decision.route,
+          routePlan: decision.routePlan,
+          explanation: decision.explanation,
+          retrievalLabel: this.describeRetrievalRoute(decision),
+          query,
+          hitCount: durableHits.length,
+          retrievalHitType: "durable_memory",
+          autoRecall: false,
+          autoRecallReason: null,
+          matchedProjectId: decision.matchedProjectId ?? null,
+          matchedProjectTitle: decision.matchedProjectTitle ?? null,
+        },
+      };
     }
 
     if (this.shouldAutoRecall(decision, context)) {
@@ -151,12 +186,14 @@ export class ChaunyomsRetrievalService {
           query,
           consumedTokens: result.consumedTokens,
           hitCount: result.items.length,
-          retrievalHitType: "dag_recall",
-          autoRecall: true,
-          autoRecallReason: this.explainAutoRecall(decision, context),
-        },
-      };
-    }
+            retrievalHitType: "summary_tree_recall",
+            autoRecall: true,
+            autoRecallReason: this.explainAutoRecall(decision, context),
+            routePlan: decision.routePlan,
+            explanation: decision.explanation,
+          },
+        };
+      }
 
     if (decision.route === "navigation") {
       const hit = await this.navigationRepository.getNavigationStateHit(
@@ -192,12 +229,14 @@ export class ChaunyomsRetrievalService {
             route: decision.route,
             retrievalLabel: this.describeRetrievalRoute(decision),
             query,
-            retrievalHitType: "vector_retrieval",
-            autoRecall: false,
-            autoRecallReason: null,
-            source: vector.source,
-            score: vector.score ?? null,
-          },
+          retrievalHitType: "vector_retrieval",
+          autoRecall: false,
+          autoRecallReason: null,
+          routePlan: decision.routePlan,
+          explanation: decision.explanation,
+          source: vector.source,
+          score: vector.score ?? null,
+        },
         };
       }
     }
@@ -214,6 +253,8 @@ export class ChaunyomsRetrievalService {
           retrievalHitType: "durable_memory",
           autoRecall: false,
           autoRecallReason: null,
+          routePlan: decision.routePlan,
+          explanation: decision.explanation,
         },
       };
     }
@@ -230,6 +271,8 @@ export class ChaunyomsRetrievalService {
         consumedTokens: result.consumedTokens,
         hitCount: result.items.length,
         retrievalHitType: this.getRetrievalHitType(decision),
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
       },
     };
   }
@@ -258,7 +301,7 @@ export class ChaunyomsRetrievalService {
     context: LifecycleContext,
   ): Promise<{ decision: RetrievalDecision; promptForApi: boolean }> {
     const memorySearchEnabled = this.payloadAdapter.hasEmbeddingsRetrievalReady();
-    const { rawStore, summaryStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore, projectStore } = await this.runtime.getSessionStores(context);
     const [hasTopicIndexHit, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
       await Promise.all([
         this.fixedPrefixProvider.hasKnowledgeBaseTopicHit(
@@ -277,6 +320,8 @@ export class ChaunyomsRetrievalService {
           context.config.workspaceDir,
         ),
       ]);
+    const projects = projectStore.getAll().filter((project) => project.status !== "archived");
+    const matchedProject = this.matchProject(query, projects);
     const decision = this.retrievalRouter.decide(query, {
       memorySearchEnabled,
       hasTopicIndexHit,
@@ -284,9 +329,13 @@ export class ChaunyomsRetrievalService {
       hasNavigationHint,
       hasStructuredNavigationState,
       hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
+      hasProjectRegistry: projects.length > 0,
+      hasDurableHits: durableMemoryStore.search(query, 3).length > 0,
       recentAssistantUncertainty: this.hasRecentAssistantUncertainty(rawStore),
       queryComplexity: this.classifyQueryComplexity(query),
       referencesCurrentWork: this.referencesCurrentWork(query),
+      matchedProjectId: matchedProject?.id,
+      matchedProjectTitle: matchedProject?.title,
     });
     return {
       decision,
@@ -389,6 +438,8 @@ export class ChaunyomsRetrievalService {
         promptForApi: true,
         requiresEmbeddings: true,
         retrievalHitType: this.getRetrievalHitType(decision),
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
       },
     };
   }
@@ -415,6 +466,8 @@ export class ChaunyomsRetrievalService {
         autoRecallReason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
         emergencyBrake: context.config.emergencyBrake,
         autoRecallEnabled: context.config.autoRecallEnabled,
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
       },
     };
   }
@@ -551,7 +604,7 @@ export class ChaunyomsRetrievalService {
     if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
       return false;
     }
-    return decision.requiresSourceRecall || decision.route === "dag";
+    return decision.requiresSourceRecall || decision.route === "summary_tree";
   }
 
   private explainAutoRecall(decision: RetrievalDecision, context: LifecycleContext): string | null {
@@ -567,15 +620,21 @@ export class ChaunyomsRetrievalService {
     if (decision.requiresSourceRecall) {
       return "fact_or_constraint_query_requires_source_recall";
     }
-    if (decision.route === "dag") {
-      return "historical_dialog_route_requires_recall";
+    if (decision.route === "summary_tree") {
+      return "historical_summary_tree_route_requires_recall";
     }
     return "route_policy_requires_recall";
   }
 
   private getRetrievalHitType(
     decision: RetrievalDecision,
-  ): "route_hit" | "dag_recall" | "vector_retrieval" | "recent_tail" {
+  ): "route_hit" | "summary_tree_recall" | "vector_retrieval" | "recent_tail" | "project_registry" | "durable_memory" {
+    if (decision.route === "project_registry") {
+      return "project_registry";
+    }
+    if (decision.route === "durable_memory") {
+      return "durable_memory";
+    }
     if (
       decision.route === "navigation" ||
       decision.route === "shared_insights" ||
@@ -583,8 +642,8 @@ export class ChaunyomsRetrievalService {
     ) {
       return "route_hit";
     }
-    if (decision.route === "dag") {
-      return "dag_recall";
+    if (decision.route === "summary_tree") {
+      return "summary_tree_recall";
     }
     if (decision.route === "vector_search") {
       return "vector_retrieval";
@@ -596,10 +655,14 @@ export class ChaunyomsRetrievalService {
     switch (decision.route) {
       case "recent_tail":
         return "recent-tail direct context";
+      case "project_registry":
+        return "project registry state";
+      case "durable_memory":
+        return "durable memory";
+      case "summary_tree":
+        return "summary tree -> raw recall";
       case "navigation":
         return "navigation route hit";
-      case "dag":
-        return "oms DAG/source recall";
       case "shared_insights":
         return "shared-insights route hit";
       case "knowledge_base":
@@ -609,6 +672,82 @@ export class ChaunyomsRetrievalService {
       default:
         return decision.route;
     }
+  }
+
+  private buildProjectRegistryResult(
+    project: ProjectRecord | null,
+    decision: RetrievalDecision,
+    query: string,
+  ): ToolResponse {
+    const text = project
+      ? [
+          `Project: ${project.title}`,
+          `Status: ${project.status}`,
+          `Summary: ${project.summary}`,
+          `Active focus: ${project.activeFocus}`,
+          `Current decision: ${project.currentDecision}`,
+          `Next step: ${project.nextStep}`,
+          `Todo: ${project.todo}`,
+          `Blocker: ${project.blocker}`,
+          `Risk: ${project.risk}`,
+        ].join("\n")
+      : `No matching project registry entry found for query: ${query}`;
+
+    return {
+      content: [{ type: "text", text }],
+      details: {
+        ok: true,
+        route: decision.route,
+        retrievalLabel: this.describeRetrievalRoute(decision),
+        query,
+        retrievalHitType: "project_registry",
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
+        matchedProjectId: project?.id ?? decision.matchedProjectId ?? null,
+        matchedProjectTitle: project?.title ?? decision.matchedProjectTitle ?? null,
+        autoRecall: false,
+        autoRecallReason: null,
+      },
+    };
+  }
+
+  private matchProject(query: string, projects: ProjectRecord[]): ProjectRecord | null {
+    const terms = query
+      .toLowerCase()
+      .split(/[^a-z0-9\u4e00-\u9fff]+/i)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2);
+    if (terms.length === 0) {
+      return projects[0] ?? null;
+    }
+
+    let best: { project: ProjectRecord; score: number } | null = null;
+    for (const project of projects) {
+      const haystack = [
+        project.title,
+        project.canonicalKey,
+        project.summary,
+        project.activeFocus,
+        ...project.tags,
+        ...project.topicIds,
+      ].join(" ").toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (haystack.includes(term)) {
+          score += term.length >= 6 ? 3 : 2;
+        }
+      }
+      if (project.title && query.toLowerCase().includes(project.title.toLowerCase())) {
+        score += 6;
+      }
+      if (score <= 0) {
+        continue;
+      }
+      if (!best || score > best.score) {
+        best = { project, score };
+      }
+    }
+    return best?.project ?? null;
   }
 
   private buildRouteHitResult(
@@ -632,6 +771,10 @@ export class ChaunyomsRetrievalService {
         retrievalHitType: "route_hit",
         autoRecall: false,
         autoRecallReason: null,
+        routePlan: decision.routePlan,
+        explanation: decision.explanation,
+        matchedProjectId: decision.matchedProjectId ?? null,
+        matchedProjectTitle: decision.matchedProjectTitle ?? null,
       },
     };
   }

@@ -65,6 +65,45 @@ export class ProjectRegistryStore implements ProjectRegistryRepository {
     return this.findById(normalized.id) ?? normalized;
   }
 
+  async reconcileProjects(projects: ProjectRecord[]): Promise<void> {
+    const nextProjects = new Map<string, ProjectRecord>();
+    for (const project of projects) {
+      const normalized = this.normalizeProject(project);
+      const existing = nextProjects.get(normalized.canonicalKey) ??
+        this.projects.find((entry) => entry.canonicalKey === normalized.canonicalKey) ??
+        null;
+      if (existing) {
+        nextProjects.set(normalized.canonicalKey, this.normalizeProject({
+          ...existing,
+          ...normalized,
+          tags: this.mergeUnique(existing.tags, normalized.tags),
+          sourceSessionIds: this.mergeUnique(existing.sourceSessionIds, normalized.sourceSessionIds),
+          summaryIds: this.mergeUnique(existing.summaryIds, normalized.summaryIds),
+          memoryIds: this.mergeUnique(existing.memoryIds, normalized.memoryIds),
+          topicIds: this.mergeUnique(existing.topicIds, normalized.topicIds),
+          createdAt: existing.createdAt,
+          updatedAt: normalized.updatedAt,
+        }));
+      } else {
+        nextProjects.set(normalized.canonicalKey, normalized);
+      }
+    }
+
+    const incomingKeys = new Set(nextProjects.keys());
+    const archived = this.projects
+      .filter((entry) => !incomingKeys.has(entry.canonicalKey))
+      .map((entry) => this.normalizeProject({
+        ...entry,
+        status: "archived",
+      }));
+
+    this.projects = [
+      ...nextProjects.values(),
+      ...archived,
+    ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    await this.flush();
+  }
+
   getAll(): ProjectRecord[] {
     return [...this.projects];
   }

@@ -7,6 +7,7 @@ import { CompactionEngine } from "../engines/CompactionEngine";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
+import { BackgroundOrganizerEngine } from "../engines/BackgroundOrganizerEngine";
 import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
 import {
   SessionDataLayer,
@@ -93,6 +94,7 @@ export class ChaunyomsSessionRuntime {
   private readonly extractionEngine = new MemoryExtractionEngine();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
+  private backgroundOrganizerEngine: BackgroundOrganizerEngine;
   private externalSystemBootstrap: ExternalSystemBootstrap;
   private compactionEngine: CompactionEngine;
   private llmCaller: LlmCaller | null;
@@ -114,6 +116,7 @@ export class ChaunyomsSessionRuntime {
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
+    this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
   }
 
   updateHost(logger: LoggerLike, llmCaller: LlmCaller | null): void {
@@ -123,6 +126,7 @@ export class ChaunyomsSessionRuntime {
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
+    this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
   }
 
   getConfig(): BridgeConfig {
@@ -273,6 +277,12 @@ export class ChaunyomsSessionRuntime {
       durableMemoryStore,
       true,
     );
+    await this.backgroundOrganizerEngine.run(
+      durableMemoryStore,
+      summaryStore,
+      this.getActiveStores().projectStore,
+      this.config.agentId,
+    );
 
     return {
       ok: true,
@@ -348,6 +358,12 @@ export class ChaunyomsSessionRuntime {
       compactionResult.compacted,
     );
     await this.updateProjectRegistry(context, rawStore, summaryStore, durableMemoryStore);
+    await this.backgroundOrganizerEngine.run(
+      durableMemoryStore,
+      summaryStore,
+      this.getActiveStores().projectStore,
+      this.config.agentId,
+    );
 
     return {
       stats,

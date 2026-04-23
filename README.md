@@ -39,6 +39,20 @@ Lightweight OMS context-engine plugin for OpenClaw.
 - `ProjectRegistryStore`: agent-scoped project registry that tracks active focus, blockers, next steps, linked summaries, and linked durable memories
 - `SessionDataLayer`: the plugin's data boundary; runtime orchestration reads/writes through this layer instead of directly managing file stores
 
+## Organizer / Routing Upgrades
+
+- background organization now reconciles duplicate durable memories, supersedes stale project-state records, and rebuilds the project registry from active summaries + durable memories
+- retrieval routing now hard-selects between:
+  - `recent_tail`
+  - `project_registry`
+  - `durable_memory`
+  - `summary_tree`
+  - `knowledge_base`
+  - `shared_insights`
+  - `vector_search`
+- retrieval decisions now include an explicit route plan and explanation so downstream callers can inspect why a layer was chosen
+- multi-project validation coverage now includes parallel Project Atlas / Project Beacon routing and organizer reconciliation
+
 ## Decoupling Status
 
 ChaunyOMS now separates:

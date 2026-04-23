@@ -1,23 +1,14 @@
-import { RetrievalDecision } from "../types";
+﻿import { RetrievalDecision, RetrievalRoute } from "../types";
 
-const FACT_RECALL_RE =
-  /(原话|原文|精确|准确|参数|细节|约束|配置|当时怎么说|quote|exact|verbatim|parameter|constraint|detail)/i;
-const STATE_RE =
-  /(当前状态|项目状态|现在在做|在做什么|进度|下一步|待办|未解决|阻塞|卡住|决策|状态|what should we do next|where did we leave off|next step|next action|todo|pending|unresolved|blocker|blocked|decision|status|state|progress|working on|follow[- ]?up|dependency|dependencies|risk)/i;
-const NAVIGATION_RE =
-  /(active topic|recent|current|navigation|current focus|status|state|progress|todo|decision|next step|blocker)/i;
-const SHARED_INSIGHTS_RE =
-  /(shared[- ]?insights|共享洞察|共享记忆|insight)/i;
-const KNOWLEDGE_BASE_RE =
-  /(knowledge[- ]?base|知识库|文档|资料|架构文档|v2|v3|版本差异|topic-index)/i;
-const DAG_RE =
-  /(还记得吗|之前有个|历史对话|旧对话|压缩前|摘要|dag|summary|history)/i;
-const FUZZY_SEARCH_RE =
-  /(有篇|好像有个|我记得有|类似那个|相关资料|找一下相关|搜一下相关|something about|something related)/i;
-const COMPLEX_TASK_RE =
-  /(怎么推进|怎么做|如何处理|怎么拆|计划|方案|顺序|依赖|风险|取舍|tradeoff|compare|versus| vs |plan|sequence|dependency|dependencies|risk|rollout|migration|what's left|what remains|how should)/i;
-const CURRENT_WORK_RE =
-  /(这个项目|当前任务|这件事|这个问题|我们现在|当前工作|当前主线|this project|current task|current work|our work|we are|we're|what we are doing|where we left off)/i;
+const FACT_RECALL_RE = /(原话|原文|精确|准确|参数|细节|约束|配置|quote|exact|verbatim|parameter|constraint|detail)/i;
+const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未解决|阻塞|决策|status|state|progress|next step|next action|todo|pending|blocker|blocked|decision|where we left off)/i;
+const CURRENT_WORK_RE = /(这个项目|当前任务|当前工作|这件事|我们现在|当前主线|this project|current task|current work|our work|what we are doing)/i;
+const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|history|what happened earlier|why did we)/i;
+const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
+const SHARED_INSIGHTS_RE = /(shared[- ]?insights|共享洞察|insight)/i;
+const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
+const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
+const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|what's left|what remains)/i;
 
 export interface RouteContext {
   memorySearchEnabled: boolean;
@@ -26,160 +17,142 @@ export interface RouteContext {
   hasNavigationHint?: boolean;
   hasStructuredNavigationState?: boolean;
   hasCompactedHistory?: boolean;
+  hasProjectRegistry?: boolean;
+  hasDurableHits?: boolean;
   recentAssistantUncertainty?: boolean;
   queryComplexity?: "low" | "medium" | "high";
   referencesCurrentWork?: boolean;
+  matchedProjectId?: string;
+  matchedProjectTitle?: string;
 }
 
 export class MemoryRetrievalRouter {
   decide(query: string, context: RouteContext): RetrievalDecision {
     const normalized = query.trim();
     if (!normalized) {
-      return this.decision(
-        "recent_tail",
-        "empty_query_defaults_to_recent_tail",
-        false,
-        false,
-        true,
-      );
+      return this.decision("recent_tail", "empty_query_defaults_to_recent_tail", false, false, true, ["recent_tail"], "Empty query defaults to the recent conversational tail.");
     }
 
     const needsFacts = FACT_RECALL_RE.test(normalized);
-    const asksForState = STATE_RE.test(normalized);
-    const mentionsNavigation = NAVIGATION_RE.test(normalized);
+    const asksProjectState = PROJECT_STATE_RE.test(normalized);
+    const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
+    const asksHistory = HISTORY_RE.test(normalized);
+    const asksDurable = DURABLE_RE.test(normalized);
     const mentionsInsights = SHARED_INSIGHTS_RE.test(normalized);
-    const mentionsKb = KNOWLEDGE_BASE_RE.test(normalized);
-    const mentionsDag = DAG_RE.test(normalized);
+    const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
-    const asksComplexTask = COMPLEX_TASK_RE.test(normalized);
-    const referencesCurrentWork =
-      context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
-    const queryComplexity =
-      context.queryComplexity ?? (asksComplexTask ? "high" : "low");
-    const stateAvailable =
-      context.hasStructuredNavigationState || context.hasNavigationHint;
+    const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
+    const stateAvailable = context.hasStructuredNavigationState || context.hasNavigationHint || context.hasProjectRegistry;
 
-    if ((mentionsNavigation || asksForState) && !needsFacts) {
+    if ((asksProjectState || referencesCurrentWork) && context.hasProjectRegistry) {
       return this.decision(
-        "navigation",
-        asksForState ? "project_state_question" : "recent_workflow_question",
+        "project_registry",
+        context.matchedProjectId ? "matched_project_state_query" : "project_state_query",
         false,
         false,
         true,
+        ["project_registry", "durable_memory", "recent_tail"],
+        context.matchedProjectTitle
+          ? `The query is about project state, so route to the project registry first (matched project: ${context.matchedProjectTitle}).`
+          : "The query is about project state, so route to the project registry first.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
       );
     }
 
-    if ((mentionsNavigation || asksForState) && needsFacts) {
+    if (asksDurable && context.hasDurableHits) {
       return this.decision(
-        "dag",
-        asksForState
-          ? "state_question_but_fact_recall_required"
-          : "navigation_hit_but_fact_recall_required",
+        "durable_memory",
+        "durable_memory_query",
+        false,
         false,
         true,
-        false,
+        ["durable_memory", "project_registry", "summary_tree"],
+        "The query asks for stable constraints/decisions, so durable memory is the primary layer.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
       );
     }
 
-    if (
-      stateAvailable &&
-      referencesCurrentWork &&
-      (queryComplexity === "high" || asksComplexTask)
-    ) {
+    if (needsFacts || asksHistory) {
       return this.decision(
-        "navigation",
-        "complex_task_state_upgrade",
-        false,
+        "summary_tree",
+        needsFacts ? "fact_question_requires_summary_to_raw_recall" : "historical_recall_query",
         false,
         true,
+        false,
+        ["summary_tree", "recent_tail"],
+        "The query needs historical detail, so it should traverse summaries first and expand back to raw messages.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
       );
     }
 
-    if (
-      context.recentAssistantUncertainty &&
-      stateAvailable &&
-      (referencesCurrentWork || context.hasCompactedHistory)
-    ) {
+    if ((complexTask || context.recentAssistantUncertainty) && stateAvailable && referencesCurrentWork) {
       return this.decision(
-        "navigation",
-        "assistant_uncertainty_state_upgrade",
+        context.hasProjectRegistry ? "project_registry" : "navigation",
+        complexTask ? "complex_task_state_upgrade" : "assistant_uncertainty_state_upgrade",
         false,
         false,
         true,
+        context.hasProjectRegistry
+          ? ["project_registry", "navigation", "durable_memory"]
+          : ["navigation", "durable_memory", "recent_tail"],
+        "The query is coordinating current work, so prefer structured project/navigation state before raw history.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
       );
     }
 
     if (mentionsInsights && (fuzzyLookup || !context.hasSharedInsightHint)) {
       return this.decision(
         context.memorySearchEnabled ? "vector_search" : "shared_insights",
-        context.memorySearchEnabled
-          ? "shared_insights_fuzzy_lookup_with_embeddings"
-          : "shared_insights_fuzzy_lookup_without_embeddings",
+        context.memorySearchEnabled ? "shared_insights_fuzzy_lookup_with_embeddings" : "shared_insights_fuzzy_lookup_without_embeddings",
         !context.memorySearchEnabled,
         false,
         context.memorySearchEnabled,
+        context.memorySearchEnabled ? ["vector_search", "shared_insights"] : ["shared_insights"],
+        "The query targets shared insights and needs fuzzy retrieval, so vector search (or shared-insights fallback) is the right path.",
       );
     }
 
     if (mentionsInsights) {
-      return this.decision(
-        "shared_insights",
-        "shared_insights_route_hit",
-        false,
-        false,
-        true,
-      );
+      return this.decision("shared_insights", "shared_insights_route_hit", false, false, true, ["shared_insights"], "The query explicitly asks for shared insights.");
     }
 
-    if (mentionsKb && (fuzzyLookup || !context.hasTopicIndexHit)) {
+    if (mentionsKnowledge && (fuzzyLookup || !context.hasTopicIndexHit)) {
       return this.decision(
         context.memorySearchEnabled ? "vector_search" : "knowledge_base",
-        context.memorySearchEnabled
-          ? "knowledge_base_fuzzy_lookup_with_embeddings"
-          : "knowledge_base_fuzzy_lookup_without_embeddings",
+        context.memorySearchEnabled ? "knowledge_base_fuzzy_lookup_with_embeddings" : "knowledge_base_fuzzy_lookup_without_embeddings",
         !context.memorySearchEnabled,
         false,
         context.memorySearchEnabled,
+        context.memorySearchEnabled ? ["vector_search", "knowledge_base"] : ["knowledge_base"],
+        "The query targets long-term knowledge docs and needs a broader lookup path.",
       );
     }
 
-    if (mentionsKb) {
-      return this.decision(
-        "knowledge_base",
-        "knowledge_base_route_hit",
-        false,
-        needsFacts,
-        !needsFacts,
-      );
+    if (mentionsKnowledge) {
+      return this.decision("knowledge_base", "knowledge_base_route_hit", false, false, true, ["knowledge_base"], "The query explicitly asks for the knowledge layer.");
     }
 
-    if (mentionsDag || needsFacts) {
-      return this.decision(
-        "dag",
-        needsFacts
-          ? "fact_question_requires_source_recall"
-          : "historical_dialog_recall",
-        false,
-        true,
-        false,
-      );
+    if (context.hasDurableHits && /(remember|constraint|decision|config|rule|长期|约束|决策|配置)/i.test(normalized)) {
+      return this.decision("durable_memory", "fallback_durable_memory_match", false, false, true, ["durable_memory", "recent_tail"], "Durable memory contains matching stable facts, so use it before the volatile recent tail.", context.matchedProjectId, context.matchedProjectTitle);
     }
 
-    return this.decision(
-      "recent_tail",
-      "default_recent_tail",
-      false,
-      false,
-      true,
-    );
+    return this.decision("recent_tail", "default_recent_tail", false, false, true, ["recent_tail"], "No higher-priority structured route matched, so answer from the recent tail.");
   }
 
   private decision(
-    route: RetrievalDecision["route"],
+    route: RetrievalRoute,
     reason: string,
     requiresEmbeddings: boolean,
     requiresSourceRecall: boolean,
     canAnswerDirectly: boolean,
+    routePlan: RetrievalRoute[],
+    explanation: string,
+    matchedProjectId?: string,
+    matchedProjectTitle?: string,
   ): RetrievalDecision {
     return {
       route,
@@ -187,6 +160,10 @@ export class MemoryRetrievalRouter {
       requiresEmbeddings,
       requiresSourceRecall,
       canAnswerDirectly,
+      routePlan,
+      explanation,
+      matchedProjectId,
+      matchedProjectTitle,
     };
   }
 }
