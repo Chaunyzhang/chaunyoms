@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
+import { KnowledgeRawAdmissionEngine } from "../engines/KnowledgeRawAdmissionEngine";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
@@ -20,6 +21,7 @@ import {
   DurableMemoryEntry,
   FixedPrefixProvider,
   HostFixedContextProvider,
+  KnowledgeRawEntry,
   LlmCaller,
   LoggerLike,
   NavigationRepository,
@@ -100,6 +102,7 @@ export class ChaunyomsSessionRuntime {
   private readonly hostFixedContextProvider: HostFixedContextProvider;
   private readonly assembler: ContextAssembler;
   private readonly extractionEngine = new MemoryExtractionEngine();
+  private readonly knowledgeRawAdmissionEngine = new KnowledgeRawAdmissionEngine();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
   private backgroundOrganizerEngine: BackgroundOrganizerEngine;
@@ -168,26 +171,70 @@ export class ChaunyomsSessionRuntime {
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
-    const { rawStore, durableMemoryStore } = await this.ensureSession(payload.sessionId, payload.config);
+    const decision = this.runtimeIngress.inspect({
+      id: payload.id,
+      sourceKey: payload.id,
+      role: payload.role,
+      content: payload.content,
+      text: payload.content,
+      metadata: payload.metadata,
+    });
+
+    if (!decision.persist || payload.config.emergencyBrake) {
+      this.logger.info("ingest_message_skipped_by_ingress", {
+        sessionId: payload.sessionId,
+        role: payload.role,
+        classification: decision.classification,
+        reason: payload.config.emergencyBrake ? "emergency_brake_enabled" : decision.reason,
+      });
+      return { ingested: false };
+    }
+
+    const createdAt = new Date().toISOString();
+    const metadata = {
+      ...(payload.metadata ?? {}),
+      runtimeClassification: decision.classification,
+      runtimePersistenceReason: decision.reason,
+    };
+
+    if (decision.storageTarget === "observation") {
+      const { observationStore } = await this.ensureSession(payload.sessionId, payload.config);
+      const observation: ObservationEntry = {
+        id: payload.id,
+        sessionId: payload.sessionId,
+        agentId: payload.config.agentId,
+        role: payload.role,
+        classification: decision.classification,
+        content: decision.normalizedText,
+        sourceKey: payload.id,
+        createdAt,
+        tokenCount: estimateTokens(decision.normalizedText),
+        metadata,
+      };
+      if (observationStore.getAll().some((entry) => entry.id === observation.id || entry.sourceKey === observation.sourceKey)) {
+        return { ingested: false };
+      }
+      await this.sessionData.appendObservation(observation);
+      await this.persistDerivedMemoryArtifactsFromObservation(observation);
+      return { ingested: true };
+    }
+
+    const { rawStore } = await this.ensureSession(payload.sessionId, payload.config);
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
     const message: RawMessage = {
       id: payload.id,
       sessionId: payload.sessionId,
       agentId: payload.config.agentId,
       role: payload.role,
-      content: payload.content,
+      content: decision.normalizedText,
       turnNumber,
-      createdAt: new Date().toISOString(),
-      tokenCount: estimateTokens(payload.content),
+      createdAt,
+      tokenCount: estimateTokens(decision.normalizedText),
       compacted: false,
-      metadata: payload.metadata,
+      metadata,
     };
     await rawStore.append(message);
-    await this.persistDurableMemories(
-      durableMemoryStore,
-      this.extractionEngine.extractFromRawMessage(message),
-    );
-    await this.sessionData.writeDurableMemoryArtifacts();
+    await this.persistDerivedMemoryArtifactsFromRawMessage(message);
     return { ingested: true };
   }
 
@@ -314,7 +361,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async afterTurn(context: LifecycleContext): Promise<AfterTurnResult> {
-    const { rawStore, summaryStore, observationStore, durableMemoryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, observationStore, durableMemoryStore, knowledgeRawStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -348,6 +395,7 @@ export class ChaunyomsSessionRuntime {
       summaryTokens: summaryStore.getTotalTokens(),
       observationCount: observationStore.count(),
       durableMemoryCount: durableMemoryStore.count(),
+      knowledgeRawCount: knowledgeRawStore.count(),
       managedKnowledgeDir: this.config.knowledgePromotionEnabled ? knowledgeStore.getBaseDir() : null,
       knowledgeImportDir: this.config.knowledgeBaseDir,
       contextItems: this.contextViewStore.getItems().length,
@@ -413,7 +461,7 @@ export class ChaunyomsSessionRuntime {
       return { importedMessages: 0 };
     }
 
-    const { rawStore, observationStore, durableMemoryStore } = await this.ensureSession(sessionId, config);
+    const { rawStore, observationStore } = await this.ensureSession(sessionId, config);
     const inspectedMessages = runtimeMessages.map((message) => ({
       message,
       decision: this.runtimeIngress.inspect(message),
@@ -519,10 +567,7 @@ export class ChaunyomsSessionRuntime {
         },
       };
       await this.sessionData.appendRawMessage(rawMessage);
-      await this.persistDurableMemories(
-        durableMemoryStore,
-        this.extractionEngine.extractFromRawMessage(rawMessage),
-      );
+      await this.persistDerivedMemoryArtifactsFromRawMessage(rawMessage);
       existingSourceKeys.add(message.sourceKey);
       importedMessages += 1;
     }
@@ -552,11 +597,7 @@ export class ChaunyomsSessionRuntime {
         },
       };
       await this.sessionData.appendObservation(observation);
-      await this.persistDurableMemories(
-        durableMemoryStore,
-        this.extractionEngine.extractFromObservation(observation),
-      );
-      await this.sessionData.writeDurableMemoryArtifacts();
+      await this.persistDerivedMemoryArtifactsFromObservation(observation);
       existingObservationSourceKeys.add(message.sourceKey);
       importedMessages += 1;
     }
@@ -572,6 +613,39 @@ export class ChaunyomsSessionRuntime {
       return;
     }
     await this.sessionData.addDurableEntries(entries);
+  }
+
+  private async persistKnowledgeRawEntries(
+    entries: KnowledgeRawEntry[],
+  ): Promise<void> {
+    if (this.config.emergencyBrake || entries.length === 0) {
+      return;
+    }
+    await this.sessionData.addKnowledgeRawEntries(entries);
+  }
+
+  private async persistDerivedMemoryArtifactsFromRawMessage(
+    message: RawMessage,
+  ): Promise<void> {
+    const { durableMemoryStore } = this.getActiveStores();
+    const extracted = this.extractionEngine.extractFromRawMessage(message);
+    await this.persistDurableMemories(durableMemoryStore, extracted);
+    await this.persistKnowledgeRawEntries(
+      this.knowledgeRawAdmissionEngine.admitFromRawMessage(message, extracted),
+    );
+    await this.sessionData.writeDurableMemoryArtifacts();
+  }
+
+  private async persistDerivedMemoryArtifactsFromObservation(
+    observation: ObservationEntry,
+  ): Promise<void> {
+    const { durableMemoryStore } = this.getActiveStores();
+    const extracted = this.extractionEngine.extractFromObservation(observation);
+    await this.persistDurableMemories(durableMemoryStore, extracted);
+    await this.persistKnowledgeRawEntries(
+      this.knowledgeRawAdmissionEngine.admitFromObservation(observation, extracted),
+    );
+    await this.sessionData.writeDurableMemoryArtifacts();
   }
 
   private resolveRuntimeTurnNumber(

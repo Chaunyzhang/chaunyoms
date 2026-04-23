@@ -103,6 +103,53 @@ export interface DurableMemoryRepository {
   count(): number;
 }
 
+export type MemoryIntent =
+  | "explicit_remember"
+  | "preference_memory"
+  | "project_memory"
+  | "temporary_remember"
+  | "none";
+
+export type KnowledgeRawKind =
+  | DurableMemoryEntry["kind"]
+  | "preference";
+
+export interface KnowledgeRawEntry {
+  id: string;
+  eventId?: string;
+  sessionId: string;
+  agentId?: string;
+  projectId?: string;
+  topicId?: string;
+  kind: KnowledgeRawKind;
+  recordStatus?: RecordStatus;
+  supersededById?: string;
+  text: string;
+  fingerprint: string;
+  tags: string[];
+  createdAt: string;
+  sourceType: "raw_message" | "observation" | "snapshot";
+  sourceIds: string[];
+  sourceSequenceMin?: number;
+  sourceSequenceMax?: number;
+  sourceStartTimestamp?: string;
+  sourceEndTimestamp?: string;
+  memoryIntent?: MemoryIntent;
+  memoryIntentConfidence?: number;
+  memoryIntentTrigger?: string;
+  stabilityScore?: number;
+  reusabilityScore?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface KnowledgeRawRepository {
+  init(): Promise<void>;
+  addEntries(entries: KnowledgeRawEntry[]): Promise<number>;
+  replaceAll(entries: KnowledgeRawEntry[]): Promise<void>;
+  getAll(): KnowledgeRawEntry[];
+  count(): number;
+}
+
 export interface SummaryEntry {
   id: string;
   eventId?: string;

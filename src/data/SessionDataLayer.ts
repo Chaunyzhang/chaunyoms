@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { DurableMemoryStore } from "../stores/DurableMemoryStore";
 import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
+import { KnowledgeRawStore } from "../stores/KnowledgeRawStore";
 import { ObservationStore } from "../stores/ObservationStore";
 import { ProjectRegistryStore } from "../stores/ProjectRegistryStore";
 import { RawMessageStore } from "../stores/RawMessageStore";
@@ -11,6 +12,8 @@ import {
   BridgeConfig,
   DurableMemoryEntry,
   DurableMemoryRepository,
+  KnowledgeRawEntry,
+  KnowledgeRawRepository,
   LoggerLike,
   KnowledgeRepository,
   ObservationEntry,
@@ -33,6 +36,7 @@ export interface SessionDataStores {
   summaryStore: SummaryRepository;
   observationStore: ObservationRepository;
   durableMemoryStore: DurableMemoryRepository;
+  knowledgeRawStore: KnowledgeRawRepository;
   knowledgeStore: KnowledgeRepository;
   projectStore: ProjectRegistryRepository;
 }
@@ -50,6 +54,7 @@ export class SessionDataLayer {
   private summaryStore: SummaryIndexStore | null = null;
   private observationStore: ObservationStore | null = null;
   private durableMemoryStore: DurableMemoryStore | null = null;
+  private knowledgeRawStore: KnowledgeRawStore | null = null;
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private projectStore: ProjectRegistryStore | null = null;
   private statsLogStore: RuntimeStatsLogStore | null = null;
@@ -70,6 +75,7 @@ export class SessionDataLayer {
       this.summaryStore &&
       this.observationStore &&
       this.durableMemoryStore &&
+      this.knowledgeRawStore &&
       this.knowledgeStore &&
       this.projectStore &&
       this.agentVault &&
@@ -140,6 +146,7 @@ export class SessionDataLayer {
     this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
     this.observationStore = new ObservationStore(agentDataDir, config.agentId);
     this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
+    this.knowledgeRawStore = new KnowledgeRawStore(agentDataDir, config.agentId);
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
     this.statsLogStore = new RuntimeStatsLogStore(config.dataDir);
@@ -148,6 +155,7 @@ export class SessionDataLayer {
     await this.summaryStore.init();
     await this.observationStore.init();
     await this.durableMemoryStore.init();
+    await this.knowledgeRawStore.init();
     await this.knowledgeStore.init();
     await this.projectStore.init();
     await this.agentVault.ensureLayout();
@@ -163,7 +171,7 @@ export class SessionDataLayer {
   }
 
   getStores(): SessionDataStores {
-    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.knowledgeStore || !this.projectStore) {
+    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.knowledgeRawStore || !this.knowledgeStore || !this.projectStore) {
       throw new Error("SessionDataLayer stores are not initialized");
     }
     return {
@@ -171,6 +179,7 @@ export class SessionDataLayer {
       summaryStore: this.summaryStore,
       observationStore: this.observationStore,
       durableMemoryStore: this.durableMemoryStore,
+      knowledgeRawStore: this.knowledgeRawStore,
       knowledgeStore: this.knowledgeStore,
       projectStore: this.projectStore,
     };
@@ -186,6 +195,10 @@ export class SessionDataLayer {
 
   async addDurableEntries(entries: DurableMemoryEntry[]): Promise<number> {
     return await this.getStores().durableMemoryStore.addEntries(entries);
+  }
+
+  async addKnowledgeRawEntries(entries: KnowledgeRawEntry[]): Promise<number> {
+    return await this.getStores().knowledgeRawStore.addEntries(entries);
   }
 
   async writeNavigationSnapshot(snapshot: string): Promise<string | null> {
@@ -297,6 +310,7 @@ export class SessionDataLayer {
     const summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
     const observationStore = new ObservationStore(agentDataDir, config.agentId);
     const durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
+    const knowledgeRawStore = new KnowledgeRawStore(agentDataDir, config.agentId);
     const knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     const projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
     const vault = new AgentVault(config.memoryVaultDir, config.agentId);
@@ -305,6 +319,7 @@ export class SessionDataLayer {
     await summaryStore.init();
     await observationStore.init();
     await durableMemoryStore.init();
+    await knowledgeRawStore.init();
     await knowledgeStore.init();
     await projectStore.init();
     await vault.ensureLayout();
@@ -318,6 +333,7 @@ export class SessionDataLayer {
     }
 
     durableMemoryStore.getAll();
+    knowledgeRawStore.getAll();
     projectStore.getAll();
     knowledgeStore.searchRelatedDocuments("upgrade validation", 1);
   }
