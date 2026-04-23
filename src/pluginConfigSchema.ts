@@ -40,7 +40,7 @@ export const pluginConfigSchema = {
     },
     strictCompaction: {
       type: "boolean",
-      description: "Require LLM-generated summaries. If true, fallback summaries are disabled.",
+      description: "Require the host LLM for summary generation. When true, summary, rollup, and knowledge-promotion writes stop instead of degrading to non-LLM output.",
     },
     compactionBarrierEnabled: {
       type: "boolean",

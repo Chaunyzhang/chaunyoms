@@ -92,19 +92,28 @@ export class ChaunyomsRetrievalService {
 
   async executeRecallDetail(args: any): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const { rawStore, summaryStore, durableMemoryStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore, projectStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("recall_detail");
     }
 
     const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
+    const matchedProject = this.matchProject(
+      query,
+      projectStore.getAll().filter((project) => project.status !== "archived"),
+    );
     if (promptForApi) {
       return this.buildEmbeddingsPromptResponse(decision);
     }
 
     if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
-      const durableHits = durableMemoryStore.search(query, 5);
+      const durableHits = this.searchDurableHits(
+        durableMemoryStore.getAll(),
+        query,
+        matchedProject?.id,
+        5,
+      );
       return this.buildRecallDisabledResponse(query, durableHits, context, decision);
     }
 
@@ -136,7 +145,16 @@ export class ChaunyomsRetrievalService {
     }
 
     const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
-    const durableHits = durableMemoryStore.search(query, 3);
+    const matchedProject = this.matchProject(
+      query,
+      projectStore.getAll().filter((project) => project.status !== "archived"),
+    );
+    const durableHits = this.searchDurableHits(
+      durableMemoryStore.getAll(),
+      query,
+      matchedProject?.id,
+      3,
+    );
     if (promptForApi) {
       return this.buildEmbeddingsPromptResponse(decision);
     }
@@ -322,6 +340,12 @@ export class ChaunyomsRetrievalService {
       ]);
     const projects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, projects);
+    const scopedDurableHits = this.searchDurableHits(
+      durableMemoryStore.getAll(),
+      query,
+      matchedProject?.id,
+      3,
+    );
     const decision = this.retrievalRouter.decide(query, {
       memorySearchEnabled,
       hasTopicIndexHit,
@@ -330,7 +354,7 @@ export class ChaunyomsRetrievalService {
       hasStructuredNavigationState,
       hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
       hasProjectRegistry: projects.length > 0,
-      hasDurableHits: durableMemoryStore.search(query, 3).length > 0,
+      hasDurableHits: scopedDurableHits.length > 0,
       recentAssistantUncertainty: this.hasRecentAssistantUncertainty(rawStore),
       queryComplexity: this.classifyQueryComplexity(query),
       referencesCurrentWork: this.referencesCurrentWork(query),
@@ -414,6 +438,56 @@ export class ChaunyomsRetrievalService {
       `Durable memory hits for: ${query}`,
       ...items.map((item, index) => `${index + 1}. [${item.kind}] ${item.text}`),
     ].join("\n");
+  }
+
+  private searchDurableHits(
+    entries: DurableMemoryEntry[],
+    query: string,
+    projectId?: string,
+    limit = 5,
+  ): DurableMemoryEntry[] {
+    const terms = query
+      .toLowerCase()
+      .split(/[^a-z0-9\u4e00-\u9fff]+/i)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2);
+    if (terms.length === 0) {
+      return [];
+    }
+
+    const scored = entries
+      .filter((entry) => entry.recordStatus === "active")
+      .map((entry) => {
+        const haystack = [
+          entry.kind,
+          entry.projectId ?? "",
+          entry.topicId ?? "",
+          ...entry.tags,
+          entry.text,
+        ].join(" ").toLowerCase();
+        let score = 0;
+        for (const term of terms) {
+          if (haystack.includes(term)) {
+            score += term.length >= 6 ? 3 : 2;
+          }
+        }
+        if (terms.every((term) => haystack.includes(term))) {
+          score += 4;
+        }
+        if (projectId && entry.projectId === projectId) {
+          score += 5;
+        }
+        return { entry, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        return right.entry.createdAt.localeCompare(left.entry.createdAt);
+      });
+
+    return scored.slice(0, Math.max(limit, 1)).map((item) => item.entry);
   }
 
   private buildMissingQueryResponse(toolName: string): ToolResponse {

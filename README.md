@@ -15,6 +15,7 @@ Lightweight OMS context-engine plugin for OpenClaw.
 - strict compaction is **enabled by default**:
   - trigger threshold: `0.70`
   - LLM summary required
+  - summary / rollup / knowledge promotion are LLM-only paths
 - This avoids the MiniMax Anthropic-compatible `tool call id is invalid (2013)` failure we reproduced during direct activation.
 - knowledge promotion is present in code but **disabled by default**.
 

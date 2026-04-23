@@ -48,13 +48,9 @@ export class DataSchemaRegistry {
   async ensureCurrentVersions(): Promise<Array<{ storeKey: string; from: number; to: number }>> {
     const upgraded: Array<{ storeKey: string; from: number; to: number }> = [];
 
-    for (const [storeKey, to] of Object.entries(CURRENT_STORE_VERSIONS)) {
-      const from = Number(this.registry.stores[storeKey] ?? 0);
-      if (from === to) {
-        continue;
-      }
-      this.registry.stores[storeKey] = to;
-      upgraded.push({ storeKey, from, to });
+    for (const pending of this.getPendingUpgrades()) {
+      this.registry.stores[pending.storeKey] = pending.to;
+      upgraded.push(pending);
     }
 
     if (upgraded.length > 0) {
@@ -62,6 +58,24 @@ export class DataSchemaRegistry {
     }
 
     return upgraded;
+  }
+
+  getPendingUpgrades(): Array<{ storeKey: string; from: number; to: number }> {
+    const upgraded: Array<{ storeKey: string; from: number; to: number }> = [];
+
+    for (const [storeKey, to] of Object.entries(CURRENT_STORE_VERSIONS)) {
+      const from = Number(this.registry.stores[storeKey] ?? 0);
+      if (from === to) {
+        continue;
+      }
+      upgraded.push({ storeKey, from, to });
+    }
+
+    return upgraded;
+  }
+
+  getFilePath(): string {
+    return this.filePath;
   }
 
   private async flush(): Promise<void> {

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+锘縤mport { createHash } from "node:crypto";
 
 import {
   KnowledgeDocBucket,
@@ -56,16 +56,12 @@ export class KnowledgePromotionEngine {
       3,
     );
 
-    let draft = await this.generateDraft({
+    const draft = await this.generateDraft({
       summaryEntry,
       messages,
       relatedDocs,
       modelName: knowledgePromotionModel ?? summaryModel,
     });
-
-    if (!draft.body.trim() && draft.shouldWrite) {
-      draft = this.buildFallbackDraft(summaryEntry, messages, relatedDocs);
-    }
 
     return await knowledgeStore.writePromotion(summaryEntry, draft, {
       sessionId,
@@ -91,7 +87,7 @@ export class KnowledgePromotionEngine {
     modelName?: string;
   }): Promise<KnowledgePromotionDraft> {
     if (!this.llmCaller) {
-      return this.buildFallbackDraft(args.summaryEntry, args.messages, args.relatedDocs);
+      throw new Error("LLM caller unavailable for knowledge promotion");
     }
 
     const prompt = this.buildPrompt(args.summaryEntry, args.messages, args.relatedDocs);
@@ -107,13 +103,13 @@ export class KnowledgePromotionEngine {
       if (parsed) {
         return parsed;
       }
+      throw new Error("LLM knowledge promotion response was not valid JSON draft output");
     } catch (error) {
       this.logger.warn("knowledge_markdown_generation_failed", {
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
-
-    return this.buildFallbackDraft(args.summaryEntry, args.messages, args.relatedDocs);
   }
 
   private buildPrompt(
@@ -221,92 +217,6 @@ export class KnowledgePromotionEngine {
     }
   }
 
-  private buildFallbackDraft(
-    summaryEntry: SummaryEntry,
-    messages: RawMessage[],
-    relatedDocs: Array<{ slug: string; canonicalKey: string }>,
-  ): KnowledgePromotionDraft {
-    const material = messages
-      .map((message) => message.content.trim())
-      .filter((content) => content.length >= 20)
-      .filter(
-        (content) =>
-          /(must|should|decision|fix|failed|error|constraint|parameter|config|risk|blocker|需要|必须|决定|修复|失败|错误|约束|参数|配置|风险|阻塞)/i.test(
-            content,
-          ),
-      );
-
-    if (material.length === 0) {
-      return {
-        shouldWrite: false,
-        reason: "fallback_found_no_durable_knowledge",
-        bucket: "facts",
-        slug: "",
-        title: "",
-        summary: "",
-        tags: [],
-        canonicalKey: "",
-        body: "",
-        status: "draft",
-      };
-    }
-
-    const bucket = this.chooseBucket(summaryEntry.summary, material.join(" "));
-    const slug = this.slugify(
-      relatedDocs[0]?.slug ||
-        summaryEntry.keywords.slice(0, 3).join("-") ||
-        `turns-${summaryEntry.startTurn}-${summaryEntry.endTurn}`,
-    );
-    const title = this.toTitle(slug);
-    const summary = summaryEntry.summary.split(/\n/)[0].slice(0, 200).trim();
-    const tags = [...new Set(summaryEntry.keywords.slice(0, 6).map((item) => this.slugify(item)).filter(Boolean))];
-    const canonicalKey = relatedDocs[0]?.canonicalKey || slug;
-    const evidence = material.slice(0, 4).map((item) => `- ${item}`);
-    const body = [
-      `# ${title}`,
-      "",
-      "## Why it matters",
-      summary,
-      "",
-      "## Canonical knowledge",
-      ...this.toKnowledgeBullets(material.slice(0, 4)),
-      "",
-      "## Evidence",
-      ...evidence,
-    ].join("\n");
-
-    return {
-      shouldWrite: true,
-      reason: "fallback_promoted_reusable_history",
-      bucket,
-      slug,
-      title,
-      summary,
-      tags,
-      canonicalKey,
-      body,
-      status: "active",
-    };
-  }
-
-  private chooseBucket(summary: string, material: string): KnowledgeDocBucket {
-    const text = `${summary}\n${material}`.toLowerCase();
-    if (/incident|postmortem|outage|failure|failed|traceback|error|事故|失败|报错/.test(text)) {
-      return "incidents";
-    }
-    if (/decision|decided|keep|enable|disable|adopt|switch|决定|保持|启用|禁用|采用/.test(text)) {
-      return "decisions";
-    }
-    if (/pattern|workflow|procedure|steps|how to|best practice|模式|流程|步骤|最佳实践/.test(text)) {
-      return "patterns";
-    }
-    return "facts";
-  }
-
-  private toKnowledgeBullets(items: string[]): string[] {
-    return items.map((item) => `- ${item}`);
-  }
-
   private slugify(value: string): string {
     return value
       .toLowerCase()
@@ -314,13 +224,5 @@ export class KnowledgePromotionEngine {
       .replace(/-{2,}/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 80) || `knowledge-${createHash("sha256").update(value, "utf8").digest("hex").slice(0, 8)}`;
-  }
-
-  private toTitle(slug: string): string {
-    return slug
-      .split("-")
-      .filter(Boolean)
-      .map((part) => part[0].toUpperCase() + part.slice(1))
-      .join(" ");
   }
 }

@@ -4,6 +4,15 @@ import path from "node:path";
 import { SummaryEntry, SummaryRepository } from "../types";
 import { buildStableEventId } from "../utils/projectIdentity";
 
+const SUMMARY_PHASES = new Set([
+  "planning",
+  "implementation",
+  "validation",
+  "fixing",
+  "review",
+  "active",
+]);
+
 interface SummaryIndexFileV3 {
   schemaVersion: 3;
   summaries: SummaryEntry[];
@@ -155,11 +164,16 @@ export class SummaryIndexStore implements SummaryRepository {
     return this.getActiveSummaries().filter((entry) => {
       const haystack = [
         entry.summary,
+        entry.memoryType ?? "",
+        entry.phase ?? "",
         entry.keywords.join(" "),
         entry.constraints.join(" "),
         entry.decisions.join(" "),
         entry.blockers.join(" "),
+        (entry.nextSteps ?? []).join(" "),
+        (entry.keyEntities ?? []).join(" "),
         entry.exactFacts.join(" "),
+        entry.promotionIntent ?? "",
         entry.projectId ?? "",
         entry.topicId ?? "",
       ]
@@ -258,10 +272,15 @@ export class SummaryIndexStore implements SummaryRepository {
       sourceMessageIds: [...new Set(entry.sourceMessageIds ?? [])],
       summaryLevel: entry.summaryLevel ?? 1,
       nodeKind: entry.nodeKind ?? (entry.sourceSummaryIds && entry.sourceSummaryIds.length > 0 ? "branch" : "leaf"),
+      memoryType: entry.memoryType ?? "general",
+      phase: this.normalizePhase(entry.phase),
       constraints: Array.isArray(entry.constraints) ? entry.constraints : [],
       decisions: Array.isArray(entry.decisions) ? entry.decisions : [],
       blockers: Array.isArray(entry.blockers) ? entry.blockers : [],
+      nextSteps: Array.isArray(entry.nextSteps) ? [...new Set(entry.nextSteps)] : [],
+      keyEntities: Array.isArray(entry.keyEntities) ? [...new Set(entry.keyEntities)] : [],
       exactFacts: Array.isArray(entry.exactFacts) ? entry.exactFacts : [],
+      promotionIntent: entry.promotionIntent ?? "candidate",
       keywords: Array.isArray(entry.keywords) ? entry.keywords : [],
     };
 
@@ -271,6 +290,11 @@ export class SummaryIndexStore implements SummaryRepository {
       normalized.childSummaryIds = [...sourceSummaryIds];
     }
     return normalized;
+  }
+
+  private normalizePhase(value: SummaryEntry["phase"]): SummaryEntry["phase"] {
+    const candidate = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return SUMMARY_PHASES.has(candidate) ? candidate as SummaryEntry["phase"] : undefined;
   }
 
   private buildDedupKey(entry: SummaryEntry): string {

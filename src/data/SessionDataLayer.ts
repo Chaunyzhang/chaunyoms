@@ -24,6 +24,7 @@ import { hashRawMessages } from "../utils/integrity";
 import { DataSchemaRegistry } from "./DataSchemaRegistry";
 import { SessionDataMigrationRunner } from "./SessionDataMigrationRunner";
 import { AgentVault } from "./AgentVault";
+import { SessionUpgradeManager } from "./SessionUpgradeManager";
 
 export interface SessionDataStores {
   rawStore: RawMessageRepository;
@@ -52,6 +53,7 @@ export class SessionDataLayer {
   private schemaRegistry: DataSchemaRegistry | null = null;
   private migrationRunner: SessionDataMigrationRunner | null = null;
   private agentVault: AgentVault | null = null;
+  private upgradeManager: SessionUpgradeManager | null = null;
   private boundAgentId: string | null = null;
   private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"> | null = null;
 
@@ -81,13 +83,56 @@ export class SessionDataLayer {
     this.schemaRegistry = new DataSchemaRegistry(path.join(config.dataDir, "_state"));
     await this.schemaRegistry.init();
     this.migrationRunner = new SessionDataMigrationRunner(agentDataDir, config.agentId);
-    const migrated = await this.migrationRunner.runAll();
-    if (migrated.length > 0) {
-      this.logger.info("session_data_migrations_applied", {
-        agentId: config.agentId,
-        migrated,
-      });
-    }
+    this.upgradeManager = new SessionUpgradeManager(this.logger);
+    const pendingMigrations = await this.migrationRunner.inspectPending();
+    const pendingRegistryUpgrades = this.schemaRegistry.getPendingUpgrades();
+    await this.upgradeManager.runProtectedUpgrade({
+      dataDir: config.dataDir,
+      paths: [
+        {
+          label: "agent_data",
+          sourcePath: agentDataDir,
+          snapshotRelativePath: path.join("agent_data"),
+        },
+        {
+          label: "schema_registry",
+          sourcePath: this.schemaRegistry.getFilePath(),
+          snapshotRelativePath: path.join("schema_registry.json"),
+        },
+        {
+          label: "knowledge_markdown",
+          sourcePath: knowledgeDir,
+          snapshotRelativePath: path.join("knowledge_markdown"),
+        },
+        {
+          label: "agent_vault",
+          sourcePath: path.join(config.memoryVaultDir, "agents", config.agentId),
+          snapshotRelativePath: path.join("agent_vault"),
+        },
+      ],
+      pendingMigrations,
+      pendingRegistryUpgrades,
+      apply: async () => {
+        const migrations = await this.migrationRunner?.runAll() ?? [];
+        const registryUpgrades = await this.schemaRegistry?.ensureCurrentVersions() ?? [];
+        if (migrations.length > 0) {
+          this.logger.info("session_data_migrations_applied", {
+            agentId: config.agentId,
+            migrated: migrations,
+          });
+        }
+        if (registryUpgrades.length > 0) {
+          this.logger.info("session_data_schema_registry_updated", {
+            agentId: config.agentId,
+            upgraded: registryUpgrades,
+          });
+        }
+        return { migrations, registryUpgrades };
+      },
+      validate: async () => {
+        await this.validateUpgradedState(agentDataDir, knowledgeDir, config);
+      },
+    });
     this.rawStore = new RawMessageStore(agentDataDir, config.agentId);
     this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
     this.observationStore = new ObservationStore(agentDataDir, config.agentId);
@@ -102,13 +147,6 @@ export class SessionDataLayer {
     await this.knowledgeStore.init();
     await this.projectStore.init();
     await this.agentVault.ensureLayout();
-    const upgraded = await this.schemaRegistry.ensureCurrentVersions();
-    if (upgraded.length > 0) {
-      this.logger.info("session_data_schema_registry_updated", {
-        agentId: config.agentId,
-        upgraded,
-      });
-    }
     this.boundAgentId = config.agentId;
     this.boundConfig = {
       dataDir: config.dataDir,
@@ -237,5 +275,39 @@ export class SessionDataLayer {
 
   private resolveSharedKnowledgeDir(config: BridgeConfig): string {
     return path.join(config.memoryVaultDir, "shared", "knowledge");
+  }
+
+  private async validateUpgradedState(
+    agentDataDir: string,
+    knowledgeDir: string,
+    config: BridgeConfig,
+  ): Promise<void> {
+    const rawStore = new RawMessageStore(agentDataDir, config.agentId);
+    const summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
+    const observationStore = new ObservationStore(agentDataDir, config.agentId);
+    const durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
+    const knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
+    const projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
+    const vault = new AgentVault(config.memoryVaultDir, config.agentId);
+
+    await rawStore.init();
+    await summaryStore.init();
+    await observationStore.init();
+    await durableMemoryStore.init();
+    await knowledgeStore.init();
+    await projectStore.init();
+    await vault.ensureLayout();
+
+    for (const summary of summaryStore.getAllSummaries()) {
+      const startTurn = Number(summary.startTurn);
+      const endTurn = Number(summary.endTurn);
+      if (!Number.isFinite(startTurn) || !Number.isFinite(endTurn) || startTurn > endTurn) {
+        throw new Error(`Invalid summary turn range after upgrade for summary ${summary.id}`);
+      }
+    }
+
+    durableMemoryStore.getAll();
+    projectStore.getAll();
+    knowledgeStore.searchRelatedDocuments("upgrade validation", 1);
   }
 }

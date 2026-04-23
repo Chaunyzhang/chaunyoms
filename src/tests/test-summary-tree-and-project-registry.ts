@@ -41,10 +41,15 @@ async function main(): Promise<void> {
           summary: "Rollup-safe summary capturing implementation status and next actions.",
           keywords: ["chaunyoms", "memory", "project", "summary"],
           toneTag: "focused",
+          memoryType: "project_state",
+          phase: "implementation",
           constraints: ["keep external data stable"],
           decisions: ["preserve raw history", "build summary hierarchy"],
           blockers: [],
+          nextSteps: ["stabilize rollup metadata", "keep project registry aligned"],
+          keyEntities: ["ChaunyomsSessionRuntime.ts", "ProjectRegistryStore"],
           exactFacts: ["contextThreshold=0.45", "compactionBatchTurns=2"],
+          promotionIntent: "promote",
         });
       },
     },
@@ -94,6 +99,11 @@ async function main(): Promise<void> {
   assert(branch, "expected summary hierarchy rollup to create at least one branch summary");
   assert((branch?.summaryLevel ?? 0) > 1, "expected branch summary to have a higher summary level");
   assert((branch?.childSummaryIds?.length ?? 0) >= 3, "expected branch summary to link multiple child summaries");
+  assert(branch?.memoryType === "project_state", "expected branch summary to retain memory type metadata");
+  assert(branch?.phase === "implementation", "expected branch summary to retain phase metadata");
+  assert((branch?.nextSteps?.length ?? 0) > 0, "expected branch summary to retain next-step metadata");
+  assert((branch?.keyEntities?.length ?? 0) > 0, "expected branch summary to retain key-entity metadata");
+  assert(branch?.promotionIntent === "promote", "expected branch summary to retain promotion intent metadata");
 
   const childIds = new Set(branch?.childSummaryIds ?? []);
   const linkedChildren = summaries.filter((entry) => childIds.has(entry.id));

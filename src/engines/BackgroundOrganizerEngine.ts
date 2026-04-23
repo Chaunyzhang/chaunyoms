@@ -102,6 +102,18 @@ export class BackgroundOrganizerEngine {
     const reconciledProjects: ProjectRecord[] = [];
     for (const [projectId, bucket] of grouped.entries()) {
       const latestSummary = [...bucket.summaries].sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      const latestProjectStateSummary = [...bucket.summaries]
+        .filter((entry) => entry.memoryType === "project_state")
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      const latestDecisionSummary = [...bucket.summaries]
+        .filter((entry) => entry.memoryType === "decision" || entry.decisions.length > 0)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      const latestConstraintSummary = [...bucket.summaries]
+        .filter((entry) => entry.memoryType === "constraint" || entry.constraints.length > 0)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+      const latestDiagnosticSummary = [...bucket.summaries]
+        .filter((entry) => entry.memoryType === "diagnostic" || entry.blockers.length > 0)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
       const latestProjectState = [...bucket.memories]
         .filter((entry) => entry.kind === "project_state")
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
@@ -128,11 +140,30 @@ export class BackgroundOrganizerEngine {
         title: snapshot?.projectTitle || identity.title,
         status: snapshot ? deriveProjectStatusFromSnapshot(snapshot) : (bucket.summaries.length > 0 ? "active" : "planned"),
         summary: latestSummary?.summary ?? latestProjectState?.text ?? "No summary recorded yet.",
-        activeFocus: snapshot?.active ?? latestProjectState?.text ?? latestSummary?.summary ?? "none recorded",
-        currentDecision: snapshot?.decision ?? latestSummary?.decisions?.[0] ?? "none recorded",
-        nextStep: snapshot?.next ?? "none recorded",
+        activeFocus:
+          snapshot?.active ??
+          latestProjectStateSummary?.summary ??
+          latestProjectStateSummary?.phase ??
+          latestProjectState?.text ??
+          latestSummary?.summary ??
+          "none recorded",
+        currentDecision:
+          snapshot?.decision ??
+          latestDecisionSummary?.decisions?.[0] ??
+          latestConstraintSummary?.constraints?.[0] ??
+          "none recorded",
+        nextStep:
+          snapshot?.next ??
+          latestProjectStateSummary?.nextSteps?.[0] ??
+          latestDecisionSummary?.nextSteps?.[0] ??
+          latestSummary?.nextSteps?.[0] ??
+          "none recorded",
         todo: snapshot?.todo ?? "none recorded",
-        blocker: snapshot?.blocker ?? latestSummary?.blockers?.[0] ?? "none recorded",
+        blocker:
+          snapshot?.blocker ??
+          latestDiagnosticSummary?.blockers?.[0] ??
+          latestSummary?.blockers?.[0] ??
+          "none recorded",
         risk: snapshot?.risk ?? "none recorded",
         tags: [...new Set(tags)].slice(0, 24),
         sourceSessionIds: [

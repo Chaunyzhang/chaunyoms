@@ -15,6 +15,34 @@ import {
   buildStableEventId,
   deriveProjectIdentityFromMessages,
 } from "../utils/projectIdentity";
+
+const SUMMARY_MEMORY_TYPES = [
+  "project_state",
+  "decision",
+  "constraint",
+  "diagnostic",
+  "preference",
+  "feedback",
+  "temporary_note",
+  "general",
+] as const;
+
+const SUMMARY_PHASES = [
+  "planning",
+  "implementation",
+  "validation",
+  "fixing",
+  "review",
+  "active",
+] as const;
+
+const PROMOTION_INTENTS = [
+  "navigation_only",
+  "candidate",
+  "promote",
+  "priority_promote",
+] as const;
+
 export class CompactionEngine {
   constructor(
     private readonly llmCaller: LlmCaller | null,
@@ -84,7 +112,11 @@ export class CompactionEngine {
       return null;
     }
 
-    const protectedTurns = this.selectProtectedTailTurns(uncompacted, freshTailTokens, maxFreshTailTurns);
+    const protectedTurns = this.selectProtectedTailTurns(
+      uncompacted,
+      freshTailTokens,
+      maxFreshTailTurns,
+    );
     const candidateTurnNumbers = turnNumbers.filter((turnNumber) => !protectedTurns.has(turnNumber));
     const candidateTurns = candidateTurnNumbers.slice(0, Math.min(maxTurns, candidateTurnNumbers.length));
     if (candidateTurns.length === 0) {
@@ -97,9 +129,13 @@ export class CompactionEngine {
     return messages.length === 0 ? null : { startTurn, endTurn, messages };
   }
 
-  async generateSummary(messages: RawMessage[], summaryModel: string | undefined, maxOutputTokens: number): Promise<SummaryResult> {
+  async generateSummary(
+    messages: RawMessage[],
+    summaryModel: string | undefined,
+    maxOutputTokens: number,
+  ): Promise<SummaryResult | null> {
     if (!this.llmCaller) {
-      return this.buildFallbackSummary(messages);
+      return null;
     }
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -128,7 +164,7 @@ export class CompactionEngine {
       }
     }
 
-    return this.buildFallbackSummary(messages);
+    return null;
   }
 
   async runCompaction(
@@ -204,13 +240,17 @@ export class CompactionEngine {
         });
         return null;
       }
+
       const projectIdentity = deriveProjectIdentityFromMessages(
         candidate.messages,
         `${agentId}-${sessionId}`,
       );
       const entry: SummaryEntry = {
         id: randomUUID(),
-        eventId: buildStableEventId("summary", `${sessionId}|${candidate.startTurn}|${candidate.endTurn}|${sourceHash}`),
+        eventId: buildStableEventId(
+          "summary",
+          `${sessionId}|${candidate.startTurn}|${candidate.endTurn}|${sourceHash}`,
+        ),
         sessionId,
         agentId,
         projectId: projectIdentity.projectId,
@@ -219,10 +259,15 @@ export class CompactionEngine {
         summary: summary.summary,
         keywords: summary.keywords,
         toneTag: summary.toneTag,
+        memoryType: summary.memoryType,
+        phase: summary.phase,
         constraints: summary.constraints,
         decisions: summary.decisions,
         blockers: summary.blockers,
+        nextSteps: summary.nextSteps,
+        keyEntities: summary.keyEntities,
         exactFacts: summary.exactFacts,
+        promotionIntent: summary.promotionIntent,
         startTurn: candidate.startTurn,
         endTurn: candidate.endTurn,
         sourceFirstMessageId: candidate.messages[0]?.id,
@@ -257,20 +302,27 @@ export class CompactionEngine {
       .join("\n\n");
 
     return [
-      "You are generating a compact transcript summary for a context engine.",
-      "Return JSON with exactly these keys: summary, keywords, toneTag, constraints, decisions, blockers, exactFacts.",
+      "You are generating a high-quality structured memory node for a context engine.",
+      "Do not optimize for extreme brevity. Optimize for factual retention, structure, and future reuse.",
+      "Return JSON with exactly these keys: summary, keywords, toneTag, memoryType, phase, constraints, decisions, blockers, nextSteps, keyEntities, exactFacts, promotionIntent.",
       "Output only one JSON object. Do not wrap it in markdown.",
       "Do not output any extra commentary before or after the JSON object.",
       attempt > 1
         ? "Important: suppress reasoning and emit the final JSON object immediately."
         : "",
-      "summary must be concise and fact-preserving.",
+      "summary must be structured, fact-preserving, and readable by both humans and downstream organizer logic.",
       "keywords must be an array of short search terms.",
       "toneTag must be a short phrase describing the dialogue tone.",
+      `memoryType must be one of: ${SUMMARY_MEMORY_TYPES.join(", ")}.`,
+      "phase must be a short lifecycle label such as planning, implementation, validation, fixing, review, or active.",
       "constraints must list explicit limits, requirements, and must-not rules.",
       "decisions must list concrete decisions or settled implementation choices.",
       "blockers must list concrete failures, risks, or unresolved blockers.",
-      "exactFacts must list exact numbers, ports, file names, config keys, parameter values, and other precise anchors that should survive compression.",
+      "nextSteps must list concrete next actions or follow-up work.",
+      "keyEntities must list important project names, files, modules, APIs, components, or other retrieval anchors.",
+      "exactFacts must list exact numbers, file names, config keys, parameter values, and other precise anchors that should survive compression.",
+      `promotionIntent must be one of: ${PROMOTION_INTENTS.join(", ")}.`,
+      "Prefer promote or priority_promote only when the node is strong enough to become a reusable long-term asset.",
       "",
       transcript,
     ].join("\n");
@@ -284,9 +336,7 @@ export class CompactionEngine {
 
     const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]+?)```/i);
     if (fencedMatch) {
-      const fenced = this.normalizeSummaryCandidate(
-        this.tryParseJsonObject(fencedMatch[1]),
-      );
+      const fenced = this.normalizeSummaryCandidate(this.tryParseJsonObject(fencedMatch[1]));
       if (fenced) {
         return fenced;
       }
@@ -297,11 +347,6 @@ export class CompactionEngine {
     );
     if (embedded) {
       return embedded;
-    }
-
-    const labeled = this.parseLabeledSummary(raw);
-    if (labeled) {
-      return labeled;
     }
 
     return null;
@@ -368,6 +413,11 @@ export class CompactionEngine {
         summary: candidateRecord.summary,
         keywords: candidateRecord.keywords.map((keyword) => String(keyword)),
         toneTag: candidateRecord.toneTag,
+        memoryType: this.normalizeMemoryType(candidateRecord.memoryType),
+        phase:
+          typeof candidateRecord.phase === "string"
+            ? this.normalizePhase(candidateRecord.phase)
+            : undefined,
         constraints: Array.isArray(candidateRecord.constraints)
           ? candidateRecord.constraints.map((item) => String(item))
           : [],
@@ -377,9 +427,16 @@ export class CompactionEngine {
         blockers: Array.isArray(candidateRecord.blockers)
           ? candidateRecord.blockers.map((item) => String(item))
           : [],
+        nextSteps: Array.isArray(candidateRecord.nextSteps)
+          ? candidateRecord.nextSteps.map((item) => String(item))
+          : [],
+        keyEntities: Array.isArray(candidateRecord.keyEntities)
+          ? candidateRecord.keyEntities.map((item) => String(item))
+          : [],
         exactFacts: Array.isArray(candidateRecord.exactFacts)
           ? candidateRecord.exactFacts.map((item) => String(item))
           : [],
+        promotionIntent: this.normalizePromotionIntent(candidateRecord.promotionIntent),
       };
     }
 
@@ -412,141 +469,25 @@ export class CompactionEngine {
     return start >= 0 && end > start ? raw.slice(start, end + 1) : raw;
   }
 
-  private parseLabeledSummary(raw: string): SummaryResult | null {
-    const summaryMatch = raw.match(/summary\s*[:：]\s*(.+)/i);
-    const keywordsMatch = raw.match(/keywords?\s*[:：]\s*(.+)/i);
-    const toneMatch = raw.match(/toneTag\s*[:：]\s*(.+)/i);
-    if (!summaryMatch || !keywordsMatch) {
-      return null;
-    }
-
-    const keywords = keywordsMatch[1]
-      .split(/[,\uFF0C|]/)
-      .map((keyword) => keyword.trim())
-      .filter(Boolean);
-    if (keywords.length === 0) {
-      return null;
-    }
-
-    return {
-      summary: summaryMatch[1].trim(),
-      keywords,
-      toneTag: toneMatch?.[1]?.trim() || "neutral",
-      constraints: [],
-      decisions: [],
-      blockers: [],
-      exactFacts: [],
-    };
+  private normalizeMemoryType(value: unknown): SummaryResult["memoryType"] {
+    const candidate = String(value ?? "").trim();
+    return (SUMMARY_MEMORY_TYPES as readonly string[]).includes(candidate)
+      ? (candidate as SummaryResult["memoryType"])
+      : "general";
   }
 
-  private buildFallbackSummary(messages: RawMessage[]): SummaryResult {
-    const startTurn = messages[0]?.turnNumber ?? 0;
-    const endTurn = messages[messages.length - 1]?.turnNumber ?? startTurn;
-    const sentences = messages.flatMap((message) =>
-      this.extractSentences(message.content).map((sentence) => ({
-        role: message.role,
-        sentence,
-      })),
-    );
-    const constraints = this.pickFallbackHighlights(
-      sentences,
-      /(constraint|must|must not|do not|don't|should not|require|need to|不要|必须|约束|禁用|disable)/i,
-    );
-    const decisions = this.pickFallbackHighlights(
-      sentences,
-      /(decision|decided|keep|we will|recorded|选择|决定|保留|采用)/i,
-    );
-    const blockers = this.pickFallbackHighlights(
-      sentences,
-      /(blocker|blocked|error|fail|issue|risk|cannot|can't|not installed|阻塞|卡住|失败|报错|风险)/i,
-    );
-    const nextActions = this.pickFallbackHighlights(
-      sentences,
-      /(next action|next step|follow-up|todo|pending|下一步|待办|后续|接下来)/i,
-    );
-    const exactFacts = this.pickFallbackHighlights(
-      sentences,
-      /(\b\d{2,}\b|port|gateway|profile|config|parameter|exact|具体|端口|配置|参数)/i,
-    );
-    const summaryParts = [
-      `Fallback transcript summary for turns ${startTurn}-${endTurn}.`,
-      constraints.length > 0 ? `Constraints: ${constraints.join(" | ")}` : "",
-      decisions.length > 0 ? `Decisions: ${decisions.join(" | ")}` : "",
-      blockers.length > 0 ? `Blockers: ${blockers.join(" | ")}` : "",
-      nextActions.length > 0 ? `Next: ${nextActions.join(" | ")}` : "",
-      exactFacts.length > 0 ? `Facts: ${exactFacts.join(" | ")}` : "",
-    ].filter(Boolean);
-    const content = summaryParts.join("\n");
-    const keywords = this.buildFallbackKeywords([
-      ...constraints,
-      ...decisions,
-      ...blockers,
-      ...nextActions,
-      ...exactFacts,
-    ]);
-    return {
-      summary: content,
-      keywords,
-      toneTag: "neutral",
-      constraints,
-      decisions,
-      blockers,
-      exactFacts,
-    };
+  private normalizePromotionIntent(value: unknown): SummaryResult["promotionIntent"] {
+    const candidate = String(value ?? "").trim();
+    return (PROMOTION_INTENTS as readonly string[]).includes(candidate)
+      ? (candidate as SummaryResult["promotionIntent"])
+      : "candidate";
   }
 
-  private extractSentences(content: string): string[] {
-    return content
-      .split(/(?<=[.!?。！？])\s+/)
-      .map((sentence) => sentence.replace(/\s+/g, " ").trim())
-      .filter(Boolean);
-  }
-
-  private pickFallbackHighlights(
-    sentences: Array<{ role: RawMessage["role"]; sentence: string }>,
-    pattern: RegExp,
-    limit = 2,
-  ): string[] {
-    const picked: string[] = [];
-    for (const { sentence } of sentences) {
-      if (!pattern.test(sentence)) {
-        continue;
-      }
-      if (picked.includes(sentence)) {
-        continue;
-      }
-      picked.push(sentence);
-      if (picked.length >= limit) {
-        break;
-      }
-    }
-    return picked;
-  }
-
-  private buildFallbackKeywords(highlights: string[]): string[] {
-    const keywords = new Set<string>();
-    for (const highlight of highlights) {
-      const exactAnchors = highlight.match(/\b\d{2,}\b/g) ?? [];
-      for (const anchor of exactAnchors) {
-        keywords.add(anchor.toLowerCase());
-        if (keywords.size >= 10) {
-          return [...keywords];
-        }
-      }
-    }
-    for (const highlight of highlights) {
-      const terms = highlight
-        .split(/[^a-zA-Z0-9\u4e00-\u9fff]+/)
-        .map((term) => term.trim().toLowerCase())
-        .filter((term) => term.length >= 2);
-      for (const term of terms) {
-        keywords.add(term);
-        if (keywords.size >= 10) {
-          return [...keywords];
-        }
-      }
-    }
-    return [...keywords];
+  private normalizePhase(value: unknown): SummaryResult["phase"] {
+    const candidate = String(value ?? "").trim().toLowerCase();
+    return (SUMMARY_PHASES as readonly string[]).includes(candidate)
+      ? (candidate as SummaryResult["phase"])
+      : undefined;
   }
 
   private resolveLastClosedTurn(messages: RawMessage[]): number {
@@ -594,9 +535,9 @@ export class CompactionEngine {
       maxFreshTailTurns,
     );
 
-    return uncompacted.reduce((sum, message) => {
-      return protectedTurns.has(message.turnNumber) ? sum : sum + message.tokenCount;
-    }, 0);
+    return uncompacted.reduce((sum, message) => (
+      protectedTurns.has(message.turnNumber) ? sum : sum + message.tokenCount
+    ), 0);
   }
 
   private selectProtectedTailTurns(

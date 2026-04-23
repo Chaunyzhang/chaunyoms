@@ -1,6 +1,27 @@
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 export type RecordStatus = "active" | "superseded" | "archived";
 export type SummaryNodeKind = "leaf" | "branch";
+export type SummaryMemoryType =
+  | "project_state"
+  | "decision"
+  | "constraint"
+  | "diagnostic"
+  | "preference"
+  | "feedback"
+  | "temporary_note"
+  | "general";
+export type SummaryPhase =
+  | "planning"
+  | "implementation"
+  | "validation"
+  | "fixing"
+  | "review"
+  | "active";
+export type PromotionIntent =
+  | "navigation_only"
+  | "candidate"
+  | "promote"
+  | "priority_promote";
 
 export interface RawMessage {
   id: string;
@@ -94,10 +115,15 @@ export interface SummaryEntry {
   summary: string;
   keywords: string[];
   toneTag: string;
+  memoryType?: SummaryMemoryType;
+  phase?: SummaryPhase;
   constraints: string[];
   decisions: string[];
   blockers: string[];
+  nextSteps?: string[];
+  keyEntities?: string[];
   exactFacts: string[];
+  promotionIntent?: PromotionIntent;
   startTurn: number;
   endTurn: number;
   sourceFirstMessageId?: string;
@@ -254,6 +280,31 @@ export interface KnowledgeRepository {
   ): Promise<KnowledgePromotionResult>;
 }
 
+export interface ExternalKnowledgeCapabilities {
+  read: boolean;
+  write: boolean;
+  supportsVersions: boolean;
+  supportsBacklinks: boolean;
+}
+
+export interface ExternalKnowledgeHit {
+  providerId: string;
+  sourceKind: "external";
+  title: string;
+  summary: string;
+  tags: string[];
+  canonicalKey?: string;
+  filePath?: string;
+  score?: number;
+}
+
+export interface ExternalKnowledgeProvider {
+  id: string;
+  init(): Promise<void>;
+  describeCapabilities(): ExternalKnowledgeCapabilities;
+  search(query: string, limit?: number): Promise<ExternalKnowledgeHit[]> | ExternalKnowledgeHit[];
+}
+
 export interface ContextBudget {
   totalBudget: number;
   availableBudget: number;
@@ -301,10 +352,15 @@ export interface SummaryResult {
   summary: string;
   keywords: string[];
   toneTag: string;
+  memoryType?: SummaryMemoryType;
+  phase?: SummaryPhase;
   constraints: string[];
   decisions: string[];
   blockers: string[];
+  nextSteps?: string[];
+  keyEntities?: string[];
   exactFacts: string[];
+  promotionIntent?: PromotionIntent;
 }
 
 export interface CompactionCandidate {

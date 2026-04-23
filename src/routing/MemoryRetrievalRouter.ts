@@ -44,6 +44,22 @@ export class MemoryRetrievalRouter {
     const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
     const stateAvailable = context.hasStructuredNavigationState || context.hasNavigationHint || context.hasProjectRegistry;
 
+    if (asksDurable && context.hasDurableHits) {
+      return this.decision(
+        "durable_memory",
+        context.matchedProjectId ? "matched_project_durable_memory_query" : "durable_memory_query",
+        false,
+        false,
+        true,
+        ["durable_memory", "project_registry", "summary_tree"],
+        context.matchedProjectTitle
+          ? `The query asks for stable constraints/decisions, so durable memory is the primary layer for the matched project (${context.matchedProjectTitle}).`
+          : "The query asks for stable constraints/decisions, so durable memory is the primary layer.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
+      );
+    }
+
     if ((asksProjectState || referencesCurrentWork) && context.hasProjectRegistry) {
       return this.decision(
         "project_registry",
@@ -55,20 +71,6 @@ export class MemoryRetrievalRouter {
         context.matchedProjectTitle
           ? `The query is about project state, so route to the project registry first (matched project: ${context.matchedProjectTitle}).`
           : "The query is about project state, so route to the project registry first.",
-        context.matchedProjectId,
-        context.matchedProjectTitle,
-      );
-    }
-
-    if (asksDurable && context.hasDurableHits) {
-      return this.decision(
-        "durable_memory",
-        "durable_memory_query",
-        false,
-        false,
-        true,
-        ["durable_memory", "project_registry", "summary_tree"],
-        "The query asks for stable constraints/decisions, so durable memory is the primary layer.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );

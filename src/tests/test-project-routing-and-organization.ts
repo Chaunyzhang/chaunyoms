@@ -144,6 +144,16 @@ async function main(): Promise<void> {
   assert(beaconRetrieve.details.route === "durable_memory", "expected durable constraint queries to route to durable memory");
   assert(/postgres connection pool/i.test(beaconText), "expected durable retrieval to return the Beacon constraint");
 
+  const atlasRetrieve = await retrieval.executeMemoryRetrieve({
+    sessionId: config.sessionId,
+    config,
+    query: "What decision did we make for Project Atlas?",
+  });
+  const atlasText = String(atlasRetrieve.content[0]?.text ?? "");
+  assert(atlasRetrieve.details.route === "durable_memory", "expected durable decision queries to route to durable memory");
+  assert(/redis queue/i.test(atlasText), "expected project-scoped durable retrieval to prioritize Atlas decision");
+  assert(!/postgres connection pool/i.test(atlasText), "expected project-scoped durable retrieval to avoid Beacon bleed-through");
+
   await rm(dir, { recursive: true, force: true });
   console.log("test-project-routing-and-organization passed");
 }

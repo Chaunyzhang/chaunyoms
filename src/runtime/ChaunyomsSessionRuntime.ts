@@ -576,7 +576,7 @@ export class ChaunyomsSessionRuntime {
   ): number {
     const messages = rawStore.getAll();
     const lastTurn = messages[messages.length - 1]?.turnNumber ?? 0;
-    return role === "assistant" ? Math.max(lastTurn, 1) : lastTurn + 1;
+    return role === "user" ? lastTurn + 1 : Math.max(lastTurn, 1);
   }
 
   private findRuntimeOverlap(

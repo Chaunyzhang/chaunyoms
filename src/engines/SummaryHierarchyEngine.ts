@@ -5,6 +5,7 @@ import {
   LoggerLike,
   SummaryEntry,
   SummaryRepository,
+  SummaryResult,
 } from "../types";
 import { estimateTokens } from "../utils/tokenizer";
 import {
@@ -12,15 +13,14 @@ import {
   deriveProjectIdentityFromSummary,
 } from "../utils/projectIdentity";
 
-interface SummaryResult {
-  summary: string;
-  keywords: string[];
-  toneTag: string;
-  constraints: string[];
-  decisions: string[];
-  blockers: string[];
-  exactFacts: string[];
-}
+const SUMMARY_PHASES = new Set([
+  "planning",
+  "implementation",
+  "validation",
+  "fixing",
+  "review",
+  "active",
+]);
 
 export class SummaryHierarchyEngine {
   constructor(
@@ -58,10 +58,15 @@ export class SummaryHierarchyEngine {
       summary: result.summary,
       keywords: result.keywords,
       toneTag: result.toneTag,
+      memoryType: result.memoryType,
+      phase: result.phase,
       constraints: result.constraints,
       decisions: result.decisions,
       blockers: result.blockers,
+      nextSteps: result.nextSteps,
+      keyEntities: result.keyEntities,
       exactFacts: result.exactFacts,
+      promotionIntent: result.promotionIntent,
       startTurn: candidateGroup[0].startTurn,
       endTurn: candidateGroup[candidateGroup.length - 1].endTurn,
       sourceFirstMessageId: candidateGroup[0].sourceFirstMessageId,
@@ -115,24 +120,29 @@ export class SummaryHierarchyEngine {
     maxOutputTokens: number,
   ): Promise<SummaryResult> {
     if (!this.llmCaller) {
-      return this.buildFallback(children);
+      throw new Error("LLM caller unavailable for summary hierarchy rollup");
     }
 
     try {
       const prompt = [
         "You are generating a higher-level rollup summary for a memory tree.",
-        "Return JSON with exactly these keys: summary, keywords, toneTag, constraints, decisions, blockers, exactFacts.",
+        "Return JSON with exactly these keys: summary, keywords, toneTag, memoryType, phase, constraints, decisions, blockers, nextSteps, keyEntities, exactFacts, promotionIntent.",
         "The output must merge child summaries into a navigation-level parent summary.",
         "Do not invent facts. Keep references stable and concise.",
         "",
         ...children.map((child, index) => [
           `Child summary ${index + 1} (${child.startTurn}-${child.endTurn}):`,
           child.summary,
+          `memoryType: ${child.memoryType ?? "general"}`,
+          `phase: ${child.phase ?? ""}`,
           `keywords: ${child.keywords.join(", ")}`,
           `constraints: ${child.constraints.join("; ")}`,
           `decisions: ${child.decisions.join("; ")}`,
           `blockers: ${child.blockers.join("; ")}`,
+          `nextSteps: ${(child.nextSteps ?? []).join("; ")}`,
+          `keyEntities: ${(child.keyEntities ?? []).join("; ")}`,
           `exactFacts: ${child.exactFacts.join("; ")}`,
+          `promotionIntent: ${child.promotionIntent ?? "candidate"}`,
         ].join("\n")),
       ].join("\n\n");
       const raw = await this.llmCaller.call({
@@ -145,26 +155,13 @@ export class SummaryHierarchyEngine {
       if (parsed) {
         return parsed;
       }
+      throw new Error("LLM rollup response was not valid JSON summary output");
     } catch (error) {
       this.logger.warn("summary_hierarchy_rollup_failed", {
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
-
-    return this.buildFallback(children);
-  }
-
-  private buildFallback(children: SummaryEntry[]): SummaryResult {
-    const summary = children.map((child) => child.summary).join(" ").slice(0, 600);
-    return {
-      summary: summary.trim(),
-      keywords: [...new Set(children.flatMap((child) => child.keywords))].slice(0, 10),
-      toneTag: "structured rollup",
-      constraints: [...new Set(children.flatMap((child) => child.constraints))].slice(0, 8),
-      decisions: [...new Set(children.flatMap((child) => child.decisions))].slice(0, 8),
-      blockers: [...new Set(children.flatMap((child) => child.blockers))].slice(0, 8),
-      exactFacts: [...new Set(children.flatMap((child) => child.exactFacts))].slice(0, 12),
-    };
   }
 
   private tryParse(raw: string): SummaryResult | null {
@@ -177,13 +174,23 @@ export class SummaryHierarchyEngine {
         summary: parsed.summary.trim(),
         keywords: Array.isArray(parsed.keywords) ? parsed.keywords.map(String) : [],
         toneTag: typeof parsed.toneTag === "string" ? parsed.toneTag : "structured rollup",
+        memoryType: typeof parsed.memoryType === "string" ? parsed.memoryType as SummaryResult["memoryType"] : "project_state",
+        phase: this.normalizePhase(parsed.phase),
         constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map(String) : [],
         decisions: Array.isArray(parsed.decisions) ? parsed.decisions.map(String) : [],
         blockers: Array.isArray(parsed.blockers) ? parsed.blockers.map(String) : [],
+        nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps.map(String) : [],
+        keyEntities: Array.isArray(parsed.keyEntities) ? parsed.keyEntities.map(String) : [],
         exactFacts: Array.isArray(parsed.exactFacts) ? parsed.exactFacts.map(String) : [],
+        promotionIntent: typeof parsed.promotionIntent === "string" ? parsed.promotionIntent as SummaryResult["promotionIntent"] : "candidate",
       };
     } catch {
       return null;
     }
+  }
+
+  private normalizePhase(value: unknown): SummaryResult["phase"] {
+    const candidate = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return SUMMARY_PHASES.has(candidate) ? candidate as SummaryResult["phase"] : undefined;
   }
 }
