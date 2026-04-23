@@ -1,4 +1,6 @@
 export type MessageRole = "system" | "user" | "assistant" | "tool";
+export type RecordStatus = "active" | "superseded" | "archived";
+export type SummaryNodeKind = "leaf" | "branch";
 
 export interface RawMessage {
   id: string;
@@ -50,15 +52,24 @@ export interface ObservationRepository {
 
 export interface DurableMemoryEntry {
   id: string;
+  eventId?: string;
   sessionId: string;
   agentId?: string;
+  projectId?: string;
+  topicId?: string;
   kind: "user_fact" | "assistant_decision" | "project_state" | "solution" | "diagnostic" | "constraint";
+  recordStatus?: RecordStatus;
+  supersededById?: string;
   text: string;
   fingerprint: string;
   tags: string[];
   createdAt: string;
   sourceType: "raw_message" | "observation" | "snapshot";
   sourceIds: string[];
+  sourceSequenceMin?: number;
+  sourceSequenceMax?: number;
+  sourceStartTimestamp?: string;
+  sourceEndTimestamp?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -72,8 +83,13 @@ export interface DurableMemoryRepository {
 
 export interface SummaryEntry {
   id: string;
+  eventId?: string;
   sessionId: string;
   agentId?: string;
+  projectId?: string;
+  topicId?: string;
+  recordStatus?: RecordStatus;
+  supersededById?: string;
   summary: string;
   keywords: string[];
   toneTag: string;
@@ -90,6 +106,11 @@ export interface SummaryEntry {
   sourceEndTimestamp?: string;
   sourceSequenceMin?: number;
   sourceSequenceMax?: number;
+  sourceSummaryIds?: string[];
+  parentSummaryId?: string;
+  childSummaryIds?: string[];
+  summaryLevel?: number;
+  nodeKind?: SummaryNodeKind;
   tokenCount: number;
   createdAt: string;
   sourceHash?: string;
@@ -99,7 +120,10 @@ export interface SummaryEntry {
 export interface SummaryRepository {
   init(): Promise<void>;
   addSummary(entry: SummaryEntry): Promise<boolean>;
+  upsertSummary(entry: SummaryEntry): Promise<void>;
   getAllSummaries(): SummaryEntry[];
+  getActiveSummaries(): SummaryEntry[];
+  getRootSummaries(): SummaryEntry[];
   getCoveredTurns(): Set<number>;
   findBySourceCoverage(
     startTurn: number,
@@ -109,6 +133,38 @@ export interface SummaryRepository {
   ): SummaryEntry | null;
   search(query: string): SummaryEntry[];
   getTotalTokens(): number;
+  attachParent(parentSummaryId: string, childSummaryIds: string[]): Promise<void>;
+}
+
+export interface ProjectRecord {
+  id: string;
+  agentId: string;
+  canonicalKey: string;
+  title: string;
+  status: "active" | "blocked" | "planned" | "archived";
+  summary: string;
+  activeFocus: string;
+  currentDecision: string;
+  nextStep: string;
+  todo: string;
+  blocker: string;
+  risk: string;
+  tags: string[];
+  sourceSessionIds: string[];
+  summaryIds: string[];
+  memoryIds: string[];
+  topicIds: string[];
+  latestSummaryId?: string;
+  updatedAt: string;
+  createdAt: string;
+}
+
+export interface ProjectRegistryRepository {
+  init(): Promise<void>;
+  upsert(project: ProjectRecord): Promise<ProjectRecord>;
+  getAll(): ProjectRecord[];
+  findById(id: string): ProjectRecord | null;
+  findByCanonicalKey(canonicalKey: string): ProjectRecord | null;
 }
 
 export type KnowledgeDocBucket = "decisions" | "patterns" | "facts" | "incidents";
@@ -305,8 +361,11 @@ export interface RecallResult {
 }
 
 export interface ProjectStateSnapshot {
-  schemaVersion: 1;
+  schemaVersion: 2;
   dateLabel: string;
+  projectId: string;
+  projectTitle: string;
+  projectStatus: "active" | "blocked" | "planned" | "archived";
   active: string;
   decision: string;
   todo: string;

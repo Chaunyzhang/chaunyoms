@@ -60,7 +60,11 @@ export class ContextAssembler {
   }
 
   assembleSummaries(summaryStore: SummaryRepository, budget: number): ContextItem[] {
-    const summaries = [...summaryStore.getAllSummaries()].sort(
+    const rootSummaries = summaryStore.getRootSummaries();
+    const sourceSummaries = rootSummaries.length > 0
+      ? rootSummaries
+      : summaryStore.getActiveSummaries();
+    const summaries = [...sourceSummaries].sort(
       (left, right) => right.endTurn - left.endTurn || right.startTurn - left.startTurn,
     );
     const selected: ContextItem[] = [];
@@ -84,6 +88,13 @@ export class ContextAssembler {
           decisions: summary.decisions,
           blockers: summary.blockers,
           exactFacts: summary.exactFacts,
+          projectId: summary.projectId,
+          topicId: summary.topicId,
+          summaryLevel: summary.summaryLevel,
+          nodeKind: summary.nodeKind,
+          parentSummaryId: summary.parentSummaryId,
+          childSummaryIds: summary.childSummaryIds,
+          sourceSummaryIds: summary.sourceSummaryIds,
           startTurn: summary.startTurn,
           endTurn: summary.endTurn,
           sourceFirstMessageId: summary.sourceFirstMessageId,
@@ -101,6 +112,7 @@ export class ContextAssembler {
 
   assembleDurableMemory(durableMemoryStore: DurableMemoryRepository, budget: number): ContextItem[] {
     const memories = [...durableMemoryStore.getAll()]
+      .filter((entry) => entry.recordStatus === "active")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, 8);
     const selected: ContextItem[] = [];
@@ -122,6 +134,9 @@ export class ContextAssembler {
           layer: "durable_memory",
           kind: memory.kind,
           tags: memory.tags,
+          projectId: memory.projectId,
+          topicId: memory.topicId,
+          recordStatus: memory.recordStatus,
         },
       });
     }

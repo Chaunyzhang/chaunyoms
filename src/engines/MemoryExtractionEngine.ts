@@ -1,16 +1,21 @@
-import { createHash } from "node:crypto";
+ï»¿import { createHash } from "node:crypto";
 
 import { ObservationEntry, DurableMemoryEntry, RawMessage } from "../types";
+import {
+  buildStableEventId,
+  deriveProjectIdentityFromMessages,
+  deriveProjectIdentityFromText,
+} from "../utils/projectIdentity";
 
 const USER_MEMORY_PATTERNS = [
   /\b(?:must|need to|should|prefer|plan|will|want to|don't|do not|cannot|can't|blocker|risk|parameter|config|setting|exact)\b/i,
-  /(?:ĞèÒª|±ØĞë|Æ«ºÃ|¼Æ»®|ÏÂÒ»²½|×èÈû|·çÏÕ|²ÎÊı|ÅäÖÃ|¾«È·)/,
+  /(?:éœ€è¦|å¿…é¡»|åå¥½|è®¡åˆ’|ä¸‹ä¸€æ­¥|é˜»å¡|é£é™©|å‚æ•°|é…ç½®|ç²¾ç¡®)/,
   /\b[a-zA-Z_][\w-]{1,40}\s*[:=]\s*[^\s,;]{1,80}/,
 ];
 
 const ASSISTANT_MEMORY_PATTERNS = [
   /\b(?:root cause|fixed|fix|changed|decision|next step|recommend|keep|disable|enable|use|set|configured|will do|should)\b/i,
-  /(?:¸ùÒò|ĞŞ¸´|¸ÄÎª|¾ö¶¨|ÏÂÒ»²½|½¨Òé|±£³Ö|½ûÓÃ|ÆôÓÃ|Ê¹ÓÃ|ÉèÖÃ|ÅäÖÃ)/,
+  /(?:æ ¹å› |ä¿®å¤|æ”¹ä¸º|å†³å®š|ä¸‹ä¸€æ­¥|å»ºè®®|ä¿æŒ|ç¦ç”¨|å¯ç”¨|ä½¿ç”¨|è®¾ç½®|é…ç½®)/,
   /\b[a-zA-Z_][\w-]{1,40}\s*[:=]\s*[^\s,;]{1,80}/,
 ];
 
@@ -18,12 +23,12 @@ const TOOL_MEMORY_PATTERNS = [
   /\b(?:error|exception|failed|failure|warning|stderr|traceback|root cause)\b/i,
   /\b(?:created|updated|deleted|changed)\b/i,
   /\b(?:src|dist|package|config|port|timeout|token|parameter|setting)\b/i,
-  /(?:±¨´í|´íÎó|Ê§°Ü|¾¯¸æ|ĞŞ¸Ä|´´½¨|É¾³ı|ÅäÖÃ|²ÎÊı)/,
+  /(?:æŠ¥é”™|é”™è¯¯|å¤±è´¥|è­¦å‘Š|ä¿®æ”¹|åˆ›å»º|åˆ é™¤|é…ç½®|å‚æ•°)/,
 ];
 
 const UNCERTAINTY_PATTERNS = [
   /\b(?:not sure|unclear|need more context|might need|may be missing)\b/i,
-  /(?:²»È·¶¨|²»Çå³ş|ĞèÒª¸ü¶àÉÏÏÂÎÄ|¿ÉÄÜÈ±ÉÙĞÅÏ¢)/,
+  /(?:ä¸ç¡®å®š|ä¸æ¸…æ¥š|éœ€è¦æ›´å¤šä¸Šä¸‹æ–‡|å¯èƒ½ç¼ºå°‘ä¿¡æ¯)/,
 ];
 
 export class MemoryExtractionEngine {
@@ -34,7 +39,7 @@ export class MemoryExtractionEngine {
 
     if (message.role === "user") {
       return this.extract(
-        message.sessionId,
+        message,
         "user_fact",
         message.content,
         message.createdAt,
@@ -50,7 +55,7 @@ export class MemoryExtractionEngine {
         return [];
       }
       return this.extract(
-        message.sessionId,
+        message,
         "assistant_decision",
         message.content,
         message.createdAt,
@@ -70,7 +75,18 @@ export class MemoryExtractionEngine {
     }
 
     return this.extract(
-      observation.sessionId,
+      {
+        id: observation.id,
+        sessionId: observation.sessionId,
+        agentId: observation.agentId,
+        role: observation.role,
+        content: observation.content,
+        turnNumber: 0,
+        createdAt: observation.createdAt,
+        tokenCount: observation.tokenCount,
+        compacted: false,
+        metadata: observation.metadata,
+      },
       this.classifyToolObservation(observation.content),
       observation.content,
       observation.createdAt,
@@ -86,21 +102,28 @@ export class MemoryExtractionEngine {
     createdAt: string,
     snapshot: string,
   ): DurableMemoryEntry {
+    const identity = deriveProjectIdentityFromText([snapshot], sessionId);
     return {
       id: `memory-${this.hash(`${sessionId}|snapshot|${snapshot}`)}`,
+      eventId: buildStableEventId("memory", `${sessionId}|snapshot|${snapshot}`),
       sessionId,
+      projectId: identity.projectId,
+      topicId: identity.topicId,
       kind: "project_state",
+      recordStatus: "active",
       text: snapshot,
       fingerprint: this.hash(`snapshot|${snapshot}`),
       tags: ["project", "state", "navigation"],
       createdAt,
       sourceType: "snapshot",
       sourceIds: [],
+      sourceStartTimestamp: createdAt,
+      sourceEndTimestamp: createdAt,
     };
   }
 
   private extract(
-    sessionId: string,
+    sourceMessage: RawMessage,
     kind: DurableMemoryEntry["kind"],
     content: string,
     createdAt: string,
@@ -115,16 +138,27 @@ export class MemoryExtractionEngine {
       .filter((segment) => patterns.some((pattern) => pattern.test(segment)))
       .slice(0, 3);
 
+    const identity = deriveProjectIdentityFromMessages([sourceMessage], sourceMessage.sessionId);
+
     return segments.map((segment) => ({
-      id: `memory-${this.hash(`${sessionId}|${kind}|${segment}`)}`,
-      sessionId,
+      id: `memory-${this.hash(`${sourceMessage.sessionId}|${kind}|${segment}`)}`,
+      eventId: buildStableEventId("memory", `${sourceMessage.sessionId}|${kind}|${segment}`),
+      sessionId: sourceMessage.sessionId,
+      agentId: sourceMessage.agentId,
+      projectId: identity.projectId,
+      topicId: identity.topicId,
       kind,
+      recordStatus: "active",
       text: segment,
       fingerprint: this.hash(`${kind}|${segment}`),
       tags: [...baseTags, ...this.extractTags(segment)],
       createdAt,
       sourceType,
       sourceIds,
+      sourceSequenceMin: sourceMessage.sequence,
+      sourceSequenceMax: sourceMessage.sequence,
+      sourceStartTimestamp: createdAt,
+      sourceEndTimestamp: createdAt,
     }));
   }
 
@@ -141,7 +175,7 @@ export class MemoryExtractionEngine {
   private toSegments(content: string): string[] {
     return content
       .split(/\r?\n+/)
-      .flatMap((line) => line.split(/(?<=[.!?¡££¡£¿])\s+/))
+      .flatMap((line) => line.split(/(?<=[.!?ã€‚ï¼ï¼Ÿ])\s+/))
       .map((segment) => segment.replace(/\s+/g, " ").trim())
       .filter(Boolean)
       .map((segment) => (segment.length > 220 ? `${segment.slice(0, 217)}...` : segment));

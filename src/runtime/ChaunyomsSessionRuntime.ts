@@ -6,6 +6,7 @@ import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
+import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
 import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
 import {
   SessionDataLayer,
@@ -38,6 +39,11 @@ import {
   buildProjectStateSnapshot,
   formatProjectStateSnapshot,
 } from "../utils/projectState";
+import {
+  deriveProjectIdentityFromSnapshot,
+  deriveProjectIdentityFromSummary,
+  deriveProjectStatusFromSnapshot,
+} from "../utils/projectIdentity";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
 import { HostFixedContextEstimator } from "./HostFixedContextEstimator";
 
@@ -86,6 +92,7 @@ export class ChaunyomsSessionRuntime {
   private readonly assembler = new ContextAssembler(this.contextViewStore, this.prefixAdapter);
   private readonly extractionEngine = new MemoryExtractionEngine();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
+  private summaryHierarchyEngine: SummaryHierarchyEngine;
   private externalSystemBootstrap: ExternalSystemBootstrap;
   private compactionEngine: CompactionEngine;
   private llmCaller: LlmCaller | null;
@@ -106,6 +113,7 @@ export class ChaunyomsSessionRuntime {
     this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
+    this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
   }
 
   updateHost(logger: LoggerLike, llmCaller: LlmCaller | null): void {
@@ -114,6 +122,7 @@ export class ChaunyomsSessionRuntime {
     this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
+    this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
   }
 
   getConfig(): BridgeConfig {
@@ -256,6 +265,7 @@ export class ChaunyomsSessionRuntime {
     }
 
     await this.promoteSummaryToKnowledge(entry, rawStore, context);
+    await this.rollUpSummaryTree(summaryStore, context);
     await this.writeNavigationArtifactsIfPending(
       context,
       rawStore,
@@ -298,6 +308,7 @@ export class ChaunyomsSessionRuntime {
     if (compactionResult.entry) {
       await this.promoteSummaryToKnowledge(compactionResult.entry, rawStore, context);
       await this.sessionData.appendSummaryArtifact(compactionResult.entry);
+      await this.rollUpSummaryTree(summaryStore, context);
     }
 
     const { knowledgeStore } = await this.ensureSession(
@@ -336,6 +347,7 @@ export class ChaunyomsSessionRuntime {
       durableMemoryStore,
       compactionResult.compacted,
     );
+    await this.updateProjectRegistry(context, rawStore, summaryStore, durableMemoryStore);
 
     return {
       stats,
@@ -662,6 +674,7 @@ export class ChaunyomsSessionRuntime {
       }
 
       await this.promoteSummaryToKnowledge(entry, rawStore, context);
+      await this.rollUpSummaryTree(summaryStore, context);
       budgetState = await this.measureCompactionBudgetState(context, rawStore, summaryStore);
     }
 
@@ -941,6 +954,99 @@ export class ChaunyomsSessionRuntime {
     }
     await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
     this.navigationSnapshotPending = false;
+  }
+
+  private async rollUpSummaryTree(
+    summaryStore: SummaryRepository,
+    context: LifecycleContext,
+  ): Promise<void> {
+    let passes = 0;
+    while (passes < 4) {
+      passes += 1;
+      const rollup = await this.summaryHierarchyEngine.rollUp(
+        summaryStore,
+        context.sessionId,
+        this.config.agentId,
+        context.summaryModel,
+        this.config.summaryMaxOutputTokens,
+      );
+      if (!rollup) {
+        return;
+      }
+      this.navigationSnapshotPending = true;
+      await this.promoteSummaryToKnowledge(rollup, this.getActiveStores().rawStore, context);
+      await this.sessionData.appendSummaryArtifact(rollup);
+    }
+  }
+
+  private async updateProjectRegistry(
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    durableMemoryStore: DurableMemoryRepository,
+  ): Promise<void> {
+    const snapshot = buildProjectStateSnapshot(rawStore, summaryStore);
+    let identity = deriveProjectIdentityFromSnapshot(
+      snapshot,
+      `${this.config.agentId}-${context.sessionId}`,
+    );
+    const activeSummaries = summaryStore
+      .getActiveSummaries()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    let projectSummaries = activeSummaries
+      .filter((entry) => entry.projectId === identity.projectId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    if (projectSummaries.length === 0 && activeSummaries.length > 0) {
+      identity = deriveProjectIdentityFromSummary(
+        activeSummaries[0],
+        `${this.config.agentId}-${context.sessionId}`,
+      );
+      snapshot.projectId = identity.projectId;
+      snapshot.projectTitle = identity.title;
+      projectSummaries = activeSummaries.filter((entry) => entry.projectId === identity.projectId);
+    }
+
+    let projectMemories = durableMemoryStore
+      .getAll()
+      .filter((entry) => entry.recordStatus === "active" && entry.projectId === identity.projectId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    if (projectMemories.length === 0) {
+      projectMemories = durableMemoryStore
+        .getAll()
+        .filter((entry) => entry.recordStatus === "active")
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    }
+
+    await this.sessionData.upsertProjectRecord({
+      id: identity.projectId,
+      agentId: this.config.agentId,
+      canonicalKey: identity.canonicalKey,
+      title: snapshot.projectTitle || identity.title,
+      status: deriveProjectStatusFromSnapshot(snapshot),
+      summary: projectSummaries[0]?.summary ?? snapshot.active,
+      activeFocus: snapshot.active,
+      currentDecision: snapshot.decision,
+      nextStep: snapshot.next,
+      todo: snapshot.todo,
+      blocker: snapshot.blocker,
+      risk: snapshot.risk,
+      tags: [
+        identity.canonicalKey,
+        ...projectSummaries.flatMap((entry) => entry.keywords).slice(0, 12),
+        ...projectMemories.flatMap((entry) => entry.tags).slice(0, 12),
+      ],
+      sourceSessionIds: [context.sessionId],
+      summaryIds: projectSummaries.map((entry) => entry.id),
+      memoryIds: projectMemories.map((entry) => entry.id),
+      topicIds: [
+        identity.topicId,
+        ...projectSummaries.map((entry) => entry.topicId).filter((value): value is string => Boolean(value)),
+        ...projectMemories.map((entry) => entry.topicId).filter((value): value is string => Boolean(value)),
+      ],
+      latestSummaryId: projectSummaries[0]?.id,
+      updatedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    });
   }
 
   private getActiveStores(): SessionDataStores {

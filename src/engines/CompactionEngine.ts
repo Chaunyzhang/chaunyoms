@@ -11,6 +11,10 @@ import {
 } from "../types";
 import { estimateTokens } from "../utils/tokenizer";
 import { hashRawMessages } from "../utils/integrity";
+import {
+  buildStableEventId,
+  deriveProjectIdentityFromMessages,
+} from "../utils/projectIdentity";
 export class CompactionEngine {
   constructor(
     private readonly llmCaller: LlmCaller | null,
@@ -200,10 +204,18 @@ export class CompactionEngine {
         });
         return null;
       }
+      const projectIdentity = deriveProjectIdentityFromMessages(
+        candidate.messages,
+        `${agentId}-${sessionId}`,
+      );
       const entry: SummaryEntry = {
         id: randomUUID(),
+        eventId: buildStableEventId("summary", `${sessionId}|${candidate.startTurn}|${candidate.endTurn}|${sourceHash}`),
         sessionId,
         agentId,
+        projectId: projectIdentity.projectId,
+        topicId: projectIdentity.topicId,
+        recordStatus: "active",
         summary: summary.summary,
         keywords: summary.keywords,
         toneTag: summary.toneTag,
@@ -220,6 +232,8 @@ export class CompactionEngine {
         sourceEndTimestamp: candidate.messages[candidate.messages.length - 1]?.createdAt,
         sourceSequenceMin: candidate.messages[0]?.sequence,
         sourceSequenceMax: candidate.messages[candidate.messages.length - 1]?.sequence,
+        summaryLevel: 1,
+        nodeKind: "leaf",
         tokenCount: estimateTokens(summary.summary),
         createdAt: new Date().toISOString(),
         sourceHash,

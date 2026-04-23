@@ -33,9 +33,10 @@ Lightweight OMS context-engine plugin for OpenClaw.
 ## Memory Layers
 
 - `RawMessageStore`: source transcript layer for fresh tail assembly and source recall
-- `SummaryIndexStore`: compressed history layer; summaries now preserve structured fact anchors and stable source boundary metadata
-- `DurableMemoryStore`: extracted durable facts, decisions, diagnostics, and project-state hints for lightweight retrieval
+- `SummaryIndexStore`: compressed history layer; summaries now preserve structured fact anchors, project/topic coordinates, active-state markers, and parent/child summary-tree links
+- `DurableMemoryStore`: extracted durable facts, decisions, diagnostics, and project-state hints for lightweight retrieval with active/superseded record tracking
 - `KnowledgeMarkdownStore`: optional markdown knowledge promotion path, present in code but disabled by default
+- `ProjectRegistryStore`: agent-scoped project registry that tracks active focus, blockers, next steps, linked summaries, and linked durable memories
 - `SessionDataLayer`: the plugin's data boundary; runtime orchestration reads/writes through this layer instead of directly managing file stores
 
 ## Decoupling Status
@@ -45,6 +46,17 @@ ChaunyOMS now separates:
 - **data layer**: raw/summaries/observations/durable memory/knowledge persistence and migrations
 
 Core runtime services no longer depend on concrete file-store classes directly; they depend on repository interfaces and the session data layer.
+
+## Summary Tree / Project Organization
+
+- leaf summaries still compact raw message ranges
+- when enough root summaries accumulate, ChaunyOMS now rolls them into higher-level branch summaries
+- branch summaries keep child summary ids and inherited source-message boundaries so recall can still trace back to raw history
+- project snapshots now carry:
+  - `project_id`
+  - `project_title`
+  - `project_status`
+- durable project-state memories supersede older active project-state entries for the same project instead of piling up forever
 
 ## Update / Migration Behavior
 

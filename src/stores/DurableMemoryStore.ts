@@ -1,10 +1,11 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+﻿import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { DurableMemoryEntry } from "../types";
+import { buildStableEventId } from "../utils/projectIdentity";
 
-interface DurableMemoryFileV2 {
-  schemaVersion: 2;
+interface DurableMemoryFileV3 {
+  schemaVersion: 3;
   memories: DurableMemoryEntry[];
 }
 
@@ -21,9 +22,9 @@ export class DurableMemoryStore {
 
     try {
       const content = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(content) as DurableMemoryFileV2 | DurableMemoryEntry[];
+      const parsed = JSON.parse(content) as DurableMemoryFileV3 | DurableMemoryEntry[];
       const entries = Array.isArray(parsed) ? parsed : parsed.memories;
-      this.memories = Array.isArray(entries) ? [...entries] : [];
+      this.memories = Array.isArray(entries) ? entries.map((entry) => this.normalizeEntry(entry)) : [];
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code !== "ENOENT") {
@@ -34,15 +35,23 @@ export class DurableMemoryStore {
 
   async addEntries(entries: DurableMemoryEntry[]): Promise<number> {
     let added = 0;
-    for (const entry of entries) {
-      if (this.memories.some((item) => item.fingerprint === entry.fingerprint)) {
+    for (const rawEntry of entries) {
+      const entry = this.normalizeEntry(rawEntry);
+      if (this.memories.some((item) => item.fingerprint === entry.fingerprint && item.recordStatus !== "archived")) {
         continue;
+      }
+
+      if (entry.kind === "project_state" && entry.projectId) {
+        this.supersedeActiveProjectState(entry.projectId, entry.id);
       }
       this.memories.push(entry);
       added += 1;
     }
 
     if (added > 0) {
+      this.memories = this.memories
+        .map((entry) => this.normalizeEntry(entry))
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
       await this.flush();
     }
     return added;
@@ -59,6 +68,7 @@ export class DurableMemoryStore {
     }
 
     return [...this.memories]
+      .filter((entry) => entry.recordStatus === "active")
       .map((entry) => ({
         entry,
         score: this.scoreEntry(entry, terms),
@@ -79,11 +89,24 @@ export class DurableMemoryStore {
   }
 
   count(): number {
-    return this.memories.length;
+    return this.memories.filter((entry) => entry.recordStatus === "active").length;
+  }
+
+  private supersedeActiveProjectState(projectId: string, supersededById: string): void {
+    this.memories = this.memories.map((entry) => {
+      if (entry.kind !== "project_state" || entry.projectId !== projectId || entry.recordStatus !== "active") {
+        return entry;
+      }
+      return this.normalizeEntry({
+        ...entry,
+        recordStatus: "superseded",
+        supersededById,
+      });
+    });
   }
 
   private scoreEntry(entry: DurableMemoryEntry, terms: string[]): number {
-    const haystack = `${entry.kind} ${entry.tags.join(" ")} ${entry.text}`.toLowerCase();
+    const haystack = `${entry.kind} ${entry.projectId ?? ""} ${entry.topicId ?? ""} ${entry.tags.join(" ")} ${entry.text}`.toLowerCase();
     let score = 0;
 
     for (const term of terms) {
@@ -100,10 +123,20 @@ export class DurableMemoryStore {
   }
 
   private async flush(): Promise<void> {
-    const payload: DurableMemoryFileV2 = {
-      schemaVersion: 2,
+    const payload: DurableMemoryFileV3 = {
+      schemaVersion: 3,
       memories: this.memories,
     };
     await writeFile(this.filePath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
+  private normalizeEntry(entry: DurableMemoryEntry): DurableMemoryEntry {
+    return {
+      ...entry,
+      eventId: entry.eventId ?? buildStableEventId("memory", `${entry.id}|${entry.createdAt}`),
+      recordStatus: entry.recordStatus ?? "active",
+      tags: Array.isArray(entry.tags) ? [...new Set(entry.tags)] : [],
+      sourceIds: Array.isArray(entry.sourceIds) ? [...new Set(entry.sourceIds)] : [],
+    };
   }
 }

@@ -1,12 +1,17 @@
-import {
+﻿import {
   ProjectStateSnapshot,
   RawMessageRepository,
   SummaryRepository,
 } from "../types";
+import {
+  deriveProjectIdentityFromMessages,
+  deriveProjectIdentityFromSnapshot,
+  deriveProjectStatusFromSnapshot,
+} from "./projectIdentity";
 
 const LINE_RE = /^-\s*([a-z_ ]+):\s*(.+)$/i;
 const DEFAULT_NONE = "none recorded";
-const PROJECT_STATE_HEADER = "# chaunyoms-project-state:v1";
+const PROJECT_STATE_HEADER = "# chaunyoms-project-state:v2";
 
 function truncate(input: string, maxChars = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
@@ -56,9 +61,8 @@ export function buildProjectStateSnapshot(
       : "review outstanding work from the latest session";
   const risk =
     blocker === DEFAULT_NONE ? DEFAULT_NONE : "latest blocker needs follow-up";
-
-  return {
-    schemaVersion: 1,
+  const preliminary = {
+    schemaVersion: 2 as const,
     dateLabel,
     active: truncate(active),
     decision: truncate(decision),
@@ -70,6 +74,16 @@ export function buildProjectStateSnapshot(
     recall: latestSummary
       ? `summary:${latestSummary.id} messages ${latestSummary.sourceFirstMessageId ?? "unknown"}..${latestSummary.sourceLastMessageId ?? "unknown"}`
       : "none",
+    projectId: "",
+    projectTitle: "",
+    projectStatus: "active" as const,
+  };
+  const projectIdentity = deriveProjectIdentityFromMessages(latestMessages, dateLabel);
+  return {
+    ...preliminary,
+    projectId: projectIdentity.projectId,
+    projectTitle: truncate(projectIdentity.title, 72),
+    projectStatus: deriveProjectStatusFromSnapshot(preliminary),
   };
 }
 
@@ -79,6 +93,9 @@ export function formatProjectStateSnapshot(
   return [
     PROJECT_STATE_HEADER,
     `${snapshot.dateLabel}:`,
+    `- project_id: ${snapshot.projectId}`,
+    `- project_title: ${snapshot.projectTitle}`,
+    `- project_status: ${snapshot.projectStatus}`,
     `- active: ${snapshot.active}`,
     `- decision: ${snapshot.decision}`,
     `- todo: ${snapshot.todo}`,
@@ -99,7 +116,7 @@ export function parseProjectStateSnapshot(
   }
 
   const dataLines =
-    lines[0].toLowerCase() === PROJECT_STATE_HEADER ? lines.slice(1) : lines;
+    lines[0].toLowerCase().startsWith("# chaunyoms-project-state") ? lines.slice(1) : lines;
   if (dataLines.length === 0) {
     return null;
   }
@@ -118,9 +135,12 @@ export function parseProjectStateSnapshot(
     return null;
   }
 
-  return {
-    schemaVersion: 1,
+  const snapshot: ProjectStateSnapshot = {
+    schemaVersion: 2,
     dateLabel,
+    projectId: fields.get("project_id") ?? "",
+    projectTitle: fields.get("project_title") ?? DEFAULT_NONE,
+    projectStatus: normalizeProjectStatus(fields.get("project_status")),
     active: fields.get("active") ?? DEFAULT_NONE,
     decision: fields.get("decision") ?? DEFAULT_NONE,
     todo: fields.get("todo") ?? DEFAULT_NONE,
@@ -130,6 +150,13 @@ export function parseProjectStateSnapshot(
     risk: fields.get("risk") ?? DEFAULT_NONE,
     recall: fields.get("recall") ?? "none",
   };
+
+  if (!snapshot.projectId) {
+    const identity = deriveProjectIdentityFromSnapshot(snapshot, snapshot.dateLabel);
+    snapshot.projectId = identity.projectId;
+    snapshot.projectTitle = identity.title;
+  }
+  return snapshot;
 }
 
 export function prioritizeProjectStateSnapshot(
@@ -140,6 +167,8 @@ export function prioritizeProjectStateSnapshot(
   const preferredKeys = projectStateKeysForQuery(normalizedQuery);
   const orderedKeys: Array<keyof ProjectStateSnapshot> = [
     ...preferredKeys,
+    "projectTitle",
+    "projectStatus",
     "active",
     "decision",
     "todo",
@@ -151,16 +180,33 @@ export function prioritizeProjectStateSnapshot(
   ];
 
   const seen = new Set<keyof ProjectStateSnapshot>();
-  const lines = [PROJECT_STATE_HEADER, `${snapshot.dateLabel}:`];
+  const lines = [PROJECT_STATE_HEADER, `${snapshot.dateLabel}:`, `- project_id: ${snapshot.projectId}`];
   for (const key of orderedKeys) {
-    if (key === "dateLabel" || key === "schemaVersion" || seen.has(key)) {
+    if (
+      key === "dateLabel" ||
+      key === "schemaVersion" ||
+      key === "projectId" ||
+      seen.has(key)
+    ) {
       continue;
     }
-    lines.push(`- ${key}: ${snapshot[key]}`);
+    const label = camelToSnake(key);
+    lines.push(`- ${label}: ${snapshot[key]}`);
     seen.add(key);
   }
 
   return lines.join("\n");
+}
+
+function normalizeProjectStatus(value?: string): ProjectStateSnapshot["projectStatus"] {
+  if (value === "blocked" || value === "planned" || value === "archived") {
+    return value;
+  }
+  return "active";
+}
+
+function camelToSnake(value: string): string {
+  return value.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`);
 }
 
 function projectStateKeysForQuery(
@@ -179,7 +225,7 @@ function projectStateKeysForQuery(
     return ["decision", "active", "recall"];
   }
   if (/(status|state|progress|当前状态|项目状态|active|current)/i.test(query)) {
-    return ["active", "decision", "todo", "next", "pending"];
+    return ["projectStatus", "projectTitle", "active", "decision", "todo", "next", "pending"];
   }
-  return ["active", "decision", "todo", "next"];
+  return ["projectTitle", "active", "decision", "todo", "next"];
 }

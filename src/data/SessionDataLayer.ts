@@ -3,6 +3,7 @@ import path from "node:path";
 import { DurableMemoryStore } from "../stores/DurableMemoryStore";
 import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
 import { ObservationStore } from "../stores/ObservationStore";
+import { ProjectRegistryStore } from "../stores/ProjectRegistryStore";
 import { RawMessageStore } from "../stores/RawMessageStore";
 import { SummaryIndexStore } from "../stores/SummaryIndexStore";
 import {
@@ -12,6 +13,8 @@ import {
   LoggerLike,
   ObservationEntry,
   ObservationRepository,
+  ProjectRecord,
+  ProjectRegistryRepository,
   RawMessage,
   RawMessageRepository,
   SummaryEntry,
@@ -28,6 +31,7 @@ export interface SessionDataStores {
   observationStore: ObservationRepository;
   durableMemoryStore: DurableMemoryRepository;
   knowledgeStore: KnowledgeMarkdownStore;
+  projectStore: ProjectRegistryRepository;
 }
 
 export interface SummaryIntegrityInspection {
@@ -44,6 +48,7 @@ export class SessionDataLayer {
   private observationStore: ObservationStore | null = null;
   private durableMemoryStore: DurableMemoryStore | null = null;
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
+  private projectStore: ProjectRegistryStore | null = null;
   private schemaRegistry: DataSchemaRegistry | null = null;
   private migrationRunner: SessionDataMigrationRunner | null = null;
   private agentVault: AgentVault | null = null;
@@ -61,6 +66,7 @@ export class SessionDataLayer {
       this.observationStore &&
       this.durableMemoryStore &&
       this.knowledgeStore &&
+      this.projectStore &&
       this.agentVault &&
       this.boundAgentId === config.agentId &&
       this.boundConfig?.dataDir === config.dataDir &&
@@ -87,12 +93,14 @@ export class SessionDataLayer {
     this.observationStore = new ObservationStore(agentDataDir, config.agentId);
     this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
+    this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
     this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
     await this.summaryStore.init();
     await this.observationStore.init();
     await this.durableMemoryStore.init();
     await this.knowledgeStore.init();
+    await this.projectStore.init();
     await this.agentVault.ensureLayout();
     const upgraded = await this.schemaRegistry.ensureCurrentVersions();
     if (upgraded.length > 0) {
@@ -113,7 +121,7 @@ export class SessionDataLayer {
   }
 
   getStores(): SessionDataStores {
-    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.knowledgeStore) {
+    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.knowledgeStore || !this.projectStore) {
       throw new Error("SessionDataLayer stores are not initialized");
     }
     return {
@@ -122,6 +130,7 @@ export class SessionDataLayer {
       observationStore: this.observationStore,
       durableMemoryStore: this.durableMemoryStore,
       knowledgeStore: this.knowledgeStore,
+      projectStore: this.projectStore,
     };
   }
 
@@ -155,7 +164,13 @@ export class SessionDataLayer {
     if (!this.agentVault) {
       return;
     }
-    await this.agentVault.writeDurableMemoryMirror(this.getStores().durableMemoryStore.getAll());
+    await this.agentVault.writeDurableMemoryMirror(
+      this.getStores().durableMemoryStore.getAll().filter((entry) => entry.recordStatus === "active"),
+    );
+  }
+
+  async upsertProjectRecord(project: ProjectRecord): Promise<ProjectRecord> {
+    return await this.getStores().projectStore.upsert(project);
   }
 
   inspectSummaryIntegrity(): SummaryIntegrityInspection {
