@@ -196,6 +196,7 @@ export interface ProjectRegistryRepository {
 }
 
 export type KnowledgeDocBucket = "decisions" | "patterns" | "facts" | "incidents";
+export type KnowledgeOrigin = "native" | "imported" | "synthesized";
 
 export interface KnowledgePromotionDraft {
   shouldWrite: boolean;
@@ -229,9 +230,29 @@ export interface KnowledgeDocumentIndexEntry {
   summary: string;
   tags: string[];
   canonicalKey: string;
+  origin: KnowledgeOrigin;
   status: "active" | "draft" | "superseded";
+  supersededById?: string;
+  linkedSummaryIds: string[];
+  sourceRefs: string[];
   updatedAt: string;
   versions: KnowledgeDocVersionRecord[];
+}
+
+export interface KnowledgeDocumentRecord {
+  entry: KnowledgeDocumentIndexEntry;
+  version: KnowledgeDocVersionRecord;
+  filePath: string;
+  content: string;
+}
+
+export interface KnowledgeTrustModel {
+  owner: "chaunyoms";
+  layer: "managed_knowledge";
+  writable: boolean;
+  versioned: boolean;
+  requiresProvenance: boolean;
+  notes: string[];
 }
 
 export interface PromotionLedgerEntry {
@@ -267,6 +288,13 @@ export interface KnowledgeRepository {
   getBaseDir(): string;
   findPromotion(summary: SummaryEntry): PromotionLedgerEntry | null;
   searchRelatedDocuments(query: string, limit?: number): KnowledgeDocumentIndexEntry[];
+  getById(id: string): Promise<KnowledgeDocumentRecord | null>;
+  listVersions(canonicalKey: string): KnowledgeDocVersionRecord[];
+  markSuperseded(id: string, byId: string): Promise<boolean>;
+  reconcile(canonicalKey: string): Promise<KnowledgeDocumentIndexEntry | null>;
+  linkToSummary(id: string, summaryId: string): Promise<boolean>;
+  linkToSource(id: string, sourceRef: string): Promise<boolean>;
+  describeTrustModel(): KnowledgeTrustModel;
   writePromotion(
     summary: SummaryEntry,
     draft: KnowledgePromotionDraft,
@@ -280,29 +308,71 @@ export interface KnowledgeRepository {
   ): Promise<KnowledgePromotionResult>;
 }
 
-export interface ExternalKnowledgeCapabilities {
+export interface KnowledgeImportCapabilities {
   read: boolean;
   write: boolean;
   supportsVersions: boolean;
   supportsBacklinks: boolean;
 }
 
-export interface ExternalKnowledgeHit {
-  providerId: string;
-  sourceKind: "external";
+export interface KnowledgeImportHit {
+  id: string;
+  sourceId: string;
+  sourceKind: "imported";
   title: string;
   summary: string;
   tags: string[];
   canonicalKey?: string;
   filePath?: string;
+  ref?: string;
   score?: number;
 }
 
-export interface ExternalKnowledgeProvider {
+export interface KnowledgeImportDocument {
+  id: string;
+  sourceId: string;
+  title: string;
+  content: string;
+  summary: string;
+  tags: string[];
+  canonicalKey?: string;
+  filePath?: string;
+  ref?: string;
+}
+
+export interface KnowledgeImportMetadata {
+  id: string;
+  sourceId: string;
+  title: string;
+  canonicalKey?: string;
+  tags: string[];
+  filePath?: string;
+}
+
+export interface KnowledgeImportProvenance {
+  sourceId: string;
+  ref: string;
+  trustModel: string;
+}
+
+export interface KnowledgeImportTrustModel {
+  owner: "external-provider";
+  layer: "external_knowledge";
+  writableByChaunyoms: boolean;
+  versionedByChaunyoms: boolean;
+  notes: string[];
+}
+
+export interface KnowledgeImportSource {
   id: string;
   init(): Promise<void>;
-  describeCapabilities(): ExternalKnowledgeCapabilities;
-  search(query: string, limit?: number): Promise<ExternalKnowledgeHit[]> | ExternalKnowledgeHit[];
+  describeCapabilities(): KnowledgeImportCapabilities;
+  getById(id: string): Promise<KnowledgeImportDocument | null> | KnowledgeImportDocument | null;
+  resolveRef(ref: string): Promise<KnowledgeImportDocument | null> | KnowledgeImportDocument | null;
+  getMetadata(id: string): Promise<KnowledgeImportMetadata | null> | KnowledgeImportMetadata | null;
+  getProvenance(id: string): Promise<KnowledgeImportProvenance | null> | KnowledgeImportProvenance | null;
+  describeTrustModel(): KnowledgeImportTrustModel;
+  search(query: string, limit?: number): Promise<KnowledgeImportHit[]> | KnowledgeImportHit[];
 }
 
 export interface ContextBudget {
@@ -456,9 +526,9 @@ export type RetrievalRoute =
   | "project_registry"
   | "durable_memory"
   | "summary_tree"
+  | "knowledge"
   | "navigation"
   | "shared_insights"
-  | "knowledge_base"
   | "vector_search";
 
 export interface RetrievalDecision {

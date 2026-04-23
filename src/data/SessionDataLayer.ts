@@ -12,6 +12,7 @@ import {
   DurableMemoryEntry,
   DurableMemoryRepository,
   LoggerLike,
+  KnowledgeRepository,
   ObservationEntry,
   ObservationRepository,
   ProjectRecord,
@@ -32,7 +33,7 @@ export interface SessionDataStores {
   summaryStore: SummaryRepository;
   observationStore: ObservationRepository;
   durableMemoryStore: DurableMemoryRepository;
-  knowledgeStore: KnowledgeMarkdownStore;
+  knowledgeStore: KnowledgeRepository;
   projectStore: ProjectRegistryRepository;
 }
 

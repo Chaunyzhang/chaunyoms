@@ -4,12 +4,12 @@ import {
   KnowledgeDocBucket,
   KnowledgePromotionDraft,
   KnowledgePromotionResult,
+  KnowledgeRepository,
   LlmCaller,
   LoggerLike,
   RawMessage,
   SummaryEntry,
 } from "../types";
-import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
 
 const KNOWLEDGE_PROMPT_VERSION = "kb-md-v1";
 
@@ -19,7 +19,7 @@ interface PromoteArgs {
   sessionId: string;
   summaryModel?: string;
   knowledgePromotionModel?: string;
-  knowledgeStore: KnowledgeMarkdownStore;
+  knowledgeStore: KnowledgeRepository;
 }
 
 export class KnowledgePromotionEngine {

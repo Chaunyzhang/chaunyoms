@@ -4,9 +4,13 @@ import path from "node:path";
 
 import {
   KnowledgeDocBucket,
+  KnowledgeDocVersionRecord,
+  KnowledgeDocumentRecord,
   KnowledgeDocumentIndexEntry,
   KnowledgePromotionDraft,
   KnowledgePromotionResult,
+  KnowledgeRepository,
+  KnowledgeTrustModel,
   PromotionLedgerEntry,
   SummaryEntry,
 } from "../types";
@@ -21,18 +25,19 @@ interface PromotionLedgerFileV1 {
   entries: PromotionLedgerEntry[];
 }
 
-const README_CONTENT = `# ChaunyOMS Knowledge Base
+const README_CONTENT = `# ChaunyOMS Managed Knowledge
 
-This directory stores git-friendly Markdown knowledge promoted from historical conversations.
+This directory stores versioned knowledge managed by ChaunyOMS.
 
 - decisions/: versioned decision records
 - patterns/: reusable engineering patterns
 - facts/: stable facts and constraints
 - incidents/: incident write-ups and postmortems
 - indexes/: promotion ledger and document index
+- every document keeps provenance, origin, and source references
 `;
 
-export class KnowledgeMarkdownStore {
+export class KnowledgeMarkdownStore implements KnowledgeRepository {
   private documents: KnowledgeDocumentIndexEntry[] = [];
   private ledger: PromotionLedgerEntry[] = [];
   private initialized = false;
@@ -111,6 +116,99 @@ export class KnowledgeMarkdownStore {
       })
       .slice(0, Math.max(limit, 1))
       .map((item) => item.entry);
+  }
+
+  async getById(id: string): Promise<KnowledgeDocumentRecord | null> {
+    await this.init();
+    const match = this.findDocumentById(id);
+    if (!match) {
+      return null;
+    }
+    const filePath = path.join(this.baseDir, match.entry.bucket, match.version.fileName);
+    const content = await readFile(filePath, "utf8");
+    return {
+      entry: match.entry,
+      version: match.version,
+      filePath,
+      content,
+    };
+  }
+
+  listVersions(canonicalKey: string): KnowledgeDocumentIndexEntry["versions"] {
+    const entry = this.documents.find((item) => item.canonicalKey === canonicalKey);
+    return entry ? [...entry.versions] : [];
+  }
+
+  async markSuperseded(id: string, byId: string): Promise<boolean> {
+    await this.init();
+    const match = this.findDocumentById(id);
+    if (!match) {
+      return false;
+    }
+    match.entry.status = "superseded";
+    match.entry.supersededById = byId;
+    match.entry.updatedAt = new Date().toISOString();
+    this.documents = this.normalizeDocuments(this.documents);
+    await this.flushDocumentIndex();
+    await this.updateLatestFrontmatter(match.entry);
+    return true;
+  }
+
+  async reconcile(canonicalKey: string): Promise<KnowledgeDocumentIndexEntry | null> {
+    await this.init();
+    this.documents = await this.rebuildDocumentsFromFilesystem();
+    await this.flushDocumentIndex();
+    return this.documents.find((entry) => entry.canonicalKey === canonicalKey) ?? null;
+  }
+
+  async linkToSummary(id: string, summaryId: string): Promise<boolean> {
+    await this.init();
+    const match = this.findDocumentById(id);
+    if (!match || !summaryId.trim()) {
+      return false;
+    }
+    match.entry.linkedSummaryIds = this.uniqueStrings([
+      ...(match.entry.linkedSummaryIds ?? []),
+      summaryId.trim(),
+    ]);
+    match.entry.updatedAt = new Date().toISOString();
+    this.documents = this.normalizeDocuments(this.documents);
+    await this.flushDocumentIndex();
+    await this.updateLatestFrontmatter(match.entry);
+    return true;
+  }
+
+  async linkToSource(id: string, sourceRef: string): Promise<boolean> {
+    await this.init();
+    const match = this.findDocumentById(id);
+    if (!match || !sourceRef.trim()) {
+      return false;
+    }
+    match.entry.sourceRefs = this.uniqueStrings([
+      ...(match.entry.sourceRefs ?? []),
+      sourceRef.trim(),
+    ]);
+    match.entry.updatedAt = new Date().toISOString();
+    this.documents = this.normalizeDocuments(this.documents);
+    await this.flushDocumentIndex();
+    await this.updateLatestFrontmatter(match.entry);
+    return true;
+  }
+
+  describeTrustModel(): KnowledgeTrustModel {
+    return {
+      owner: "chaunyoms",
+      layer: "managed_knowledge",
+      writable: true,
+      versioned: true,
+      requiresProvenance: true,
+      notes: [
+        "This repository stores knowledge managed by ChaunyOMS as a unified corpus.",
+        "Origin is tracked as metadata instead of splitting the corpus into separate internal/external silos.",
+        "Documents must keep provenance back to summaries and source references.",
+        "Knowledge can be superseded, reconciled, and version-audited.",
+      ],
+    };
   }
 
   async writePromotion(
@@ -206,12 +304,16 @@ export class KnowledgeMarkdownStore {
     const docId = `${normalizedDraft.slug}-v${nextVersion}`;
     const bucketDir = path.join(this.baseDir, normalizedDraft.bucket);
     const filePath = path.join(bucketDir, fileName);
+    const sourceRefs = this.buildPromotionSourceRefs(summary, metadata);
     const frontmatter = this.buildFrontmatter({
       docId,
       version: nextVersion,
       summary,
       draft: normalizedDraft,
       metadata,
+      sourceRefs,
+      linkedSummaryIds: [summary.id],
+      supersededById: existingDocument?.supersededById,
     });
 
     await writeFile(filePath, `${frontmatter}\n${normalizedDraft.body.trim()}\n`, "utf8");
@@ -232,7 +334,16 @@ export class KnowledgeMarkdownStore {
       existingDocument.summary = normalizedDraft.summary;
       existingDocument.tags = normalizedDraft.tags;
       existingDocument.canonicalKey = normalizedDraft.canonicalKey;
+      existingDocument.origin = "synthesized";
       existingDocument.status = normalizedDraft.status;
+      existingDocument.linkedSummaryIds = this.uniqueStrings([
+        ...(existingDocument.linkedSummaryIds ?? []),
+        summary.id,
+      ]);
+      existingDocument.sourceRefs = this.uniqueStrings([
+        ...(existingDocument.sourceRefs ?? []),
+        ...sourceRefs,
+      ]);
       existingDocument.updatedAt = versionRecord.createdAt;
       existingDocument.versions.push(versionRecord);
     } else {
@@ -246,7 +357,10 @@ export class KnowledgeMarkdownStore {
         summary: normalizedDraft.summary,
         tags: normalizedDraft.tags,
         canonicalKey: normalizedDraft.canonicalKey,
+        origin: "synthesized",
         status: normalizedDraft.status,
+        linkedSummaryIds: [summary.id],
+        sourceRefs,
         updatedAt: versionRecord.createdAt,
         versions: [versionRecord],
       });
@@ -322,14 +436,19 @@ export class KnowledgeMarkdownStore {
       promptVersion: string;
       modelName?: string;
     };
+    sourceRefs: string[];
+    linkedSummaryIds: string[];
+    supersededById?: string;
+    origin?: KnowledgeDocumentIndexEntry["origin"];
   }): string {
-    const { docId, version, summary, draft, metadata } = args;
+    const { docId, version, summary, draft, metadata, sourceRefs, linkedSummaryIds, supersededById, origin } = args;
     const lines = [
       "---",
       `id: ${docId}`,
       `slug: ${draft.slug}`,
       `version: ${version}`,
       `bucket: ${draft.bucket}`,
+      `origin: ${origin ?? "synthesized"}`,
       `title: ${this.escapeFrontmatterValue(draft.title)}`,
       `status: ${draft.status}`,
       `summary: ${this.escapeFrontmatterValue(draft.summary)}`,
@@ -341,7 +460,12 @@ export class KnowledgeMarkdownStore {
       `source_message_count: ${metadata.sourceMessageCount ?? 0}`,
       `prompt_version: ${metadata.promptVersion}`,
       `model: ${metadata.modelName ?? "fallback"}`,
+      `superseded_by_id: ${supersededById ?? ""}`,
       `updated_at: ${new Date().toISOString()}`,
+      "linked_summary_ids:",
+      ...linkedSummaryIds.map((summaryId) => `  - ${summaryId}`),
+      "source_refs:",
+      ...sourceRefs.map((sourceRef) => `  - ${this.escapeFrontmatterValue(sourceRef)}`),
       "tags:",
       ...draft.tags.map((tag) => `  - ${tag}`),
       "---",
@@ -409,10 +533,23 @@ export class KnowledgeMarkdownStore {
             existing.title = String(metadata.title);
             existing.summary = String(metadata.summary ?? "");
             existing.tags = this.normalizeTagList(metadata.tags);
+            existing.origin = this.normalizeOrigin(metadata.origin);
             existing.status = (metadata.status as KnowledgeDocumentIndexEntry["status"]) ?? "active";
+            existing.supersededById = this.normalizeOptionalString(metadata.superseded_by_id);
             existing.updatedAt = String(metadata.updated_at ?? versionRecord.createdAt);
             existing.canonicalKey = String(metadata.canonical_key ?? metadata.slug);
           }
+          existing.linkedSummaryIds = this.uniqueStrings([
+            ...existing.linkedSummaryIds,
+            ...this.normalizeTagList(metadata.linked_summary_ids),
+            ...(this.normalizeOptionalString(metadata.summary_entry_id)
+              ? [String(metadata.summary_entry_id)]
+              : []),
+          ]);
+          existing.sourceRefs = this.uniqueStrings([
+            ...existing.sourceRefs,
+            ...this.normalizeTagList(metadata.source_refs),
+          ]);
           existing.versions.push(versionRecord);
         } else {
           docs.push({
@@ -425,7 +562,16 @@ export class KnowledgeMarkdownStore {
             summary: String(metadata.summary ?? ""),
             tags: this.normalizeTagList(metadata.tags),
             canonicalKey: String(metadata.canonical_key ?? metadata.slug),
+            origin: this.normalizeOrigin(metadata.origin),
             status: (metadata.status as KnowledgeDocumentIndexEntry["status"]) ?? "active",
+            supersededById: this.normalizeOptionalString(metadata.superseded_by_id),
+            linkedSummaryIds: this.uniqueStrings([
+              ...this.normalizeTagList(metadata.linked_summary_ids),
+              ...(this.normalizeOptionalString(metadata.summary_entry_id)
+                ? [String(metadata.summary_entry_id)]
+                : []),
+            ]),
+            sourceRefs: this.uniqueStrings(this.normalizeTagList(metadata.source_refs)),
             updatedAt: String(metadata.updated_at ?? versionRecord.createdAt),
             versions: [versionRecord],
           });
@@ -439,13 +585,17 @@ export class KnowledgeMarkdownStore {
     return [...entries]
       .map((entry) => ({
         ...entry,
+        tags: this.uniqueStrings(entry.tags ?? []),
+        linkedSummaryIds: this.uniqueStrings(entry.linkedSummaryIds ?? []),
+        sourceRefs: this.uniqueStrings(entry.sourceRefs ?? []),
+        origin: entry.origin ?? "synthesized",
         versions: [...entry.versions].sort((a, b) => a.version - b.version),
       }))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   private scoreDocument(entry: KnowledgeDocumentIndexEntry, terms: string[]): number {
-    const haystack = `${entry.slug} ${entry.title} ${entry.summary} ${entry.tags.join(" ")}`.toLowerCase();
+    const haystack = `${entry.slug} ${entry.canonicalKey} ${entry.title} ${entry.summary} ${entry.tags.join(" ")} ${entry.sourceRefs.join(" ")}`.toLowerCase();
     let score = 0;
     for (const term of terms) {
       if (haystack.includes(term)) {
@@ -477,6 +627,94 @@ export class KnowledgeMarkdownStore {
       entries: this.ledger,
     };
     await writeFile(this.ledgerPath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
+  private findDocumentById(
+    id: string,
+  ): { entry: KnowledgeDocumentIndexEntry; version: KnowledgeDocVersionRecord } | null {
+    for (const entry of this.documents) {
+      const version =
+        entry.versions.find((item) => item.docId === id) ??
+        (entry.docId === id ? entry.versions.at(-1) ?? null : null);
+      if (version) {
+        return { entry, version };
+      }
+    }
+    return null;
+  }
+
+  private buildPromotionSourceRefs(
+    summary: SummaryEntry,
+    metadata: {
+      sessionId: string;
+      sourceHash?: string;
+      sourceMessageCount?: number;
+      promptVersion: string;
+      modelName?: string;
+    },
+  ): string[] {
+    const refs = [
+      `session:${metadata.sessionId}:turns:${summary.startTurn}-${summary.endTurn}`,
+      summary.sourceHash ? `summary_hash:${summary.sourceHash}` : null,
+      typeof metadata.sourceMessageCount === "number"
+        ? `message_count:${metadata.sourceMessageCount}`
+        : null,
+    ].filter((value): value is string => Boolean(value));
+    return this.uniqueStrings(refs);
+  }
+
+  private async updateLatestFrontmatter(entry: KnowledgeDocumentIndexEntry): Promise<void> {
+    const latestVersion = entry.versions.at(-1);
+    if (!latestVersion) {
+      return;
+    }
+    const filePath = path.join(this.baseDir, entry.bucket, latestVersion.fileName);
+    const content = await readFile(filePath, "utf8");
+    const metadata = this.parseFrontmatter(content);
+    const [startTurn, endTurn] = this.parseTurnRange(metadata.turn_range);
+    const rebuilt = this.buildFrontmatter({
+      docId: latestVersion.docId,
+      version: latestVersion.version,
+      summary: {
+        id:
+          this.normalizeOptionalString(metadata.summary_entry_id) ??
+          latestVersion.summaryEntryId,
+        startTurn,
+        endTurn,
+        summary: entry.summary,
+      } as SummaryEntry,
+      draft: {
+        shouldWrite: true,
+        reason: "frontmatter_metadata_refresh",
+        bucket: entry.bucket,
+        slug: entry.slug,
+        title: entry.title,
+        summary: entry.summary,
+        tags: entry.tags,
+        canonicalKey: entry.canonicalKey,
+        body: "",
+        status: entry.status === "superseded" ? "active" : entry.status,
+      },
+      metadata: {
+        sessionId: this.normalizeOptionalString(metadata.session_id) ?? "unknown",
+        sourceHash: this.normalizeOptionalString(metadata.source_hash),
+        sourceMessageCount: Number(metadata.source_message_count ?? 0) || undefined,
+        promptVersion: this.normalizeOptionalString(metadata.prompt_version) ?? "unknown",
+        modelName: this.normalizeOptionalString(metadata.model) ?? "unknown",
+      },
+      sourceRefs: entry.sourceRefs,
+      linkedSummaryIds: entry.linkedSummaryIds,
+      supersededById: entry.supersededById,
+      origin: entry.origin,
+    });
+    const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+    const normalizedStatus =
+      entry.status === "superseded" ? "superseded" : entry.status;
+    const frontmatter = rebuilt.replace(
+      /^status:\s+.+$/m,
+      `status: ${normalizedStatus}`,
+    );
+    await writeFile(filePath, `${frontmatter}\n${body}\n`, "utf8");
   }
 
   private async ensureFile(filePath: string, content: string): Promise<void> {
@@ -526,7 +764,39 @@ export class KnowledgeMarkdownStore {
     if (!Array.isArray(value)) {
       return [];
     }
-    return value.map((item) => String(item).trim()).filter(Boolean);
+    return value
+      .map((item) => String(item).trim().replace(/^"|"$/g, ""))
+      .filter(Boolean);
+  }
+
+  private normalizeOptionalString(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+    const normalized = value.trim();
+    return normalized ? normalized : undefined;
+  }
+
+  private normalizeOrigin(value: unknown): KnowledgeDocumentIndexEntry["origin"] {
+    switch (String(value ?? "").trim()) {
+      case "native":
+      case "imported":
+      case "synthesized":
+        return String(value).trim() as KnowledgeDocumentIndexEntry["origin"];
+      default:
+        return "synthesized";
+    }
+  }
+
+  private parseTurnRange(value: unknown): [number, number] {
+    if (typeof value !== "string") {
+      return [0, 0];
+    }
+    const match = value.match(/^(\d+)-(\d+)$/);
+    if (!match) {
+      return [0, 0];
+    }
+    return [Number(match[1]) || 0, Number(match[2]) || 0];
   }
 
   private escapeFrontmatterValue(value: string): string {
@@ -553,5 +823,9 @@ export class KnowledgeMarkdownStore {
 
   private hash(input: string): string {
     return createHash("sha256").update(input, "utf8").digest("hex");
+  }
+
+  private uniqueStrings(values: string[]): string[] {
+    return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
   }
 }

@@ -7,15 +7,17 @@ const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|his
 const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
 const SHARED_INSIGHTS_RE = /(shared[- ]?insights|共享洞察|insight)/i;
 const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
+const IMPORTED_KNOWLEDGE_RE = /(imported knowledge|import source|obsidian|graph provider|graph|外部知识|外部资料|外部文档|第三方知识|第三方文档|导入知识|导入资料)/i;
 const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
 const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|what's left|what remains)/i;
 
 export interface RouteContext {
   memorySearchEnabled: boolean;
-  hasTopicIndexHit?: boolean;
   hasSharedInsightHint?: boolean;
   hasNavigationHint?: boolean;
   hasStructuredNavigationState?: boolean;
+  hasKnowledgeHits?: boolean;
+  hasKnowledgeImportHint?: boolean;
   hasCompactedHistory?: boolean;
   hasProjectRegistry?: boolean;
   hasDurableHits?: boolean;
@@ -40,6 +42,7 @@ export class MemoryRetrievalRouter {
     const asksDurable = DURABLE_RE.test(normalized);
     const mentionsInsights = SHARED_INSIGHTS_RE.test(normalized);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(normalized);
+    const asksImportedKnowledge = IMPORTED_KNOWLEDGE_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
     const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
     const stateAvailable = context.hasStructuredNavigationState || context.hasNavigationHint || context.hasProjectRegistry;
@@ -122,20 +125,56 @@ export class MemoryRetrievalRouter {
       return this.decision("shared_insights", "shared_insights_route_hit", false, false, true, ["shared_insights"], "The query explicitly asks for shared insights.");
     }
 
-    if (mentionsKnowledge && (fuzzyLookup || !context.hasTopicIndexHit)) {
+    if (asksImportedKnowledge && mentionsKnowledge) {
       return this.decision(
-        context.memorySearchEnabled ? "vector_search" : "knowledge_base",
-        context.memorySearchEnabled ? "knowledge_base_fuzzy_lookup_with_embeddings" : "knowledge_base_fuzzy_lookup_without_embeddings",
-        !context.memorySearchEnabled,
+        "knowledge",
+        "explicit_imported_knowledge_query",
         false,
-        context.memorySearchEnabled,
-        context.memorySearchEnabled ? ["vector_search", "knowledge_base"] : ["knowledge_base"],
-        "The query targets long-term knowledge docs and needs a broader lookup path.",
+        false,
+        true,
+        ["knowledge", "summary_tree"],
+        "The query explicitly mentions imported knowledge, but imported material is still retrieved through the unified knowledge corpus.",
+      );
+    }
+
+    if (mentionsKnowledge && context.hasKnowledgeHits) {
+      return this.decision(
+        "knowledge",
+        "knowledge_route_hit",
+        false,
+        false,
+        true,
+        ["knowledge", "summary_tree"],
+        "The query asks for long-term knowledge, so retrieve from the unified knowledge corpus.",
+      );
+    }
+
+    if (mentionsKnowledge && fuzzyLookup && !context.hasKnowledgeHits && context.memorySearchEnabled) {
+      return this.decision(
+        "vector_search",
+        "knowledge_query_fuzzy_vector_fallback",
+        false,
+        false,
+        true,
+        ["knowledge", "vector_search", "summary_tree"],
+        "The query asks for fuzzy knowledge, and the unified knowledge corpus has no direct hit, so vector retrieval is the best next step.",
+      );
+    }
+
+    if (mentionsKnowledge && (fuzzyLookup || context.hasKnowledgeImportHint || !context.hasKnowledgeHits)) {
+      return this.decision(
+        "knowledge",
+        "knowledge_query_requires_unified_lookup",
+        false,
+        false,
+        true,
+        ["knowledge", "summary_tree"],
+        "The query targets long-term knowledge, so use the unified knowledge corpus and preserve provenance in the returned hits.",
       );
     }
 
     if (mentionsKnowledge) {
-      return this.decision("knowledge_base", "knowledge_base_route_hit", false, false, true, ["knowledge_base"], "The query explicitly asks for the knowledge layer.");
+      return this.decision("knowledge", "knowledge_layer_route_hit", false, false, true, ["knowledge", "summary_tree"], "The query explicitly asks for the knowledge layer, so route to the unified knowledge corpus.");
     }
 
     if (context.hasDurableHits && /(remember|constraint|decision|config|rule|长期|约束|决策|配置)/i.test(normalized)) {

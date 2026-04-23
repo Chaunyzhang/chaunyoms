@@ -12,7 +12,7 @@ export const pluginConfigSchema = {
     },
     workspaceDir: {
       type: "string",
-      description: "OpenClaw workspace directory used for navigation snapshots and local knowledge paths.",
+      description: "OpenClaw workspace directory used for navigation snapshots and project-local runtime state.",
     },
     sharedDataDir: {
       type: "string",
@@ -24,7 +24,7 @@ export const pluginConfigSchema = {
     },
     knowledgeBaseDir: {
       type: "string",
-      description: "Optional git-friendly markdown knowledge directory. Defaults to sharedDataDir/knowledge-base.",
+      description: "Optional external/imported markdown knowledge directory. Treated as a read-only reference layer by default; any ChaunyOMS cache lives under sharedDataDir/plugin-cache.",
     },
     enableTools: {
       type: "boolean",
@@ -80,7 +80,7 @@ export const pluginConfigSchema = {
     },
     knowledgePromotionEnabled: {
       type: "boolean",
-      description: "Enable knowledge markdown promotion. Disabled by default.",
+      description: "Enable promotion into the managed knowledge store. Disabled by default.",
     },
     emergencyBrake: {
       type: "boolean",

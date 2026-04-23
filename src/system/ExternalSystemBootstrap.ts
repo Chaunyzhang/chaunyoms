@@ -7,7 +7,7 @@ const STRUCTURE_DOC = `# OpenClaw Shared Data Structure
 
 This directory stores shared system data outside the agent workspace.
 
-- knowledge-base/: versioned knowledge source files and topic index
+- knowledge-base/: imported/reference knowledge files (read-only by default)
 - shared-insights/: shared insight files and insight index
 - shared-cognition/: shared cognition injected at runtime
 - vector-store/: retrieval index files

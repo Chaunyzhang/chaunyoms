@@ -231,7 +231,7 @@ export class OpenClawBridge {
 
     register(
       "memory_retrieve",
-      "Run the memory routing decision and return the first practical retrieval result from navigation, shared insights, knowledge base, DAG recall, or an embeddings API prompt.",
+      "Run the memory routing decision and return the first practical retrieval result from agent assets, managed knowledge, imported knowledge, DAG recall, or an embeddings API prompt.",
       {
         type: "object",
         properties: {
