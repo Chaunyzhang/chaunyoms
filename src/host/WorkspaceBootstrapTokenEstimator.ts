@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { HostFixedContextProvider } from "../types";
 import { estimateTokens } from "../utils/tokenizer";
 
 const HOST_BOOTSTRAP_FILES = [
@@ -14,7 +15,7 @@ const HOST_BOOTSTRAP_FILES = [
   "HEARTBEAT.md",
 ] as const;
 
-export class HostFixedContextEstimator {
+export class WorkspaceBootstrapTokenEstimator implements HostFixedContextProvider {
   async estimateWorkspaceBootstrapTokens(workspaceDir: string): Promise<number> {
     let total = 0;
 

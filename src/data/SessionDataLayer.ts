@@ -5,6 +5,7 @@ import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
 import { ObservationStore } from "../stores/ObservationStore";
 import { ProjectRegistryStore } from "../stores/ProjectRegistryStore";
 import { RawMessageStore } from "../stores/RawMessageStore";
+import { RuntimeStatsLogStore } from "../stores/RuntimeStatsLogStore";
 import { SummaryIndexStore } from "../stores/SummaryIndexStore";
 import {
   BridgeConfig,
@@ -50,6 +51,7 @@ export class SessionDataLayer {
   private durableMemoryStore: DurableMemoryStore | null = null;
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private projectStore: ProjectRegistryStore | null = null;
+  private statsLogStore: RuntimeStatsLogStore | null = null;
   private schemaRegistry: DataSchemaRegistry | null = null;
   private migrationRunner: SessionDataMigrationRunner | null = null;
   private agentVault: AgentVault | null = null;
@@ -139,6 +141,7 @@ export class SessionDataLayer {
     this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
+    this.statsLogStore = new RuntimeStatsLogStore(config.dataDir);
     this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
     await this.summaryStore.init();
@@ -205,6 +208,13 @@ export class SessionDataLayer {
     await this.agentVault.writeDurableMemoryMirror(
       this.getStores().durableMemoryStore.getAll().filter((entry) => entry.recordStatus === "active"),
     );
+  }
+
+  async appendAfterTurnStats(sessionId: string, stats: Record<string, unknown>): Promise<void> {
+    if (!this.statsLogStore) {
+      throw new Error("SessionDataLayer stats log store is not initialized");
+    }
+    await this.statsLogStore.append(sessionId, stats);
   }
 
   async upsertProjectRecord(project: ProjectRecord): Promise<ProjectRecord> {

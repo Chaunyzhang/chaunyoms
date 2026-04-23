@@ -1,12 +1,12 @@
 import {
   ContextBudget,
   ContextItem,
+  ContextViewRepository,
   DurableMemoryRepository,
   FixedPrefixProvider,
   RawMessageRepository,
   SummaryRepository,
 } from "../types";
-import { ContextViewStore } from "../stores/ContextViewStore";
 import { estimateTokens } from "../utils/tokenizer";
 
 interface AssembleOptions {
@@ -17,7 +17,7 @@ interface AssembleOptions {
 
 export class ContextAssembler {
   constructor(
-    private readonly contextViewStore: ContextViewStore,
+    private readonly contextViewStore: ContextViewRepository,
     private readonly fixedPrefixProvider: FixedPrefixProvider,
   ) {}
 

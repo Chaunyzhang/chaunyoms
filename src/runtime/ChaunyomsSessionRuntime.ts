@@ -1,6 +1,4 @@
-import { appendFile, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import path from "node:path";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
@@ -8,21 +6,23 @@ import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
 import { BackgroundOrganizerEngine } from "../engines/BackgroundOrganizerEngine";
-import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
 import {
   SessionDataLayer,
   SessionDataStores,
   SummaryIntegrityInspection,
 } from "../data/SessionDataLayer";
-import { ContextViewStore } from "../stores/ContextViewStore";
 import { ExternalSystemBootstrap } from "../system/ExternalSystemBootstrap";
 import {
   BridgeConfig,
   ContextItem,
+  ContextViewRepository,
   DurableMemoryRepository,
   DurableMemoryEntry,
+  FixedPrefixProvider,
+  HostFixedContextProvider,
   LlmCaller,
   LoggerLike,
+  NavigationRepository,
   ObservationRepository,
   ObservationEntry,
   RawMessage,
@@ -46,7 +46,6 @@ import {
   deriveProjectStatusFromSnapshot,
 } from "../utils/projectIdentity";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
-import { HostFixedContextEstimator } from "./HostFixedContextEstimator";
 
 interface CompactionBudgetState {
   availableBudget: number;
@@ -84,13 +83,22 @@ export interface AfterTurnResult {
   compactedThisTurn: boolean;
 }
 
+export interface RuntimeLayerDependencies {
+  contextViewStore: ContextViewRepository;
+  fixedPrefixProvider: FixedPrefixProvider;
+  navigationRepository: NavigationRepository;
+  hostFixedContextProvider: HostFixedContextProvider;
+}
+
 export class ChaunyomsSessionRuntime {
   private config: BridgeConfig;
   private logger: LoggerLike;
   private readonly sessionData: SessionDataLayer;
-  private readonly contextViewStore = new ContextViewStore();
-  private readonly prefixAdapter = new StablePrefixAdapter();
-  private readonly assembler = new ContextAssembler(this.contextViewStore, this.prefixAdapter);
+  private readonly contextViewStore: ContextViewRepository;
+  private readonly fixedPrefixProvider: FixedPrefixProvider;
+  private readonly navigationRepository: NavigationRepository;
+  private readonly hostFixedContextProvider: HostFixedContextProvider;
+  private readonly assembler: ContextAssembler;
   private readonly extractionEngine = new MemoryExtractionEngine();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
@@ -101,17 +109,22 @@ export class ChaunyomsSessionRuntime {
   private compactionInFlight: Promise<SummaryEntry | null> | null = null;
   private navigationSnapshotPending = false;
   private readonly runtimeIngress = new RuntimeMessageIngress();
-  private readonly hostFixedEstimator = new HostFixedContextEstimator();
 
   constructor(
     logger: LoggerLike,
     llmCaller: LlmCaller | null,
     initialConfig: BridgeConfig,
+    dependencies: RuntimeLayerDependencies,
   ) {
     this.logger = logger;
     this.config = initialConfig;
     this.llmCaller = llmCaller;
     this.sessionData = new SessionDataLayer(this.logger);
+    this.contextViewStore = dependencies.contextViewStore;
+    this.fixedPrefixProvider = dependencies.fixedPrefixProvider;
+    this.navigationRepository = dependencies.navigationRepository;
+    this.hostFixedContextProvider = dependencies.hostFixedContextProvider;
+    this.assembler = new ContextAssembler(this.contextViewStore, this.fixedPrefixProvider);
     this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
@@ -731,7 +744,7 @@ export class ChaunyomsSessionRuntime {
       context.totalBudget,
       context.systemPromptTokens,
     );
-    const stablePrefix = await this.prefixAdapter.load(
+    const stablePrefix = await this.fixedPrefixProvider.load(
       this.config.sharedDataDir,
       this.config.workspaceDir,
       budget.stablePrefixBudget,
@@ -776,7 +789,7 @@ export class ChaunyomsSessionRuntime {
             source: "systemPromptTokens" as const,
           }
         : {
-            tokens: await this.hostFixedEstimator.estimateWorkspaceBootstrapTokens(
+            tokens: await this.hostFixedContextProvider.estimateWorkspaceBootstrapTokens(
               this.config.workspaceDir,
             ),
             source: "workspaceBootstrapEstimate" as const,
@@ -878,13 +891,7 @@ export class ChaunyomsSessionRuntime {
     sessionId: string,
     stats: Record<string, unknown>,
   ): Promise<void> {
-    const logDir = path.join(this.config.dataDir, "logs");
-    await mkdir(logDir, { recursive: true });
-    await appendFile(
-      path.join(logDir, `${sessionId}.after-turn.log`),
-      `${JSON.stringify(stats)}\n`,
-      "utf8",
-    );
+    await this.sessionData.appendAfterTurnStats(sessionId, stats);
   }
 
   private async repairCompactedFlagsFromSummaries(
@@ -950,7 +957,7 @@ export class ChaunyomsSessionRuntime {
     }
 
     const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
-    const navigationWrite = await this.prefixAdapter.writeNavigationSnapshot(
+    const navigationWrite = await this.navigationRepository.writeNavigationSnapshot(
       this.config.workspaceDir,
       navigationSnapshot,
     );

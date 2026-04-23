@@ -11,7 +11,10 @@ import {
 import {
   ChaunyomsSessionRuntime,
 } from "./runtime/ChaunyomsSessionRuntime";
+import { createRuntimeLayerDependencies } from "./runtime/createRuntimeLayerDependencies";
 import { ChaunyomsRetrievalService } from "./runtime/ChaunyomsRetrievalService";
+import { StablePrefixAdapter } from "./data/StablePrefixAdapter";
+import { VectorSearchFallbackStore } from "./data/VectorSearchFallbackStore";
 
 export class OpenClawBridge {
   private api: any;
@@ -20,15 +23,24 @@ export class OpenClawBridge {
     () => this.api,
     () => this.logger,
   );
+  private readonly stablePrefixAdapter = new StablePrefixAdapter();
+  private readonly runtimeDependencies = createRuntimeLayerDependencies();
+  private readonly vectorSearchFallback = new VectorSearchFallbackStore();
   private readonly runtime = new ChaunyomsSessionRuntime(
     this.logger,
     null,
     DEFAULT_BRIDGE_CONFIG,
+    this.runtimeDependencies,
   );
   private readonly retrieval = new ChaunyomsRetrievalService(
     this.runtime,
     this.payloadAdapter,
     () => this.api,
+    {
+      fixedPrefixProvider: this.stablePrefixAdapter,
+      navigationRepository: this.stablePrefixAdapter,
+      vectorSearchFallback: this.vectorSearchFallback,
+    },
   );
   private readonly embeddingsPromptedSessions = new Set<string>();
 

@@ -325,6 +325,12 @@ export interface ContextItem {
   metadata?: Record<string, unknown>;
 }
 
+export interface ContextViewRepository {
+  setItems(items: ContextItem[]): void;
+  getItems(): ContextItem[];
+  clear(): void;
+}
+
 export interface PrefixRouteHit {
   kind: "navigation" | "shared_insights" | "knowledge_base";
   filePath?: string;
@@ -346,6 +352,17 @@ export interface NavigationRepository {
   hasNavigationHint(workspaceDir: string, query: string): Promise<boolean>;
   hasStructuredNavigationState(workspaceDir: string): Promise<boolean>;
   writeNavigationSnapshot(workspaceDir: string, content: string): Promise<{ written: boolean; filePath?: string }>;
+}
+
+export interface HostFixedContextProvider {
+  estimateWorkspaceBootstrapTokens(workspaceDir: string): Promise<number>;
+}
+
+export interface VectorSearchFallbackRepository {
+  search(
+    query: string,
+    config: Pick<BridgeConfig, "sharedDataDir">,
+  ): Promise<{ text: string; source?: string; score?: number } | null>;
 }
 
 export interface SummaryResult {

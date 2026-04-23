@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { DEFAULT_BRIDGE_CONFIG } from "../host/OpenClawHostServices";
 import { ChaunyomsSessionRuntime } from "../runtime/ChaunyomsSessionRuntime";
+import { createRuntimeLayerDependencies } from "../runtime/createRuntimeLayerDependencies";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
       strictCompaction: true,
       compactionBarrierEnabled: true,
     },
+    createRuntimeLayerDependencies(),
   );
 
   const config = {
