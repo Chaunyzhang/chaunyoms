@@ -18,9 +18,12 @@
 
 ## Table of contents
 
+- [The big idea](#the-big-idea)
 - [What it is](#what-it-is)
 - [What it is not](#what-it-is-not)
 - [Why it matters](#why-it-matters)
+- [Design principles](#design-principles)
+- [What happens in one turn](#what-happens-in-one-turn)
 - [Architecture](#architecture)
 - [Memory layers](#memory-layers)
 - [Current behavior](#current-behavior)
@@ -29,6 +32,31 @@
 - [Repository map](#repository-map)
 - [Validation](#validation)
 - [Roadmap](#roadmap)
+
+---
+
+## The big idea
+
+ChaunyOMS is built around one belief:
+
+> **Context, memory, and knowledge should not be collapsed into the same layer.**
+
+Most systems eventually blur these concerns:
+
+- raw chat gets treated like knowledge,
+- summaries get treated like durable facts,
+- project state gets mixed into long-term memory,
+- and the prompt becomes the dumping ground for everything.
+
+ChaunyOMS tries to resist that drift.
+
+It is not “bigger memory.”  
+It is an attempt to make a long-running OpenClaw agent behave like a system with:
+
+- a **source layer**
+- a **structured runtime memory layer**
+- a **controlled compression layer**
+- and a future **knowledge layer** that can be built on top without lying about provenance
 
 ---
 
@@ -49,6 +77,12 @@ In practical terms, it gives OpenClaw a stronger runtime backbone for:
 - **selective structure extraction** before any summary exists
 - **compaction barriers** when context pressure becomes unhealthy
 - **retrieval routing** across multiple memory layers
+
+The project is intentionally ambitious in architecture, but conservative in activation:
+
+- it already separates runtime and data concerns,
+- but it still ships with safe defaults,
+- and it does not pretend unfinished wiki-style knowledge layers are already “done.”
 
 ---
 
@@ -88,6 +122,102 @@ That makes it useful for teams who want something that is:
 
 - more serious than “just save chat logs”
 - more grounded than a fully speculative memory platform
+
+---
+
+## Design principles
+
+### 1. Raw history remains the source of truth
+
+Raw chat is not treated as disposable sludge.
+
+It remains:
+
+- traceable
+- recallable
+- compressible
+- auditable
+
+This matters because a system that cannot get back to its own source material eventually starts hallucinating confidence.
+
+### 2. Durable memory is not the same as summary
+
+This distinction is central.
+
+- **Durable memory** = early structured memory entries such as constraints, decisions, diagnostics, and project-state hints.
+- **Summary** = compaction output over a range of historical turns.
+
+Durable memory exists *before* compaction.  
+Summary exists *because of* compaction.
+
+### 3. Knowledge should have a staging area
+
+A lot of systems jump directly from chat into “knowledge.”
+
+ChaunyOMS inserts a cleaner buffer:
+
+- `knowledge raw`
+
+That creates a place for:
+
+- higher-value extracted material
+- explicit remember-intent handling
+- future wiki rewriting
+- later reconciliation / dedupe / promotion
+
+without pretending that every useful runtime memory is already formal knowledge.
+
+### 4. Compaction is treated as control logic
+
+Compaction is not just a convenience summary feature.
+It is a **pressure-management mechanism**.
+
+That means:
+
+- context pressure is measured
+- compaction can block assemble until the system is back in a healthy zone
+- the fixed zone, fresh zone, and compressible zone are conceptually separated
+
+### 5. Safe defaults are part of the architecture
+
+The project defaults are intentionally cautious:
+
+- tools off
+- knowledge promotion off
+- strict compaction on
+
+This is not reluctance. It is operational discipline.
+
+---
+
+## What happens in one turn
+
+When a normal turn arrives, the system does **not** immediately jump into heavy summarization.
+
+Instead, the flow is roughly:
+
+1. **Ingress filtering**
+   - strip wrappers
+   - reject low-value noise
+   - split raw chat from observation-style signals
+
+2. **Raw / observation persistence**
+   - transcript-like content goes to raw
+   - substantive tool/output signals go to observation
+
+3. **Structured extraction**
+   - durable memory entries may be created
+   - knowledge-raw candidates may be created
+
+4. **Context assembly**
+   - fresh tail remains primary while history is still manageable
+   - durable memory and other structured layers may assist
+
+5. **Compaction only when necessary**
+   - summaries are created only after pressure crosses the threshold
+   - rollups only happen after enough summary structure exists
+
+This is why the repo can already “do memory work” before any summary tree exists.
 
 ---
 
@@ -137,6 +267,14 @@ flowchart LR
 - Durable memory is an early structured extraction layer.
 - Summaries only appear once compaction is triggered.
 
+### Another useful distinction
+
+- **Project registry** is not a knowledge layer.
+- **Navigation** is not the same thing as memory content.
+- **Knowledge raw** is not yet wiki.
+
+This sounds obvious, but keeping those boundaries intact is exactly what prevents a long-running agent system from turning into an unmaintainable blob.
+
 ---
 
 ## Current behavior
@@ -155,6 +293,11 @@ flowchart LR
 - durable memory and knowledge raw can be written **before compaction**
 - compaction runs only when pressure crosses the configured threshold
 - navigation snapshots are written only after compaction creates a new compressed boundary
+
+In other words:
+
+- before compaction, the system is mostly doing **capture + extraction + organization**
+- after compaction, it starts doing **compression + hierarchical history management**
 
 ### Retrieval behavior
 
@@ -309,3 +452,6 @@ The ambitious version:
 - it already looks more like a **real context engine architecture** than a simple memory patch,
 - and it is being built with enough discipline that future wiki/knowledge layers can land on top of it cleanly.
 
+If you want the shortest honest pitch:
+
+> ChaunyOMS is trying to be the kind of memory/context engine you can keep growing for a long time without regretting the first layer.
