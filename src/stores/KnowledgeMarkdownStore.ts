@@ -217,7 +217,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       requiresProvenance: true,
       notes: [
         "This repository stores AI-promoted and user-provided knowledge as one unified corpus.",
-        "Origin is tracked as provenance metadata only; retrieval does not split internal vs external weights.",
+        "Origin is tracked as provenance metadata only; retrieval does not split imported/manual/system content into separate weights.",
         "User raw files can be dropped into raw/ and are indexed as first-class knowledge.",
         "AI-generated promotions write a system raw intake artifact before the final versioned document is committed.",
         "Documents must keep provenance back to summaries and source references.",

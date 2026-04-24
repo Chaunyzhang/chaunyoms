@@ -21,7 +21,7 @@ export const pluginConfigSchema = {
     },
     sharedDataDir: {
       type: "string",
-      description: "Shared data root for insights, indexes, and stable external plugin storage.",
+      description: "Shared data root for unified knowledge indexes, shared cognition, and plugin support files.",
     },
     memoryVaultDir: {
       type: "string",

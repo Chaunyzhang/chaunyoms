@@ -5,7 +5,7 @@ import { EvalCaseDefinition, EvalExplicitMessage, EvalSuiteDefinition } from "./
 
 const LOCOMO_DATA_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json";
 const DEFAULT_OUTPUT = path.join("artifacts", "evals", "locomo-medium-suite.json");
-const DEFAULT_CACHE = path.join("artifacts", "external", "locomo", "locomo10.json");
+const DEFAULT_CACHE = path.join("artifacts", "datasets", "locomo", "locomo10.json");
 const TARGET_CASES = 24;
 const CATEGORY_QUOTA = 8;
 

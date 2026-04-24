@@ -3,19 +3,16 @@ import path from "node:path";
 
 import { LoggerLike } from "../types";
 
-const STRUCTURE_DOC = `# OpenClaw Shared Data Structure
+const STRUCTURE_DOC = `# ChaunyOMS Shared Data Structure
 
-This directory stores shared system data outside the agent workspace.
+This directory stores runtime-managed shared data for ChaunyOMS.
 
 - knowledge-base/: unified knowledge corpus, including raw user files and AI-promoted knowledge
-- shared-insights/: shared insight files and insight index
 - shared-cognition/: shared cognition injected at runtime
-- vector-store/: retrieval index files
-- oms-data/: external data area for oms context data
-- chaunym-db/: transcript and summary base files
+- plugin-cache/: runtime cache for plugin-local generated support files
 `;
 
-export class ExternalSystemBootstrap {
+export class SharedDataBootstrap {
   constructor(private readonly logger: LoggerLike) {}
 
   async ensure(sharedDataDir: string): Promise<void> {
@@ -23,22 +20,14 @@ export class ExternalSystemBootstrap {
 
     await Promise.all([
       this.ensureDir(path.join(sharedDataDir, "knowledge-base")),
-      this.ensureDir(path.join(sharedDataDir, "shared-insights")),
       this.ensureDir(path.join(sharedDataDir, "shared-cognition")),
-      this.ensureDir(path.join(sharedDataDir, "vector-store")),
-      this.ensureDir(path.join(sharedDataDir, "oms-data")),
-      this.ensureDir(path.join(sharedDataDir, "chaunym-db")),
       this.ensureDir(path.join(sharedDataDir, "plugin-cache")),
     ]);
 
     await Promise.all([
       this.ensureFile(path.join(sharedDataDir, "STRUCTURE.md"), STRUCTURE_DOC),
       this.ensureFile(path.join(sharedDataDir, "shared-cognition", "COGNITION.md"), "# Shared Cognition\n\n"),
-      this.ensureFile(path.join(sharedDataDir, "shared-insights", "insight-index.json"), "{\n  \"topics\": []\n}\n"),
       this.ensureFile(path.join(sharedDataDir, "knowledge-base", "topic-index.json"), "{\n  \"topics\": []\n}\n"),
-      this.ensureFile(path.join(sharedDataDir, "vector-store", ".keep"), ""),
-      this.ensureFile(path.join(sharedDataDir, "oms-data", ".keep"), ""),
-      this.ensureFile(path.join(sharedDataDir, "chaunym-db", "lcm.db"), ""),
     ]);
   }
 
@@ -52,7 +41,7 @@ export class ExternalSystemBootstrap {
     } catch {
       await mkdir(path.dirname(filePath), { recursive: true });
       await writeFile(filePath, content, "utf8");
-      this.logger.info("external_system_file_created", { filePath });
+      this.logger.info("shared_data_file_created", { filePath });
     }
   }
 }

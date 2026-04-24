@@ -60,9 +60,7 @@ async function main(): Promise<void> {
 
   const fixedPrefixProvider: FixedPrefixProvider = {
     async load() { return []; },
-    async getSharedInsightHit() { return null; },
     async getKnowledgeBaseHit() { return null; },
-    async hasSharedInsightHint() { return false; },
     async hasKnowledgeBaseTopicHit() { return false; },
   };
   const retrieval = new ChaunyomsRetrievalService(

@@ -35,12 +35,6 @@ const fixedPrefixProvider: FixedPrefixProvider = {
       {
         kind: "summary",
         tokenCount: 10,
-        content: "[shared_insights]\nRemember previous cross-project lessons.",
-        metadata: { layer: "shared_insights" },
-      },
-      {
-        kind: "summary",
-        tokenCount: 10,
         content: "[knowledge_base_index]\n- architecture: v3",
         metadata: { layer: "knowledge_base_index" },
       },
@@ -52,14 +46,8 @@ const fixedPrefixProvider: FixedPrefixProvider = {
       },
     ];
   },
-  async getSharedInsightHit() {
-    return null;
-  },
   async getKnowledgeBaseHit() {
     return null;
-  },
-  async hasSharedInsightHint() {
-    return false;
   },
   async hasKnowledgeBaseTopicHit() {
     return false;
@@ -273,7 +261,7 @@ async function main(): Promise<void> {
 
   assert(
     labels.join(" > ") ===
-      "shared_cognition > navigation > lcm_recall_guidance > durable_memory > summaries > shared_insights > knowledge_base_index > recent_tail",
+      "shared_cognition > navigation > oms_recall_guidance > durable_memory > summaries > knowledge_base_index > recent_tail",
     `unexpected assembly order: ${labels.join(" > ")}`,
   );
 

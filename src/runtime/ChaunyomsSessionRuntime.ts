@@ -12,7 +12,7 @@ import {
   SessionDataStores,
   SummaryIntegrityInspection,
 } from "../data/SessionDataLayer";
-import { ExternalSystemBootstrap } from "../system/ExternalSystemBootstrap";
+import { SharedDataBootstrap } from "../system/SharedDataBootstrap";
 import {
   BridgeConfig,
   CompactionRunResult,
@@ -129,7 +129,7 @@ export class ChaunyomsSessionRuntime {
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
   private backgroundOrganizerEngine: BackgroundOrganizerEngine;
-  private externalSystemBootstrap: ExternalSystemBootstrap;
+  private sharedDataBootstrap: SharedDataBootstrap;
   private compactionEngine: CompactionEngine;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
@@ -162,7 +162,7 @@ export class ChaunyomsSessionRuntime {
     this.navigationRepository = dependencies.navigationRepository;
     this.hostFixedContextProvider = dependencies.hostFixedContextProvider;
     this.assembler = new ContextAssembler(this.contextViewStore, this.fixedPrefixProvider);
-    this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
+    this.sharedDataBootstrap = new SharedDataBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
@@ -172,7 +172,7 @@ export class ChaunyomsSessionRuntime {
   updateHost(logger: LoggerLike, llmCaller: LlmCaller | null): void {
     this.logger = logger;
     this.llmCaller = llmCaller;
-    this.externalSystemBootstrap = new ExternalSystemBootstrap(this.logger);
+    this.sharedDataBootstrap = new SharedDataBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
@@ -193,7 +193,7 @@ export class ChaunyomsSessionRuntime {
     };
   }> {
     this.config = context.config;
-    await this.externalSystemBootstrap.ensure(this.config.sharedDataDir);
+    await this.sharedDataBootstrap.ensure(this.config.sharedDataDir);
     await this.ensureSession(context.sessionId, context.config);
     const integrityInspection = this.inspectSummaryIntegrity();
     await this.repairCompactedFlagsFromSummaries(integrityInspection.verifiedEntries);

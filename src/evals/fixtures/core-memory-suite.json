@@ -1,7 +1,7 @@
 {
   "suiteId": "core-memory-suite-v1",
   "title": "ChaunyOMS Core Memory Evaluation",
-  "description": "Formal evaluation suite for core memory behavior across exact recall, knowledge updates, project state, unified knowledge, and degraded-mode abstention.",
+  "description": "Formal evaluation suite for core memory behavior across exact recall, knowledge updates, project state, and unified knowledge.",
   "cases": [
     {
       "id": "exact-fact-recall-long-history",
@@ -122,22 +122,6 @@
         "mustInclude": ["capped exponential backoff"],
         "detailEquals": {
           "retrievalHitType": "knowledge"
-        }
-      }
-    },
-    {
-      "id": "shared-insights-collapses-to-standard-path",
-      "title": "Shared Insights Collapses To Standard Path",
-      "description": "Shared-insights fuzzy search is no longer a default primary route; the standard runtime should avoid prompting for embeddings and fall back to recent tail.",
-      "tags": ["degraded_mode", "route_accuracy"],
-      "mode": "route",
-      "query": "search shared insights something related",
-      "expected": {
-        "mustInclude": ["Shared insights are no longer a separate primary route"],
-        "detailEquals": {
-          "promptForApi": false,
-          "requiresEmbeddings": false,
-          "retrievalHitType": "recent_tail"
         }
       }
     }

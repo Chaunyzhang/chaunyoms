@@ -6,7 +6,6 @@ const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未
 const CURRENT_WORK_RE = /(这个项目|当前任务|当前工作|这件事|我们现在|当前主线|this project|current task|current work|our work|what we are doing)/i;
 const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|history|what happened earlier|why did we)/i;
 const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
-const SHARED_INSIGHTS_RE = /(shared[- ]?insights|共享洞察|insight)/i;
 const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
 const RAW_KNOWLEDGE_RE = /(raw knowledge|raw notes|manual knowledge|manual notes|原始知识|原始资料|手动知识|手动资料|手动笔记)/i;
 const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
@@ -41,7 +40,6 @@ export class MemoryRetrievalRouter {
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
     const asksHistory = HISTORY_RE.test(normalized);
     const asksDurable = DURABLE_RE.test(normalized);
-    const mentionsInsights = SHARED_INSIGHTS_RE.test(normalized);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(normalized);
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
@@ -120,10 +118,6 @@ export class MemoryRetrievalRouter {
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
-    }
-
-    if (mentionsInsights) {
-      return this.decision("recent_tail", "shared_insights_no_longer_primary_route", false, false, true, ["recent_tail"], "Shared insights are no longer a separate primary route in the standard runtime path.");
     }
 
     if (asksRawKnowledge && mentionsKnowledge) {

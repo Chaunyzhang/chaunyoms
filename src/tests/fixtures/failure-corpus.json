@@ -20,17 +20,5 @@
     "expectedDetails": {
       "retrievalHitType": "recent_tail"
     }
-  },
-  {
-    "id": "shared-insights-no-longer-prompts-for-embeddings",
-    "kind": "prompt_for_api",
-    "query": "search shared insights something related",
-    "expectedTextIncludes": [
-      "shared_insights_no_longer_primary_route"
-    ],
-    "expectedDetails": {
-      "promptForApi": false,
-      "requiresEmbeddings": false
-    }
   }
 ]

@@ -33,8 +33,6 @@ const fixtures: Array<{
   { name: "durable constraint", query: "what constraint config must we remember?", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "durable rule", query: "remember the rule", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "current exact fact prefers durable", query: "what is the current exact queue_window now", context: { hasDurableHits: true }, route: "durable_memory" },
-  { name: "shared insight fuzzy is no longer a primary route", query: "search shared insights something related", route: "recent_tail" },
-  { name: "shared insight direct is no longer a primary route", query: "shared insights", route: "recent_tail" },
   { name: "knowledge hit", query: "knowledge base architecture docs", context: { hasKnowledgeHits: true }, route: "knowledge" },
   { name: "raw knowledge", query: "raw knowledge in knowledge base", route: "knowledge" },
   { name: "knowledge fuzzy stays in unified knowledge", query: "knowledge base something related", context: { hasKnowledgeHits: false }, route: "knowledge" },

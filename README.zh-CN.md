@@ -326,8 +326,6 @@ flowchart LR
 - `durable_memory`
 - `summary_tree`
 - `knowledge`
-- `shared_insights`
-- `vector_search`
 
 ---
 
@@ -424,7 +422,7 @@ src/
   routing/     检索路由决策
   runtime/     session runtime、ingress、retrieval service
   stores/      raw/summaries/durable/knowledge/project 持久化
-  system/      外部共享目录初始化
+  system/      共享数据目录初始化
   tests/       运行期与数据边界回归测试
 ```
 

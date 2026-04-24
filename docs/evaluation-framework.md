@@ -79,7 +79,7 @@ Together they cover:
 
 ## Current limitations
 
-This is a formal internal evaluation framework, but it is not the same thing as a fully external benchmark leaderboard.
+This is a formal project evaluation framework, but it is not the same thing as a fully public benchmark leaderboard.
 
 Still worth adding later:
 

@@ -308,8 +308,6 @@ Current routing can hard-select between:
 - `durable_memory`
 - `summary_tree`
 - `knowledge`
-- `shared_insights`
-- `vector_search`
 
 ---
 
@@ -406,7 +404,7 @@ src/
   routing/     retrieval route decisions
   runtime/     session runtime, ingress, retrieval service
   stores/      raw/summaries/durable/knowledge/project persistence
-  system/      external shared-data bootstrap
+  system/      shared-data bootstrap
   tests/       focused runtime/data regressions
 ```
 

@@ -44,7 +44,7 @@ async function main(): Promise<void> {
           toneTag: "focused",
           memoryType: "project_state",
           phase: "implementation",
-          constraints: ["keep external data stable"],
+          constraints: ["keep shared data stable"],
           decisions: ["preserve raw history", "build summary hierarchy"],
           blockers: [],
           nextSteps: ["stabilize rollup metadata", "keep project registry aligned"],

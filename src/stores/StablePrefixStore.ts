@@ -8,15 +8,6 @@ import {
 } from "../utils/projectState";
 import { estimateTokens } from "../utils/tokenizer";
 
-interface SharedInsightIndex {
-  topics?: Array<{
-    topicId?: string;
-    latestVersion?: number;
-    latestFile?: string;
-    summary?: string;
-  }>;
-}
-
 interface KnowledgeTopicIndex {
   topics?: Array<{
     topicId?: string;
@@ -26,7 +17,7 @@ interface KnowledgeTopicIndex {
 }
 
 export interface RouteHit {
-  kind: "navigation" | "shared_insights" | "knowledge_base";
+  kind: "navigation" | "knowledge_base";
   filePath?: string;
   title: string;
   content: string;
@@ -38,44 +29,6 @@ export class StablePrefixStore {
     /(knowledge[- ]?base|docs?|documentation|reference|manual|guide|playbook|spec|specification|api|readme|markdown|\.md\b|adr|rfc|architecture|design docs?|知识库|文档|资料|说明|手册|教程|规范|接口文档|架构|设计文档)/i;
   private static readonly REFERENCE_LOOKUP_RE =
     /(look up|lookup|search|find|read|check|consult|open|review|refer|查|找|看|翻|参考|根据)/i;
-
-  async getSharedInsightHit(
-    sharedDataDir: string,
-    query: string,
-  ): Promise<RouteHit | null> {
-    const raw = await this.readUtf8OrEmpty(
-      path.join(sharedDataDir, "shared-insights", "insight-index.json"),
-    );
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as SharedInsightIndex;
-    const terms = this.queryTerms(query);
-    const topic = (parsed.topics ?? []).find((entry) => {
-      const haystack = JSON.stringify(entry).toLowerCase();
-      return terms.some((term) => haystack.includes(term));
-    });
-    if (!topic) {
-      return await this.findSourceDocHit(
-        path.join(sharedDataDir, "shared-insights"),
-        query,
-        "shared_insights",
-      );
-    }
-    const latestFile = await this.selectLatestVersionFile(
-      path.join(sharedDataDir, "shared-insights"),
-      topic.topicId ?? "",
-      topic.latestFile,
-    );
-    const filePath = latestFile
-      ? path.join(sharedDataDir, "shared-insights", latestFile)
-      : undefined;
-    const body = filePath ? await this.readUtf8OrEmpty(filePath) : "";
-    return {
-      kind: "shared_insights",
-      filePath,
-      title: topic.topicId ?? "shared-insights",
-      content: body || topic.summary || "",
-    };
-  }
 
   async getKnowledgeBaseHit(
     sharedDataDir: string,
@@ -157,19 +110,6 @@ export class StablePrefixStore {
     };
   }
 
-  async hasSharedInsightHint(
-    sharedDataDir: string,
-    query: string,
-  ): Promise<boolean> {
-    const raw = await this.readUtf8OrEmpty(
-      path.join(sharedDataDir, "shared-insights", "insight-index.json"),
-    );
-    if (!raw) return false;
-    const parsed = JSON.parse(raw) as SharedInsightIndex;
-    const haystack = JSON.stringify(parsed.topics ?? []).toLowerCase();
-    return this.queryTerms(query).some((term) => haystack.includes(term));
-  }
-
   async hasKnowledgeBaseTopicHit(
     sharedDataDir: string,
     query: string,
@@ -241,13 +181,6 @@ export class StablePrefixStore {
     pushIfFits("navigation", await this.readNavigation(workspaceDir), {
       layer: "navigation",
     });
-    pushIfFits(
-      "shared_insights",
-      await this.readSharedInsights(sharedDataDir),
-      {
-        layer: "shared_insights",
-      },
-    );
     if (await this.shouldIncludeKnowledgeBaseIndex(sharedDataDir, options.activeQuery)) {
       pushIfFits(
         "knowledge_base_index",
@@ -265,23 +198,6 @@ export class StablePrefixStore {
     return await this.readUtf8OrEmpty(
       path.join(sharedDataDir, "shared-cognition", "COGNITION.md"),
     );
-  }
-
-  private async readSharedInsights(sharedDataDir: string): Promise<string> {
-    const raw = await this.readUtf8OrEmpty(
-      path.join(sharedDataDir, "shared-insights", "insight-index.json"),
-    );
-    if (!raw) return "";
-    const parsed = JSON.parse(raw) as SharedInsightIndex;
-    const topics = parsed.topics ?? [];
-    return topics
-      .map((topic) => {
-        const id = topic.topicId ?? "unknown-topic";
-        const file = topic.latestFile ?? "unknown-file";
-        const summary = topic.summary?.trim() ?? "";
-        return `- ${id}: latest=${file}${summary ? ` | ${summary}` : ""}`;
-      })
-      .join("\n");
   }
 
   private async readKnowledgeBaseIndex(sharedDataDir: string): Promise<string> {

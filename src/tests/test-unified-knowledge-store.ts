@@ -74,10 +74,10 @@ async function main(): Promise<void> {
   assert(versions.length === 1, "expected exactly one document version");
 
   await store.linkToSummary(result.docId as string, "summary-2");
-  await store.linkToSource(result.docId as string, "external:retry-guidelines");
+  await store.linkToSource(result.docId as string, "imported:retry-guidelines");
   const reconciled = await store.reconcile("worker-retry-policy");
   assert(reconciled?.linkedSummaryIds.includes("summary-2"), "expected reconcile to retain linked summary ids");
-  assert(reconciled?.sourceRefs.includes("external:retry-guidelines"), "expected reconcile to retain linked source refs");
+  assert(reconciled?.sourceRefs.includes("imported:retry-guidelines"), "expected reconcile to retain linked source refs");
 
   await store.markSuperseded(result.docId as string, "worker-retry-policy-v2");
   const superseded = await store.getById(result.docId as string);

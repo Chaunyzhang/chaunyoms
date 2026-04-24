@@ -426,7 +426,7 @@ export interface ContextViewRepository {
 }
 
 export interface PrefixRouteHit {
-  kind: "navigation" | "shared_insights" | "knowledge_base";
+  kind: "navigation" | "knowledge_base";
   filePath?: string;
   title: string;
   content: string;
@@ -443,9 +443,7 @@ export interface FixedPrefixProvider {
     budget: number,
     options?: PrefixLoadOptions,
   ): Promise<ContextItem[]>;
-  getSharedInsightHit(sharedDataDir: string, query: string): Promise<PrefixRouteHit | null>;
   getKnowledgeBaseHit(sharedDataDir: string, query: string): Promise<PrefixRouteHit | null>;
-  hasSharedInsightHint(sharedDataDir: string, query: string): Promise<boolean>;
   hasKnowledgeBaseTopicHit(sharedDataDir: string, query: string): Promise<boolean>;
 }
 

@@ -38,7 +38,6 @@ export class ContextAssembler {
     const layerOrder = new Map<string, number>([
       ["shared_cognition", 0],
       ["navigation", 1],
-      ["shared_insights", 0],
       ["knowledge_base_index", 1],
     ]);
     const leading: ContextItem[] = [];
@@ -47,7 +46,7 @@ export class ContextAssembler {
     for (const item of items) {
       const layer =
         typeof item.metadata?.layer === "string" ? item.metadata.layer : undefined;
-      if (layer === "shared_insights" || layer === "knowledge_base_index") {
+      if (layer === "knowledge_base_index") {
         deferred.push(item);
         continue;
       }
@@ -218,7 +217,7 @@ export class ContextAssembler {
     }
 
     const content = [
-      "[lcm_recall_guidance]",
+      "[oms_recall_guidance]",
       "Compacted summaries exist in chaunyoms.",
       "Use `memory_retrieve` as the primary recall entrypoint; use `oms_expand`/`oms_trace` only when source inspection is explicitly needed.",
       "Treat navigation/index hits as hints, not final facts.",
@@ -230,7 +229,7 @@ export class ContextAssembler {
       tokenCount: Math.max(estimateTokens(content), 1),
       content,
       metadata: {
-        layer: "lcm_recall_guidance",
+        layer: "oms_recall_guidance",
         summaryCount,
       },
     };
