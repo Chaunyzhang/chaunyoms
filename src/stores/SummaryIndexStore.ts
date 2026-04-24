@@ -1,7 +1,8 @@
-﻿import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { SummaryEntry, SummaryRepository } from "../types";
+import { atomicWriteFile } from "../utils/atomicFile";
 import { buildStableEventId } from "../utils/projectIdentity";
 
 const SUMMARY_PHASES = new Set([
@@ -202,7 +203,7 @@ export class SummaryIndexStore implements SummaryRepository {
       schemaVersion: 3,
       summaries: this.summaries,
     };
-    await writeFile(this.filePath, JSON.stringify(payload, null, 2), "utf8");
+    await atomicWriteFile(this.filePath, JSON.stringify(payload, null, 2));
   }
 
   private parsePersistedContent(content: string): SummaryEntry[] {

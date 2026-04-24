@@ -5,30 +5,92 @@
     "type": "object",
     "additionalProperties": true,
     "properties": {
-      "dataDir": { "type": "string" },
-      "agentId": { "type": "string" },
-      "configPreset": { "type": "string" },
-      "workspaceDir": { "type": "string" },
-      "sharedDataDir": { "type": "string" },
-      "memoryVaultDir": { "type": "string" },
-      "knowledgeBaseDir": { "type": "string" },
-      "enableTools": { "type": "boolean" },
-      "contextWindow": { "type": "number" },
-      "contextThreshold": { "type": "number" },
-      "strictCompaction": { "type": "boolean" },
-      "compactionBarrierEnabled": { "type": "boolean" },
-      "freshTailTokens": { "type": "number" },
-      "maxFreshTailTurns": { "type": "number" },
-      "compactionBatchTurns": { "type": "number" },
-      "summaryModel": { "type": "string" },
-      "summaryMaxOutputTokens": { "type": "number" },
-      "runtimeCaptureEnabled": { "type": "boolean" },
-      "durableMemoryEnabled": { "type": "boolean" },
-      "autoRecallEnabled": { "type": "boolean" },
-      "knowledgePromotionEnabled": { "type": "boolean" },
-      "semanticCandidateExpansionEnabled": { "type": "boolean" },
-      "semanticCandidateLimit": { "type": "number" },
-      "emergencyBrake": { "type": "boolean" }
+      "dataDir": {
+        "type": "string"
+      },
+      "agentId": {
+        "type": "string"
+      },
+      "configPreset": {
+        "type": "string",
+        "enum": [
+          "safe",
+          "balanced",
+          "enhanced_recall"
+        ]
+      },
+      "workspaceDir": {
+        "type": "string"
+      },
+      "sharedDataDir": {
+        "type": "string"
+      },
+      "memoryVaultDir": {
+        "type": "string"
+      },
+      "knowledgeBaseDir": {
+        "type": "string"
+      },
+      "enableTools": {
+        "type": "boolean"
+      },
+      "contextWindow": {
+        "type": "number",
+        "exclusiveMinimum": 0
+      },
+      "contextThreshold": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "exclusiveMaximum": 1
+      },
+      "strictCompaction": {
+        "type": "boolean"
+      },
+      "compactionBarrierEnabled": {
+        "type": "boolean"
+      },
+      "freshTailTokens": {
+        "type": "number",
+        "minimum": 0
+      },
+      "maxFreshTailTurns": {
+        "type": "number",
+        "minimum": 0
+      },
+      "compactionBatchTurns": {
+        "type": "number",
+        "exclusiveMinimum": 0
+      },
+      "summaryModel": {
+        "type": "string"
+      },
+      "summaryMaxOutputTokens": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 8192
+      },
+      "runtimeCaptureEnabled": {
+        "type": "boolean"
+      },
+      "durableMemoryEnabled": {
+        "type": "boolean"
+      },
+      "autoRecallEnabled": {
+        "type": "boolean"
+      },
+      "knowledgePromotionEnabled": {
+        "type": "boolean"
+      },
+      "semanticCandidateExpansionEnabled": {
+        "type": "boolean"
+      },
+      "semanticCandidateLimit": {
+        "type": "number",
+        "minimum": 0
+      },
+      "emergencyBrake": {
+        "type": "boolean"
+      }
     }
   }
 }

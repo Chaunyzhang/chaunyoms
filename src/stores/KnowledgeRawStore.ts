@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { KnowledgeRawEntry, KnowledgeRawRepository } from "../types";
+import { atomicWriteFile } from "../utils/atomicFile";
 import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
 
 interface KnowledgeRawFileV1 {
@@ -147,6 +148,6 @@ export class KnowledgeRawStore implements KnowledgeRawRepository {
       schemaVersion: 1,
       entries: this.entries,
     };
-    await writeFile(this.filePath, JSON.stringify(payload, null, 2), "utf8");
+    await atomicWriteFile(this.filePath, JSON.stringify(payload, null, 2));
   }
 }

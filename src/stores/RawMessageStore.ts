@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { RawMessage, RawMessageQuery } from "../types";
+import { atomicWriteFile } from "../utils/atomicFile";
 
 export class RawMessageStore {
   private readonly filePath: string;
@@ -160,7 +161,7 @@ export class RawMessageStore {
 
   private async flush(): Promise<void> {
     const serialized = this.messages.map((message) => JSON.stringify(message)).join("\n");
-    await writeFile(this.filePath, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+    await atomicWriteFile(this.filePath, serialized.length > 0 ? `${serialized}\n` : "");
   }
 
   private nextSequence(): number {

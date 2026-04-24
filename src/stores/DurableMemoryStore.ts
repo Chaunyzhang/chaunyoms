@@ -1,7 +1,8 @@
-﻿import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { DurableMemoryEntry } from "../types";
+import { atomicWriteFile } from "../utils/atomicFile";
 import { buildStableEventId } from "../utils/projectIdentity";
 
 interface DurableMemoryFileV3 {
@@ -183,7 +184,7 @@ export class DurableMemoryStore {
       schemaVersion: 3,
       memories: this.memories,
     };
-    await writeFile(this.filePath, JSON.stringify(payload, null, 2), "utf8");
+    await atomicWriteFile(this.filePath, JSON.stringify(payload, null, 2));
   }
 
   private normalizeEntry(entry: DurableMemoryEntry): DurableMemoryEntry {

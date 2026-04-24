@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
+import { getOpenClawConfigPath } from "./HostPathResolver";
 import { isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
 
 export interface ToolConfigResult {
@@ -381,7 +382,7 @@ export class OpenClawPayloadAdapter {
       baseConfig.knowledgeIntakeUserOverridePatterns,
     );
 
-    return {
+    return this.validateConfig({
       dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
       agentId: this.resolveAgentId(payload, baseConfig),
@@ -390,24 +391,34 @@ export class OpenClawPayloadAdapter {
       sharedDataDir,
       memoryVaultDir,
       knowledgeBaseDir,
-      contextWindow: Number(
-        pluginConfig.contextWindow ?? payload?.contextWindow ?? baseConfig.contextWindow,
+      contextWindow: this.resolveNumberConfig(
+        [
+          pluginConfig.contextWindow,
+          payload?.contextWindow,
+        ],
+        baseConfig.contextWindow,
       ),
-      contextThreshold: Number(
-        pluginConfig.contextThreshold ??
-          pluginConfig.compactionTriggerRatio ??
-          baseConfig.contextThreshold,
+      contextThreshold: this.resolveNumberConfig(
+        [
+          pluginConfig.contextThreshold,
+          pluginConfig.compactionTriggerRatio,
+        ],
+        baseConfig.contextThreshold,
       ),
-      freshTailTokens: Number(
-        pluginConfig.freshTailTokens ??
-          pluginConfig.recentTailTurns ??
-          baseConfig.freshTailTokens,
+      freshTailTokens: this.resolveNumberConfig(
+        [
+          pluginConfig.freshTailTokens,
+          pluginConfig.recentTailTurns,
+        ],
+        baseConfig.freshTailTokens,
       ),
-      maxFreshTailTurns: Number(
-        pluginConfig.maxFreshTailTurns ?? baseConfig.maxFreshTailTurns,
+      maxFreshTailTurns: this.resolveNumberConfig(
+        [pluginConfig.maxFreshTailTurns],
+        baseConfig.maxFreshTailTurns,
       ),
-      compactionBatchTurns: Number(
-        pluginConfig.compactionBatchTurns ?? baseConfig.compactionBatchTurns,
+      compactionBatchTurns: this.resolveNumberConfig(
+        [pluginConfig.compactionBatchTurns],
+        baseConfig.compactionBatchTurns,
       ),
       summaryModel:
         typeof pluginConfig.summaryModel === "string" &&
@@ -422,8 +433,9 @@ export class OpenClawPayloadAdapter {
               pluginConfig.knowledgeModel.trim().length > 0
             ? pluginConfig.knowledgeModel
             : undefined,
-      summaryMaxOutputTokens: Number(
-        pluginConfig.summaryMaxOutputTokens ?? baseConfig.summaryMaxOutputTokens,
+      summaryMaxOutputTokens: this.resolveNumberConfig(
+        [pluginConfig.summaryMaxOutputTokens],
+        baseConfig.summaryMaxOutputTokens,
       ),
       strictCompaction: this.resolveBooleanFlag(
         [
@@ -461,7 +473,7 @@ export class OpenClawPayloadAdapter {
             ],
             presetDefaults.semanticCandidateExpansionEnabled,
           ),
-      semanticCandidateLimit: this.resolveNumberFlag(
+      semanticCandidateLimit: this.resolveNumberConfig(
         [
           pluginConfig.semanticCandidateLimit,
           pluginConfig.maxSemanticCandidates,
@@ -469,7 +481,7 @@ export class OpenClawPayloadAdapter {
         presetDefaults.semanticCandidateLimit,
       ),
       emergencyBrake,
-    };
+    });
   }
 
   private resolvePresetDefaults(
@@ -872,6 +884,79 @@ export class OpenClawPayloadAdapter {
     return fallback;
   }
 
+  private resolveNumberConfig(candidates: unknown[], fallback: number): number {
+    for (const candidate of candidates) {
+      if (candidate === undefined || candidate === null || candidate === "") {
+        continue;
+      }
+      return typeof candidate === "number" ? candidate : Number(candidate);
+    }
+    return fallback;
+  }
+
+  private validateConfig(config: BridgeConfig): BridgeConfig {
+    const errors: string[] = [];
+    const pathFields: Array<keyof Pick<
+      BridgeConfig,
+      "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"
+    >> = [
+      "dataDir",
+      "workspaceDir",
+      "sharedDataDir",
+      "knowledgeBaseDir",
+      "memoryVaultDir",
+    ];
+
+    for (const field of pathFields) {
+      const value = config[field];
+      if (typeof value !== "string" || value.trim().length === 0) {
+        errors.push(`${field} must be a non-empty path`);
+      } else if (value.includes("\0")) {
+        errors.push(`${field} must not contain null bytes`);
+      }
+    }
+
+    if (!Number.isFinite(config.contextWindow) || config.contextWindow <= 0) {
+      errors.push("contextWindow must be a finite number greater than 0");
+    }
+    if (!Number.isFinite(config.contextThreshold) || config.contextThreshold <= 0 || config.contextThreshold >= 1) {
+      errors.push("contextThreshold must be greater than 0 and less than 1");
+    }
+    if (!Number.isFinite(config.freshTailTokens) || config.freshTailTokens < 0) {
+      errors.push("freshTailTokens must be a finite non-negative number");
+    }
+    if (
+      Number.isFinite(config.freshTailTokens) &&
+      Number.isFinite(config.contextWindow) &&
+      config.freshTailTokens >= config.contextWindow
+    ) {
+      errors.push("freshTailTokens must be less than contextWindow");
+    }
+    if (!Number.isFinite(config.maxFreshTailTurns) || config.maxFreshTailTurns < 0 || !Number.isInteger(config.maxFreshTailTurns)) {
+      errors.push("maxFreshTailTurns must be a non-negative integer");
+    }
+    if (!Number.isFinite(config.compactionBatchTurns) || config.compactionBatchTurns <= 0 || !Number.isInteger(config.compactionBatchTurns)) {
+      errors.push("compactionBatchTurns must be a positive integer");
+    }
+    if (!Number.isFinite(config.summaryMaxOutputTokens) || config.summaryMaxOutputTokens <= 0 || config.summaryMaxOutputTokens > 8192) {
+      errors.push("summaryMaxOutputTokens must be greater than 0 and at most 8192");
+    }
+    if (
+      !Number.isFinite(config.semanticCandidateLimit) ||
+      config.semanticCandidateLimit < 0 ||
+      !Number.isInteger(config.semanticCandidateLimit)
+    ) {
+      errors.push("semanticCandidateLimit must be a non-negative integer");
+    }
+    if (errors.length > 0) {
+      const message = `Invalid ChaunyOMS config: ${errors.join("; ")}`;
+      this.getLogger().error("config_validation_failed", { errors });
+      throw new Error(message);
+    }
+
+    return config;
+  }
+
   private resolveStringEnum(
     candidates: unknown[],
     allowed: string[],
@@ -917,11 +1002,7 @@ export class OpenClawPayloadAdapter {
 
   private readEnableToolsFromOpenClawConfig(): unknown {
     try {
-      const configPath = path.join(
-        process.env.USERPROFILE ?? "C:\\Users\\28227",
-        ".openclaw",
-        "openclaw.json",
-      );
+      const configPath = getOpenClawConfigPath();
       const parsed = JSON.parse(readFileSync(configPath, "utf8"));
       return parsed?.plugins?.entries?.chaunyoms?.config?.enableTools;
     } catch (error) {

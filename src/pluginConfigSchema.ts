@@ -37,10 +37,13 @@ export const pluginConfigSchema = {
     },
     contextWindow: {
       type: "number",
+      exclusiveMinimum: 0,
       description: "Maximum context budget seen by the plugin.",
     },
     contextThreshold: {
       type: "number",
+      exclusiveMinimum: 0,
+      exclusiveMaximum: 1,
       description: "Compaction trigger ratio. Default 0.70.",
     },
     strictCompaction: {
@@ -53,14 +56,17 @@ export const pluginConfigSchema = {
     },
     freshTailTokens: {
       type: "number",
+      minimum: 0,
       description: "Token budget reserved for fresh uncompressed tail messages.",
     },
     maxFreshTailTurns: {
       type: "number",
+      minimum: 0,
       description: "Maximum number of recent turns protected from compaction.",
     },
     compactionBatchTurns: {
       type: "number",
+      exclusiveMinimum: 0,
       description: "Maximum number of turn ranges considered in one compaction pass.",
     },
     summaryModel: {
@@ -69,6 +75,8 @@ export const pluginConfigSchema = {
     },
     summaryMaxOutputTokens: {
       type: "number",
+      exclusiveMinimum: 0,
+      maximum: 8192,
       description: "Maximum output tokens for summary generation.",
     },
     runtimeCaptureEnabled: {
@@ -117,6 +125,7 @@ export const pluginConfigSchema = {
     },
     semanticCandidateLimit: {
       type: "number",
+      minimum: 0,
       description: "Maximum number of semantic candidates to surface in retrieval diagnostics.",
     },
     emergencyBrake: {

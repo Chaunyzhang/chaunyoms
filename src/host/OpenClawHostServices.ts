@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import path from "node:path";
 
 import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
@@ -8,13 +7,10 @@ import {
   HostProviderConfig,
   OpenClawApiLike,
 } from "./OpenClawHostTypes";
+import { getDefaultSharedDataDir, getDefaultWorkspaceDir } from "./HostPathResolver";
 
-const DEFAULT_SHARED_DATA_DIR = "C:\\openclaw-data";
-const DEFAULT_WORKSPACE_DIR = path.join(
-  homedir(),
-  ".openclaw",
-  "workspace",
-);
+const DEFAULT_SHARED_DATA_DIR = getDefaultSharedDataDir();
+const DEFAULT_WORKSPACE_DIR = getDefaultWorkspaceDir();
 
 export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(DEFAULT_SHARED_DATA_DIR, "data", "chaunyoms"),
