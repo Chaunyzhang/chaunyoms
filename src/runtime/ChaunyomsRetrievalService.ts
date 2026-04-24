@@ -128,7 +128,7 @@ export class ChaunyomsRetrievalService {
     const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
     const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
     return {
-      content: [{ type: "text", text: this.formatRecallText(query, result.items) }],
+      content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
       details: {
         ok: true,
         route: decision.route,
@@ -222,7 +222,7 @@ export class ChaunyomsRetrievalService {
       const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
       const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
       return {
-        content: [{ type: "text", text: this.formatRecallText(query, result.items) }],
+        content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
         details: {
           ok: true,
           route: decision.route,
@@ -318,7 +318,7 @@ export class ChaunyomsRetrievalService {
     const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
     const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
     return {
-      content: [{ type: "text", text: this.formatRecallText(query, result.items) }],
+      content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
       details: {
         ok: true,
         route: decision.route,
@@ -469,16 +469,31 @@ export class ChaunyomsRetrievalService {
       );
   }
 
-  private formatRecallText(query: string, items: ContextItem[]): string {
+  private formatRecallText(query: string, items: ContextItem[], sourceTrace: Array<{ summaryId?: string; strategy: string; verified: boolean; resolvedMessageCount: number }> = []): string {
     if (items.length === 0) {
       return `No matching historical details found for query: ${query}`;
     }
-    return items
+    const messages = items
       .map(
         (item) =>
           `[turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}: ${String(item.content ?? "")}`,
       )
       .join("\n\n");
+    const traces = sourceTrace.length > 0
+      ? [
+          "",
+          "Source trace:",
+          ...sourceTrace.map((trace) =>
+            `- summary ${trace.summaryId ?? "?"} -> ${trace.strategy} -> ${trace.verified ? "verified" : "unverified"} (${trace.resolvedMessageCount} messages)`,
+          ),
+        ].join("\n")
+      : "";
+    return [
+      `Historical source hits for: ${query}`,
+      "",
+      messages,
+      traces,
+    ].filter(Boolean).join("\n");
   }
 
   private formatDurableMemoryText(query: string, items: DurableMemoryEntry[]): string {

@@ -252,6 +252,23 @@ export class OpenClawBridge {
     );
 
     register(
+      "memory_dag_inspect",
+      "Inspect the structural integrity of the summary DAG and source bindings for the current agent/session.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: any) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        return await this.runtime.inspectDag(context);
+      },
+    );
+
+    register(
       "lcm_describe",
       "Compatibility alias of memory_route for legacy chaunym-claw prompts.",
       {

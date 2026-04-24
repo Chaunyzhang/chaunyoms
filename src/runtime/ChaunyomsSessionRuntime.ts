@@ -17,6 +17,7 @@ import {
   BridgeConfig,
   CompactionRunResult,
   ContextItem,
+  DagIntegrityReport,
   ContextViewRepository,
   DurableMemoryRepository,
   DurableMemoryEntry,
@@ -48,6 +49,7 @@ import {
   deriveProjectStatusFromSnapshot,
 } from "../utils/projectIdentity";
 import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
+import { SummaryDagIntegrityInspector } from "../resolvers/SummaryDagIntegrityInspector";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
 
 interface CompactionBudgetState {
@@ -110,6 +112,7 @@ export class ChaunyomsSessionRuntime {
   private externalSystemBootstrap: ExternalSystemBootstrap;
   private compactionEngine: CompactionEngine;
   private readonly sourceMessageResolver = new SourceMessageResolver();
+  private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
   private llmCaller: LlmCaller | null;
   private compactionInFlight: Promise<CompactionRunResult> | null = null;
   private knowledgeMaintenanceInFlight: Promise<void> | null = null;
@@ -422,6 +425,13 @@ export class ChaunyomsSessionRuntime {
 
   async getSessionStores(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SessionDataStores> {
     return await this.ensureSession(context.sessionId, context.config);
+  }
+
+  async inspectDag(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<DagIntegrityReport> {
+    const { rawStore, summaryStore } = await this.ensureSession(context.sessionId, context.config);
+    return this.dagIntegrityInspector.inspect(summaryStore, rawStore, {
+      sessionId: context.sessionId,
+    });
   }
 
   private async ensureSession(

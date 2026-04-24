@@ -623,6 +623,32 @@ export interface DagTraversalStep {
   childSummaryIds?: string[];
 }
 
+export interface DagIntegrityIssue {
+  severity: "error" | "warning";
+  code:
+    | "missing_child_summary"
+    | "missing_parent_summary"
+    | "parent_child_backlink_missing"
+    | "child_parent_backlink_missing"
+    | "branch_without_children"
+    | "leaf_with_children"
+    | "source_messages_missing"
+    | "source_integrity_mismatch";
+  summaryId: string;
+  relatedSummaryId?: string;
+  message: string;
+}
+
+export interface DagIntegrityReport {
+  ok: boolean;
+  totalSummaries: number;
+  rootCount: number;
+  branchCount: number;
+  leafCount: number;
+  issueCount: number;
+  issues: DagIntegrityIssue[];
+}
+
 export interface ProjectStateSnapshot {
   schemaVersion: 2;
   dateLabel: string;
