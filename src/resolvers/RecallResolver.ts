@@ -1,3 +1,11 @@
+const QUERY_STOP_WORDS = new Set([
+  "about", "after", "again", "answer", "before", "conversation", "could", "current",
+  "does", "did", "earlier", "exact", "from", "have", "had", "has", "history",
+  "long", "many", "memory", "multiple", "question", "recall", "source", "that",
+  "their", "there", "these", "they", "this", "what", "when", "where", "which",
+  "while", "who", "why", "with", "would", "you", "your", "the", "and", "for",
+]);
+
 import {
   RawMessageRepository,
   RecallResult,
@@ -121,6 +129,6 @@ export class RecallResolver {
       .toLowerCase()
       .split(/[^a-z0-9\u4e00-\u9fff]+/i)
       .map((term) => term.trim())
-      .filter((term) => term.length >= 2);
+      .filter((term) => term.length >= 2 && !QUERY_STOP_WORDS.has(term));
   }
 }

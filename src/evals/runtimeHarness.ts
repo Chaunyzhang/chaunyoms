@@ -12,17 +12,73 @@ import { createRuntimeLayerDependencies } from "../runtime/createRuntimeLayerDep
 import { BridgeConfig, SummaryEntry } from "../types";
 import { EvalCaseDefinition, EvalExplicitMessage, EvalSeedKnowledgeDraft } from "./types";
 
-function syntheticSummaryFromPrompt(prompt: string): string {
-  const exactFacts = [
-    ...new Set(
-      Array.from(
-        prompt.matchAll(/[A-Z_]+=[A-Za-z0-9:-]+/g),
-      ).map((match) => match[0]),
-    ),
+function transcriptSnippetsFromPrompt(prompt: string): string[] {
+  const snippets: string[] = [];
+  const transcriptPattern = /Turn \d+ \| (?:user|assistant)\n([\s\S]*?)(?=\n\nTurn \d+ \| (?:user|assistant)\n|$)/g;
+  for (const match of prompt.matchAll(transcriptPattern)) {
+    const snippet = match[1]?.replace(/\s+/g, " ").trim();
+    if (snippet) {
+      snippets.push(snippet);
+    }
+  }
+  return snippets;
+}
+
+function uniqueLimited(items: string[], limit: number): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of items) {
+    const normalized = item.trim();
+    if (!normalized || seen.has(normalized.toLowerCase())) {
+      continue;
+    }
+    seen.add(normalized.toLowerCase());
+    result.push(normalized);
+    if (result.length >= limit) {
+      break;
+    }
+  }
+  return result;
+}
+
+function extractSearchTerms(text: string): string[] {
+  const stopWords = new Set([
+    "about", "after", "again", "assistant", "before", "between", "conversation",
+    "current", "earlier", "exact", "from", "have", "locomo", "message",
+    "sample", "session", "source", "speaker", "that", "their", "there", "these",
+    "they", "this", "turn", "user", "with", "would", "you", "your",
+  ]);
+  return uniqueLimited(
+    text
+      .split(/[^A-Za-z0-9\u4e00-\u9fff:'"-]+/g)
+      .map((term) => term.replace(/^['"]|['"]$/g, "").trim())
+      .filter((term) => term.length >= 3 && !stopWords.has(term.toLowerCase())),
+    80,
+  );
+}
+
+function extractExactFacts(text: string): string[] {
+  const patterns = [
+    /[A-Z_]+=[A-Za-z0-9:._-]+/g,
+    /\bD\d+:\d+\b/g,
+    /\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December),?\s+\d{4}\b/gi,
+    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December),?\s+\d{4}\b/gi,
+    /\b\d{4}\b/g,
+    /\b\d+\s+(?:years?|weeks?|months?|days?|hours?)\b/gi,
+    /"[^"]{3,80}"/g,
   ];
+  return uniqueLimited(patterns.flatMap((pattern) => Array.from(text.matchAll(pattern), (match) => match[0])), 80);
+}
+
+function syntheticSummaryFromPrompt(prompt: string): string {
+  const transcriptSnippets = transcriptSnippetsFromPrompt(prompt);
+  const sourceText = transcriptSnippets.length > 0 ? transcriptSnippets.join(" ") : prompt;
+  const exactFacts = extractExactFacts(sourceText);
+  const keywords = extractSearchTerms(sourceText);
+  const summaryBody = sourceText.replace(/\s+/g, " ").slice(0, 6000);
   return JSON.stringify({
-    summary: `Synthetic summary preserving ${exactFacts[0] ?? "current runtime context"}.`,
-    keywords: ["eval", "memory", ...(exactFacts.length > 0 ? exactFacts : [])],
+    summary: `Synthetic source-grounded summary: ${summaryBody}`,
+    keywords: ["eval", "memory", ...keywords],
     toneTag: "focused",
     memoryType: "project_state",
     phase: "implementation",
@@ -30,7 +86,7 @@ function syntheticSummaryFromPrompt(prompt: string): string {
     decisions: ["prefer source-trace-backed retrieval"],
     blockers: [],
     nextSteps: ["continue evaluation replay"],
-    keyEntities: ["ChaunyomsSessionRuntime", "ChaunyomsRetrievalService"],
+    keyEntities: uniqueLimited(["ChaunyomsSessionRuntime", "ChaunyomsRetrievalService", ...keywords.filter((term) => /^[A-Z]/.test(term))], 40),
     exactFacts,
     promotionIntent: "candidate",
   });

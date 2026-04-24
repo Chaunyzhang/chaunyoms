@@ -1,7 +1,8 @@
+import { readFile } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import path from "node:path";
 
-import suite from "./fixtures/core-memory-suite.json";
+import defaultSuite from "./fixtures/core-memory-suite.json";
 
 import {
   cleanupEvalHarness,
@@ -20,6 +21,51 @@ import {
   EvalSuiteDefinition,
   EvalSuiteReport,
 } from "./types";
+
+
+interface EvalRunOptions {
+  suitePath?: string;
+  reportPrefix: string;
+}
+
+function parseArgs(argv: string[]): EvalRunOptions {
+  const options: EvalRunOptions = {
+    suitePath: process.env.CHAUNYOMS_EVAL_SUITE,
+    reportPrefix: process.env.CHAUNYOMS_EVAL_REPORT_PREFIX ?? "memory-eval-report",
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--suite") {
+      options.suitePath = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--suite=")) {
+      options.suitePath = arg.slice("--suite=".length);
+      continue;
+    }
+    if (arg === "--report-prefix") {
+      options.reportPrefix = argv[index + 1] ?? options.reportPrefix;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--report-prefix=")) {
+      options.reportPrefix = arg.slice("--report-prefix=".length);
+    }
+  }
+
+  return options;
+}
+
+async function loadSuiteDefinition(suitePath?: string): Promise<EvalSuiteDefinition> {
+  if (!suitePath) {
+    return defaultSuite as unknown as EvalSuiteDefinition;
+  }
+
+  const resolvedPath = path.resolve(process.cwd(), suitePath);
+  return JSON.parse(await readFile(resolvedPath, "utf8")) as EvalSuiteDefinition;
+}
 
 function assertNever(_value: never): never {
   throw new Error("Unexpected value");
@@ -248,7 +294,8 @@ async function runCase(caseDef: EvalCaseDefinition): Promise<EvalCaseResult> {
 }
 
 async function main(): Promise<void> {
-  const suiteDefinition = suite as unknown as EvalSuiteDefinition;
+  const options = parseArgs(process.argv.slice(2));
+  const suiteDefinition = await loadSuiteDefinition(options.suitePath);
   const results: EvalCaseResult[] = [];
   for (const caseDef of suiteDefinition.cases) {
     results.push(await runCase(caseDef));
@@ -268,8 +315,8 @@ async function main(): Promise<void> {
   const reportDir = path.join(process.cwd(), "artifacts", "evals");
   await writeReportArtifacts(
     reportDir,
-    "memory-eval-report.json",
-    "memory-eval-report.md",
+    `${options.reportPrefix}.json`,
+    `${options.reportPrefix}.md`,
     json,
     markdown,
   );
