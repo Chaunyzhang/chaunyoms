@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
+import { KnowledgeIntakeGate } from "../engines/KnowledgeIntakeGate";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
@@ -45,6 +46,7 @@ import {
   deriveProjectIdentityFromSummary,
   deriveProjectStatusFromSnapshot,
 } from "../utils/projectIdentity";
+import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
 
 interface CompactionBudgetState {
@@ -100,15 +102,25 @@ export class ChaunyomsSessionRuntime {
   private readonly hostFixedContextProvider: HostFixedContextProvider;
   private readonly assembler: ContextAssembler;
   private readonly extractionEngine = new MemoryExtractionEngine();
+  private readonly knowledgeIntakeGate = new KnowledgeIntakeGate();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
   private backgroundOrganizerEngine: BackgroundOrganizerEngine;
   private externalSystemBootstrap: ExternalSystemBootstrap;
   private compactionEngine: CompactionEngine;
+  private readonly sourceMessageResolver = new SourceMessageResolver();
   private llmCaller: LlmCaller | null;
   private compactionInFlight: Promise<SummaryEntry | null> | null = null;
+  private knowledgeMaintenanceInFlight: Promise<void> | null = null;
+  private readonly pendingKnowledgeMaintenance = new Map<string, {
+    sessionId: string;
+    config: BridgeConfig;
+    summaryModel?: string;
+  }>();
   private navigationSnapshotPending = false;
   private readonly runtimeIngress = new RuntimeMessageIngress();
+  private static readonly DEFAULT_KNOWLEDGE_OVERRIDE_RE =
+    /(帮我记一下|记住这个|记一下这个|放进知识库|扔进知识库|加入知识库|写进知识库|加入wiki|写进wiki|沉淀进知识库|remember this|remember this for later|save this to knowledge|put this in (?:the )?knowledge base|add this to wiki|store this in (?:the )?knowledge base)/i;
 
   constructor(
     logger: LoggerLike,
@@ -164,7 +176,14 @@ export class ChaunyomsSessionRuntime {
     if (integrity.mismatched > 0) {
       this.logger.warn("summary_integrity_mismatch_detected", integrity);
     }
+    this.scheduleKnowledgeMaintenance(context);
     return { importedMessages: 0, integrity };
+  }
+
+  async waitForBackgroundWork(): Promise<void> {
+    while (this.knowledgeMaintenanceInFlight) {
+      await this.knowledgeMaintenanceInFlight;
+    }
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
@@ -201,9 +220,18 @@ export class ChaunyomsSessionRuntime {
       context.config,
       context.runtimeMessages,
     );
+    const activeQuery = this.resolveActiveUserQuery(
+      rawStore,
+      context.runtimeMessages,
+    );
 
     if (!this.config.emergencyBrake && this.config.compactionBarrierEnabled) {
-      await this.runCompactionBarrier(context, rawStore, summaryStore);
+      await this.runCompactionBarrier(
+        context,
+        rawStore,
+        summaryStore,
+        activeQuery,
+      );
     }
 
     try {
@@ -221,6 +249,8 @@ export class ChaunyomsSessionRuntime {
           includeStablePrefix: !this.config.emergencyBrake,
           includeSummaries: !this.config.emergencyBrake,
           includeDurableMemory: !this.config.emergencyBrake,
+          activeQuery,
+          sessionId: context.sessionId,
         },
       );
       return {
@@ -237,6 +267,7 @@ export class ChaunyomsSessionRuntime {
         Math.max(context.totalBudget - context.systemPromptTokens, 0),
         this.config.freshTailTokens,
         this.config.maxFreshTailTurns,
+        context.sessionId,
       );
       this.contextViewStore.setItems(fallback);
       return {
@@ -266,7 +297,7 @@ export class ChaunyomsSessionRuntime {
       context.config,
       context.runtimeMessages,
     );
-    const tokensBefore = rawStore.totalUncompactedTokens();
+    const tokensBefore = rawStore.totalUncompactedTokens({ sessionId: context.sessionId });
     const entry = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
@@ -281,7 +312,7 @@ export class ChaunyomsSessionRuntime {
       };
     }
 
-    await this.promoteSummaryToKnowledge(entry, rawStore, context);
+    await this.enqueueSummaryForKnowledge(entry, context);
     await this.rollUpSummaryTree(summaryStore, context);
     await this.writeNavigationArtifactsIfPending(
       context,
@@ -303,7 +334,7 @@ export class ChaunyomsSessionRuntime {
       result: {
         summary: entry.summary,
         tokensBefore,
-        tokensAfter: rawStore.totalUncompactedTokens(),
+        tokensAfter: rawStore.totalUncompactedTokens({ sessionId: context.sessionId }),
         details: {
           startTurn: entry.startTurn,
           endTurn: entry.endTurn,
@@ -329,7 +360,7 @@ export class ChaunyomsSessionRuntime {
       : await this.runBestEffortCompaction(context, rawStore, summaryStore);
 
     if (compactionResult.entry) {
-      await this.promoteSummaryToKnowledge(compactionResult.entry, rawStore, context);
+      await this.enqueueSummaryForKnowledge(compactionResult.entry, context);
       await this.sessionData.appendSummaryArtifact(compactionResult.entry);
       await this.rollUpSummaryTree(summaryStore, context);
     }
@@ -343,7 +374,7 @@ export class ChaunyomsSessionRuntime {
       sessionId: context.sessionId,
       contextWindow: context.totalBudget,
       compactionTriggerThreshold: this.config.contextThreshold,
-      uncompactedTokens: rawStore.totalUncompactedTokens(),
+      uncompactedTokens: rawStore.totalUncompactedTokens({ sessionId: context.sessionId }),
       summaryCount: summaryStore.getAllSummaries().length,
       summaryTokens: summaryStore.getTotalTokens(),
       observationCount: observationStore.count(),
@@ -618,6 +649,28 @@ export class ChaunyomsSessionRuntime {
     return 0;
   }
 
+  private resolveActiveUserQuery(
+    rawStore: RawMessageRepository,
+    runtimeMessages: RuntimeMessageSnapshot[],
+  ): string | undefined {
+    for (let index = runtimeMessages.length - 1; index >= 0; index -= 1) {
+      const message = runtimeMessages[index];
+      if (message.role === "user" && message.text.trim().length > 0) {
+        return message.text.trim();
+      }
+    }
+
+    const messages = rawStore.getAll();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === "user" && message.content.trim().length > 0) {
+        return message.content.trim();
+      }
+    }
+
+    return undefined;
+  }
+
   private normalizeMessageText(content: string): string {
     return content.replace(/\s+/g, " ").trim();
   }
@@ -669,11 +722,13 @@ export class ChaunyomsSessionRuntime {
     context: LifecycleContext,
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
+    activeQuery?: string,
   ): Promise<void> {
     let budgetState = await this.measureCompactionBudgetState(
       context,
       rawStore,
       summaryStore,
+      activeQuery,
     );
     if (!budgetState.triggerExceeded) {
       return;
@@ -703,9 +758,14 @@ export class ChaunyomsSessionRuntime {
         );
       }
 
-      await this.promoteSummaryToKnowledge(entry, rawStore, context);
+      await this.enqueueSummaryForKnowledge(entry, context);
       await this.rollUpSummaryTree(summaryStore, context);
-      budgetState = await this.measureCompactionBudgetState(context, rawStore, summaryStore);
+      budgetState = await this.measureCompactionBudgetState(
+        context,
+        rawStore,
+        summaryStore,
+        activeQuery,
+      );
     }
 
     if (budgetState.hostFixedTokens + budgetState.pluginFixedTokens + budgetState.freshTailTokens > context.totalBudget) {
@@ -739,6 +799,7 @@ export class ChaunyomsSessionRuntime {
     context: LifecycleContext,
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
+    activeQuery?: string,
   ): Promise<CompactionBudgetState> {
     const { durableMemoryStore } = this.getActiveStores();
     const budget = this.assembler.allocateBudget(
@@ -749,8 +810,11 @@ export class ChaunyomsSessionRuntime {
       this.config.sharedDataDir,
       this.config.workspaceDir,
       budget.stablePrefixBudget,
+      {
+        activeQuery,
+      },
     );
-    const recallGuidance = this.assembler.buildRecallGuidance(summaryStore);
+    const recallGuidance = this.assembler.buildRecallGuidance(summaryStore, context.sessionId);
     const durableMemory = this.assembler.assembleDurableMemory(
       durableMemoryStore,
       budget.recallBudget,
@@ -770,6 +834,7 @@ export class ChaunyomsSessionRuntime {
       effectiveTailBudget,
       this.config.freshTailTokens,
       this.config.maxFreshTailTurns,
+      context.sessionId,
     );
     const freshTailTokens = freshTail.reduce(
       (sum, item) => sum + item.tokenCount,
@@ -782,6 +847,7 @@ export class ChaunyomsSessionRuntime {
         summaryStore,
         this.config.freshTailTokens,
         this.config.maxFreshTailTurns,
+        context.sessionId,
       );
     const hostFixedResolved =
       context.systemPromptTokens > 0
@@ -820,43 +886,236 @@ export class ChaunyomsSessionRuntime {
     };
   }
 
-  private async promoteSummaryToKnowledge(
+  private async enqueueSummaryForKnowledge(
     entry: SummaryEntry,
-    rawStore: RawMessageRepository,
     context: LifecycleContext,
   ): Promise<void> {
     if (!this.config.knowledgePromotionEnabled || this.config.emergencyBrake) {
       return;
     }
 
-    try {
-      const { knowledgeStore } = await this.ensureSession(
-        context.sessionId,
-        context.config,
-      );
-      const sourceMessages = rawStore.getByRange(entry.startTurn, entry.endTurn);
-      const result = await this.knowledgePromotionEngine.promote({
-        summaryEntry: entry,
-        messages: sourceMessages,
-        sessionId: context.sessionId,
-        summaryModel: context.summaryModel,
-        knowledgePromotionModel: this.config.knowledgePromotionModel,
-        knowledgeStore,
-      });
-      this.logger.info("knowledge_markdown_promotion_result", {
+    const { rawStore } = await this.ensureSession(
+      context.sessionId,
+      context.config,
+    );
+    const sourceResolution = this.sourceMessageResolver.resolve(rawStore, entry);
+    if (sourceResolution.messages.length === 0) {
+      this.logger.warn("knowledge_raw_intake_missing_source_messages", {
         summaryId: entry.id,
-        status: result.status,
-        reason: result.reason,
-        slug: result.slug,
-        version: result.version,
-        filePath: result.filePath,
+        sessionId: entry.sessionId,
+        reason: sourceResolution.reason,
       });
-    } catch (error) {
-      this.logger.warn("knowledge_markdown_promotion_failed", {
-        summaryId: entry.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      return;
     }
+
+    const userOverride = this.resolveKnowledgeUserOverride(
+      sourceResolution.messages,
+      context.config,
+    );
+    const decision = userOverride
+      ? {
+          accepted: true,
+          reason: userOverride,
+        }
+      : this.knowledgeIntakeGate.decide(entry, context.config);
+    if (!decision.accepted) {
+      this.logger.info("knowledge_raw_intake_rejected", {
+        summaryId: entry.id,
+        reason: decision.reason,
+        summaryLevel: entry.summaryLevel ?? 1,
+        nodeKind: entry.nodeKind ?? "leaf",
+        memoryType: entry.memoryType ?? "general",
+        promotionIntent: entry.promotionIntent ?? "candidate",
+      });
+      return;
+    }
+
+    const { knowledgeRawStore } = await this.ensureSession(
+      context.sessionId,
+      context.config,
+    );
+    const now = new Date().toISOString();
+    const enqueued = await knowledgeRawStore.enqueue({
+      id: `knowledge-raw-${entry.id}`,
+      sessionId: entry.sessionId,
+      agentId: entry.agentId,
+      sourceSummaryId: entry.id,
+      sourceSummary: entry,
+      sourceBinding: sourceResolution.binding,
+      intakeReason: decision.reason,
+      status: "pending",
+      createdAt: now,
+      updatedAt: now,
+    });
+    if (!enqueued) {
+      this.logger.info("knowledge_raw_intake_deduped", {
+        summaryId: entry.id,
+      });
+      return;
+    }
+
+    this.logger.info("knowledge_raw_intake_enqueued", {
+      summaryId: entry.id,
+      reason: decision.reason,
+    });
+    this.scheduleKnowledgeMaintenance(context);
+  }
+
+  private scheduleKnowledgeMaintenance(context: Pick<LifecycleContext, "sessionId" | "config" | "summaryModel">): void {
+    if (!context.config.knowledgePromotionEnabled || context.config.emergencyBrake) {
+      return;
+    }
+
+    const key = `${context.config.agentId}|${context.sessionId}|${context.config.dataDir}`;
+    this.pendingKnowledgeMaintenance.set(key, {
+      sessionId: context.sessionId,
+      config: context.config,
+      summaryModel: context.summaryModel,
+    });
+    this.startKnowledgeMaintenanceLoop();
+  }
+
+  private startKnowledgeMaintenanceLoop(): void {
+    if (this.knowledgeMaintenanceInFlight) {
+      return;
+    }
+
+    this.knowledgeMaintenanceInFlight = (async () => {
+      while (this.pendingKnowledgeMaintenance.size > 0) {
+        const contexts = [...this.pendingKnowledgeMaintenance.values()];
+        this.pendingKnowledgeMaintenance.clear();
+        for (const context of contexts) {
+          await this.processKnowledgeRawQueue(context);
+        }
+      }
+    })()
+      .catch((error) => {
+        this.logger.warn("knowledge_raw_worker_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.knowledgeMaintenanceInFlight = null;
+        if (this.pendingKnowledgeMaintenance.size > 0) {
+          this.startKnowledgeMaintenanceLoop();
+        }
+      });
+  }
+
+  private async processKnowledgeRawQueue(context: {
+    sessionId: string;
+    config: BridgeConfig;
+    summaryModel?: string;
+  }): Promise<void> {
+    const { rawStore, knowledgeRawStore, knowledgeStore } = await this.ensureSession(
+      context.sessionId,
+      context.config,
+    );
+
+    while (true) {
+      const candidates = await knowledgeRawStore.claimPending(8);
+      if (candidates.length === 0) {
+        return;
+      }
+
+      for (const candidate of candidates) {
+        try {
+          const sourceResolution = this.sourceMessageResolver.resolve(
+            rawStore,
+            candidate.sourceBinding ?? candidate.sourceSummary,
+          );
+          if (sourceResolution.messages.length === 0) {
+            await knowledgeRawStore.markSettled({
+              id: candidate.id,
+              status: "failed",
+              reason: "missing_source_messages_for_knowledge_candidate",
+            });
+            continue;
+          }
+          if (!sourceResolution.verified) {
+            await knowledgeRawStore.markSettled({
+              id: candidate.id,
+              status: "failed",
+              reason: sourceResolution.reason,
+            });
+            continue;
+          }
+
+          const result = await this.knowledgePromotionEngine.promote({
+            summaryEntry: candidate.sourceSummary,
+            messages: sourceResolution.messages,
+            sessionId: context.sessionId,
+            summaryModel: context.summaryModel,
+            knowledgePromotionModel: context.config.knowledgePromotionModel,
+            knowledgeStore,
+          });
+          await knowledgeRawStore.markSettled({
+            id: candidate.id,
+            status: result.status,
+            reason: result.reason,
+            docId: result.docId,
+            slug: result.slug,
+            version: result.version,
+            filePath: result.filePath,
+          });
+          this.logger.info("knowledge_raw_candidate_processed", {
+            candidateId: candidate.id,
+            summaryId: candidate.sourceSummaryId,
+            status: result.status,
+            reason: result.reason,
+            slug: result.slug,
+            version: result.version,
+          });
+        } catch (error) {
+          await knowledgeRawStore.markSettled({
+            id: candidate.id,
+            status: "failed",
+            reason: error instanceof Error ? error.message : String(error),
+          });
+          this.logger.warn("knowledge_raw_candidate_processing_failed", {
+            candidateId: candidate.id,
+            summaryId: candidate.sourceSummaryId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+  }
+
+  private resolveKnowledgeUserOverride(
+    messages: RawMessage[],
+    config: Pick<
+      BridgeConfig,
+      "knowledgeIntakeUserOverrideEnabled" | "knowledgeIntakeUserOverridePatterns"
+    >,
+  ): string | null {
+    if (!config.knowledgeIntakeUserOverrideEnabled) {
+      return null;
+    }
+
+    const customPatterns = (config.knowledgeIntakeUserOverridePatterns ?? [])
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "user") {
+        continue;
+      }
+      const normalized = message.content.trim();
+      if (!normalized) {
+        continue;
+      }
+      if (ChaunyomsSessionRuntime.DEFAULT_KNOWLEDGE_OVERRIDE_RE.test(normalized)) {
+        return "explicit_user_knowledge_override";
+      }
+      const lower = normalized.toLowerCase();
+      if (customPatterns.some((pattern) => lower.includes(pattern))) {
+        return "custom_user_knowledge_override";
+      }
+    }
+
+    return null;
   }
 
   private inspectSummaryIntegrity(): SummaryIntegrityInspection {
@@ -896,7 +1155,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   private async repairCompactedFlagsFromSummaries(
-    verifiedEntries: Array<{ startTurn: number; endTurn: number }>,
+    verifiedEntries: Array<{ sessionId: string; startTurn: number; endTurn: number }>,
   ): Promise<void> {
     await this.sessionData.repairCompactedFlagsFromSummaries(verifiedEntries);
   }
@@ -998,7 +1257,6 @@ export class ChaunyomsSessionRuntime {
         return;
       }
       this.navigationSnapshotPending = true;
-      await this.promoteSummaryToKnowledge(rollup, this.getActiveStores().rawStore, context);
       await this.sessionData.appendSummaryArtifact(rollup);
     }
   }

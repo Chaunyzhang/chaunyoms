@@ -1,11 +1,16 @@
 import { StablePrefixStore } from "../stores/StablePrefixStore";
-import { FixedPrefixProvider, NavigationRepository } from "../types";
+import { FixedPrefixProvider, NavigationRepository, PrefixLoadOptions } from "../types";
 
 export class StablePrefixAdapter implements FixedPrefixProvider, NavigationRepository {
   constructor(private readonly store = new StablePrefixStore()) {}
 
-  async load(sharedDataDir: string, workspaceDir: string, budget: number) {
-    return await this.store.load(sharedDataDir, workspaceDir, budget);
+  async load(
+    sharedDataDir: string,
+    workspaceDir: string,
+    budget: number,
+    options?: PrefixLoadOptions,
+  ) {
+    return await this.store.load(sharedDataDir, workspaceDir, budget, options);
   }
 
   async getSharedInsightHit(sharedDataDir: string, query: string) {

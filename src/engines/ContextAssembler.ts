@@ -13,6 +13,8 @@ interface AssembleOptions {
   includeStablePrefix?: boolean;
   includeSummaries?: boolean;
   includeDurableMemory?: boolean;
+  activeQuery?: string;
+  sessionId?: string;
 }
 
 export class ContextAssembler {
@@ -20,6 +22,45 @@ export class ContextAssembler {
     private readonly contextViewStore: ContextViewRepository,
     private readonly fixedPrefixProvider: FixedPrefixProvider,
   ) {}
+
+  private splitStablePrefix(items: ContextItem[]): {
+    leading: ContextItem[];
+    deferred: ContextItem[];
+  } {
+    const layerOrder = new Map<string, number>([
+      ["shared_cognition", 0],
+      ["navigation", 1],
+      ["shared_insights", 0],
+      ["knowledge_base_index", 1],
+    ]);
+    const leading: ContextItem[] = [];
+    const deferred: ContextItem[] = [];
+
+    for (const item of items) {
+      const layer =
+        typeof item.metadata?.layer === "string" ? item.metadata.layer : undefined;
+      if (layer === "shared_insights" || layer === "knowledge_base_index") {
+        deferred.push(item);
+        continue;
+      }
+      leading.push(item);
+    }
+
+    const orderWithinBucket = (bucket: ContextItem[]) =>
+      [...bucket].sort((left, right) => {
+        const leftLayer =
+          typeof left.metadata?.layer === "string" ? left.metadata.layer : "";
+        const rightLayer =
+          typeof right.metadata?.layer === "string" ? right.metadata.layer : "";
+        return (layerOrder.get(leftLayer) ?? Number.MAX_SAFE_INTEGER) -
+          (layerOrder.get(rightLayer) ?? Number.MAX_SAFE_INTEGER);
+      });
+
+    return {
+      leading: orderWithinBucket(leading),
+      deferred: orderWithinBucket(deferred),
+    };
+  }
 
   allocateBudget(totalBudget: number, systemPromptTokens: number): ContextBudget {
     const availableBudget = Math.max(totalBudget - systemPromptTokens, 0);
@@ -34,8 +75,14 @@ export class ContextAssembler {
     };
   }
 
-  assembleRecentTail(rawStore: RawMessageRepository, budget: number, freshTailTokens: number, maxFreshTailTurns: number): ContextItem[] {
-    const recentMessages = rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns);
+  assembleRecentTail(
+    rawStore: RawMessageRepository,
+    budget: number,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+    sessionId?: string,
+  ): ContextItem[] {
+    const recentMessages = rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns, { sessionId });
     const selected: ContextItem[] = [];
     let consumed = 0;
 
@@ -59,11 +106,11 @@ export class ContextAssembler {
     return selected;
   }
 
-  assembleSummaries(summaryStore: SummaryRepository, budget: number): ContextItem[] {
-    const rootSummaries = summaryStore.getRootSummaries();
+  assembleSummaries(summaryStore: SummaryRepository, budget: number, sessionId?: string): ContextItem[] {
+    const rootSummaries = summaryStore.getRootSummaries({ sessionId });
     const sourceSummaries = rootSummaries.length > 0
       ? rootSummaries
-      : summaryStore.getActiveSummaries();
+      : summaryStore.getActiveSummaries({ sessionId });
     const summaries = [...sourceSummaries].sort(
       (left, right) => right.endTurn - left.endTurn || right.startTurn - left.startTurn,
     );
@@ -108,6 +155,7 @@ export class ContextAssembler {
           sourceEndTimestamp: summary.sourceEndTimestamp,
           sourceSequenceMin: summary.sourceSequenceMin,
           sourceSequenceMax: summary.sourceSequenceMax,
+          sourceBinding: summary.sourceBinding,
         },
       });
     }
@@ -149,8 +197,8 @@ export class ContextAssembler {
     return selected;
   }
 
-  buildRecallGuidance(summaryStore: SummaryRepository): ContextItem | null {
-    const summaryCount = summaryStore.getAllSummaries().length;
+  buildRecallGuidance(summaryStore: SummaryRepository, sessionId?: string): ContextItem | null {
+    const summaryCount = summaryStore.getAllSummaries({ sessionId }).length;
     if (summaryCount <= 0) {
       return null;
     }
@@ -189,23 +237,39 @@ export class ContextAssembler {
     const budget = this.allocateBudget(totalBudget, systemPromptTokens);
     const stablePrefix = options.includeStablePrefix === false
       ? []
-      : await this.fixedPrefixProvider.load(sharedDataDir, workspaceDir, budget.stablePrefixBudget);
+      : await this.fixedPrefixProvider.load(
+          sharedDataDir,
+          workspaceDir,
+          budget.stablePrefixBudget,
+          {
+            activeQuery: options.activeQuery,
+          },
+        );
+    const { leading: leadingStablePrefix, deferred: deferredStablePrefix } =
+      this.splitStablePrefix(stablePrefix);
     const recallGuidance = options.includeSummaries === false
       ? null
-      : this.buildRecallGuidance(summaryStore);
+      : this.buildRecallGuidance(summaryStore, options.sessionId);
     const summaries = options.includeSummaries === false
       ? []
-      : this.assembleSummaries(summaryStore, budget.summaryBudget);
+      : this.assembleSummaries(summaryStore, budget.summaryBudget, options.sessionId);
     const durableMemory = options.includeDurableMemory === false
       ? []
       : this.assembleDurableMemory(durableMemoryStore, budget.recallBudget);
     const effectiveTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
-    const recentTail = this.assembleRecentTail(rawStore, effectiveTailBudget, freshTailTokens, maxFreshTailTurns);
+    const recentTail = this.assembleRecentTail(
+      rawStore,
+      effectiveTailBudget,
+      freshTailTokens,
+      maxFreshTailTurns,
+      options.sessionId,
+    );
     const items = [
-      ...stablePrefix,
+      ...leadingStablePrefix,
       ...(recallGuidance ? [recallGuidance] : []),
       ...durableMemory,
       ...summaries,
+      ...deferredStablePrefix,
       ...recentTail,
     ];
     this.contextViewStore.setItems(items);

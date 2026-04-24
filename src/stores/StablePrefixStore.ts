@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { ContextItem } from "../types";
+import { ContextItem, PrefixLoadOptions } from "../types";
 import {
   parseProjectStateSnapshot,
   prioritizeProjectStateSnapshot,
@@ -34,6 +34,10 @@ export interface RouteHit {
 
 export class StablePrefixStore {
   private static readonly NAVIGATION_RETENTION_ROUNDS = 30;
+  private static readonly KNOWLEDGE_REFERENCE_RE =
+    /(knowledge[- ]?base|docs?|documentation|reference|manual|guide|playbook|spec|specification|api|readme|markdown|\.md\b|adr|rfc|architecture|design docs?|知识库|文档|资料|说明|手册|教程|规范|接口文档|架构|设计文档)/i;
+  private static readonly REFERENCE_LOOKUP_RE =
+    /(look up|lookup|search|find|read|check|consult|open|review|refer|查|找|看|翻|参考|根据)/i;
 
   async getSharedInsightHit(
     sharedDataDir: string,
@@ -199,6 +203,7 @@ export class StablePrefixStore {
     sharedDataDir: string,
     workspaceDir: string,
     budget: number,
+    options: PrefixLoadOptions = {},
   ): Promise<ContextItem[]> {
     await this.cleanupOldNavigation(
       workspaceDir,
@@ -233,6 +238,9 @@ export class StablePrefixStore {
         layer: "shared_cognition",
       },
     );
+    pushIfFits("navigation", await this.readNavigation(workspaceDir), {
+      layer: "navigation",
+    });
     pushIfFits(
       "shared_insights",
       await this.readSharedInsights(sharedDataDir),
@@ -240,16 +248,15 @@ export class StablePrefixStore {
         layer: "shared_insights",
       },
     );
-    pushIfFits(
-      "knowledge_base_index",
-      await this.readKnowledgeBaseIndex(sharedDataDir),
-      {
-        layer: "knowledge_base_index",
-      },
-    );
-    pushIfFits("navigation", await this.readNavigation(workspaceDir), {
-      layer: "navigation",
-    });
+    if (await this.shouldIncludeKnowledgeBaseIndex(sharedDataDir, options.activeQuery)) {
+      pushIfFits(
+        "knowledge_base_index",
+        await this.readKnowledgeBaseIndex(sharedDataDir),
+        {
+          layer: "knowledge_base_index",
+        },
+      );
+    }
 
     return items;
   }
@@ -292,6 +299,28 @@ export class StablePrefixStore {
         return `- ${id}: v${latestVersion} -> ${latestFile}`;
       })
       .join("\n");
+  }
+
+  private async shouldIncludeKnowledgeBaseIndex(
+    sharedDataDir: string,
+    activeQuery?: string,
+  ): Promise<boolean> {
+    const normalized = activeQuery?.trim();
+    if (!normalized) {
+      return false;
+    }
+
+    // The knowledge-base index is only useful when the current ask is clearly
+    // doc-seeking; otherwise it is just prompt pressure.
+    if (StablePrefixStore.KNOWLEDGE_REFERENCE_RE.test(normalized)) {
+      return true;
+    }
+
+    if (!StablePrefixStore.REFERENCE_LOOKUP_RE.test(normalized)) {
+      return false;
+    }
+
+    return await this.hasKnowledgeBaseTopicHit(sharedDataDir, normalized);
   }
 
   private async readNavigation(workspaceDir: string): Promise<string> {

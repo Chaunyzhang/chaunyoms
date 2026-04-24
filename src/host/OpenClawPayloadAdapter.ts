@@ -271,6 +271,44 @@ export class OpenClawPayloadAdapter {
           baseConfig.knowledgePromotionEnabled,
         );
 
+    const knowledgeIntakeMode = this.resolveStringEnum(
+      [
+        pluginConfig.knowledgeIntakeMode,
+        pluginConfig.knowledgeIntakePolicy,
+      ],
+      ["conservative", "balanced", "aggressive"],
+      baseConfig.knowledgeIntakeMode,
+    ) as BridgeConfig["knowledgeIntakeMode"];
+
+    const knowledgeIntakeAllowProjectState = this.resolveBooleanFlag(
+      [
+        pluginConfig.knowledgeIntakeAllowProjectState,
+        pluginConfig.allowProjectStateKnowledge,
+      ],
+      baseConfig.knowledgeIntakeAllowProjectState,
+    );
+
+    const knowledgeIntakeAllowBranchSummaries = this.resolveBooleanFlag(
+      [
+        pluginConfig.knowledgeIntakeAllowBranchSummaries,
+        pluginConfig.allowBranchSummaryKnowledge,
+      ],
+      baseConfig.knowledgeIntakeAllowBranchSummaries,
+    );
+
+    const knowledgeIntakeUserOverrideEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.knowledgeIntakeUserOverrideEnabled,
+        pluginConfig.knowledgeUserOverrideEnabled,
+      ],
+      baseConfig.knowledgeIntakeUserOverrideEnabled,
+    );
+
+    const knowledgeIntakeUserOverridePatterns = this.resolveStringList(
+      pluginConfig.knowledgeIntakeUserOverridePatterns,
+      baseConfig.knowledgeIntakeUserOverridePatterns,
+    );
+
     return {
       dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
@@ -335,6 +373,11 @@ export class OpenClawPayloadAdapter {
       durableMemoryEnabled,
       autoRecallEnabled,
       knowledgePromotionEnabled,
+      knowledgeIntakeMode,
+      knowledgeIntakeAllowProjectState,
+      knowledgeIntakeAllowBranchSummaries,
+      knowledgeIntakeUserOverrideEnabled,
+      knowledgeIntakeUserOverridePatterns,
       emergencyBrake,
     };
   }
@@ -679,6 +722,33 @@ export class OpenClawPayloadAdapter {
       }
     }
     return fallback;
+  }
+
+  private resolveStringEnum(
+    candidates: unknown[],
+    allowed: string[],
+    fallback: string,
+  ): string {
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") {
+        continue;
+      }
+      const normalized = candidate.trim().toLowerCase();
+      if (allowed.includes(normalized)) {
+        return normalized;
+      }
+    }
+    return fallback;
+  }
+
+  private resolveStringList(value: unknown, fallback: string[]): string[] {
+    if (!Array.isArray(value)) {
+      return [...fallback];
+    }
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
   }
 
   private inverseBoolean(value: unknown): boolean | undefined {

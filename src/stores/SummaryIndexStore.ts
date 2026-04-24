@@ -93,21 +93,21 @@ export class SummaryIndexStore implements SummaryRepository {
     }
   }
 
-  getAllSummaries(): SummaryEntry[] {
-    return [...this.summaries];
+  getAllSummaries(options: { sessionId?: string } = {}): SummaryEntry[] {
+    return this.filterBySession(this.summaries, options);
   }
 
-  getActiveSummaries(): SummaryEntry[] {
-    return this.summaries.filter((entry) => entry.recordStatus === "active");
+  getActiveSummaries(options: { sessionId?: string } = {}): SummaryEntry[] {
+    return this.filterBySession(this.summaries, options).filter((entry) => entry.recordStatus === "active");
   }
 
-  getRootSummaries(): SummaryEntry[] {
-    return this.getActiveSummaries().filter((entry) => !entry.parentSummaryId);
+  getRootSummaries(options: { sessionId?: string } = {}): SummaryEntry[] {
+    return this.getActiveSummaries(options).filter((entry) => !entry.parentSummaryId);
   }
 
-  getCoveredTurns(): Set<number> {
+  getCoveredTurns(options: { sessionId?: string } = {}): Set<number> {
     const coveredTurns = new Set<number>();
-    for (const summary of this.getActiveSummaries()) {
+    for (const summary of this.getActiveSummaries(options)) {
       for (let turn = summary.startTurn; turn <= summary.endTurn; turn += 1) {
         coveredTurns.add(turn);
       }
@@ -120,9 +120,14 @@ export class SummaryIndexStore implements SummaryRepository {
     endTurn: number,
     sourceHash?: string,
     sourceMessageCount?: number,
+    options: { sessionId?: string } = {},
   ): SummaryEntry | null {
     return (
       this.summaries.find((summary) => {
+        if (!this.matchesSession(summary, options)) {
+          return false;
+        }
+
         if (summary.startTurn !== startTurn || summary.endTurn !== endTurn) {
           return false;
         }
@@ -150,7 +155,7 @@ export class SummaryIndexStore implements SummaryRepository {
     );
   }
 
-  search(query: string): SummaryEntry[] {
+  search(query: string, options: { sessionId?: string } = {}): SummaryEntry[] {
     const terms = query
       .toLowerCase()
       .split(/\s+/)
@@ -161,7 +166,7 @@ export class SummaryIndexStore implements SummaryRepository {
       return [];
     }
 
-    return this.getActiveSummaries().filter((entry) => {
+    return this.getActiveSummaries(options).filter((entry) => {
       const haystack = [
         entry.summary,
         entry.memoryType ?? "",
@@ -183,8 +188,8 @@ export class SummaryIndexStore implements SummaryRepository {
     });
   }
 
-  getTotalTokens(): number {
-    return this.getActiveSummaries().reduce((total, entry) => total + entry.tokenCount, 0);
+  getTotalTokens(options: { sessionId?: string } = {}): number {
+    return this.getActiveSummaries(options).reduce((total, entry) => total + entry.tokenCount, 0);
   }
 
   private async flush(): Promise<void> {
@@ -217,6 +222,9 @@ export class SummaryIndexStore implements SummaryRepository {
     if (Array.isArray(entry.sourceSummaryIds) && entry.sourceSummaryIds.length > 0) {
       const targetKey = entry.sourceSummaryIds.join("|");
       return this.summaries.find((summary) => {
+        if (summary.sessionId !== entry.sessionId) {
+          return false;
+        }
         if (!Array.isArray(summary.sourceSummaryIds) || summary.sourceSummaryIds.length === 0) {
           return false;
         }
@@ -229,6 +237,7 @@ export class SummaryIndexStore implements SummaryRepository {
       entry.endTurn,
       entry.sourceHash,
       entry.sourceMessageCount,
+      { sessionId: entry.sessionId },
     );
   }
 
@@ -270,6 +279,7 @@ export class SummaryIndexStore implements SummaryRepository {
       childSummaryIds: [...new Set(entry.childSummaryIds ?? [])],
       sourceSummaryIds: [...new Set(entry.sourceSummaryIds ?? [])],
       sourceMessageIds: [...new Set(entry.sourceMessageIds ?? [])],
+      sourceBinding: entry.sourceBinding,
       summaryLevel: entry.summaryLevel ?? 1,
       nodeKind: entry.nodeKind ?? (entry.sourceSummaryIds && entry.sourceSummaryIds.length > 0 ? "branch" : "leaf"),
       memoryType: entry.memoryType ?? "general",
@@ -299,15 +309,23 @@ export class SummaryIndexStore implements SummaryRepository {
 
   private buildDedupKey(entry: SummaryEntry): string {
     if (Array.isArray(entry.sourceSummaryIds) && entry.sourceSummaryIds.length > 0) {
-      return `${entry.summaryLevel}:${entry.sourceSummaryIds.join("|")}`;
+      return `${entry.sessionId}:${entry.summaryLevel}:${entry.sourceSummaryIds.join("|")}`;
     }
     if (
       typeof entry.sourceHash === "string" &&
       entry.sourceHash.length > 0 &&
       typeof entry.sourceMessageCount === "number"
     ) {
-      return `${entry.startTurn}:${entry.endTurn}:${entry.sourceHash}:${entry.sourceMessageCount}`;
+      return `${entry.sessionId}:${entry.startTurn}:${entry.endTurn}:${entry.sourceHash}:${entry.sourceMessageCount}`;
     }
-    return `${entry.startTurn}:${entry.endTurn}:${entry.summaryLevel}`;
+    return `${entry.sessionId}:${entry.startTurn}:${entry.endTurn}:${entry.summaryLevel}`;
+  }
+
+  private filterBySession(entries: SummaryEntry[], options: { sessionId?: string }): SummaryEntry[] {
+    return entries.filter((entry) => this.matchesSession(entry, options));
+  }
+
+  private matchesSession(entry: SummaryEntry, options: { sessionId?: string }): boolean {
+    return !options.sessionId || entry.sessionId === options.sessionId;
   }
 }

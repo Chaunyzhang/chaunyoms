@@ -37,18 +37,35 @@ export interface RawMessage {
   metadata?: Record<string, unknown>;
 }
 
+export interface RawMessageQuery {
+  sessionId?: string;
+}
+
+export interface EvidenceBinding {
+  scope: "session" | "agent";
+  sessionId: string;
+  agentId?: string;
+  messageIds: string[];
+  sequenceMin?: number;
+  sequenceMax?: number;
+  turnStart?: number;
+  turnEnd?: number;
+  sourceHash?: string;
+  sourceMessageCount?: number;
+}
+
 export interface RawMessageRepository {
   init(): Promise<void>;
   append(message: RawMessage): Promise<void>;
-  getAll(): RawMessage[];
-  getByRange(startTurn: number, endTurn: number): RawMessage[];
-  getByIds(ids: string[]): RawMessage[];
-  getBySequenceRange(startSequence: number, endSequence: number): RawMessage[];
-  getRecentTail(turnCount: number): RawMessage[];
-  getRecentTailByTokens(tokenBudget: number, maxTurns: number): RawMessage[];
-  totalUncompactedTokens(): number;
-  getUncompactedMessages(): RawMessage[];
-  markCompacted(startTurn: number, endTurn: number): Promise<void>;
+  getAll(options?: RawMessageQuery): RawMessage[];
+  getByRange(startTurn: number, endTurn: number, options?: RawMessageQuery): RawMessage[];
+  getByIds(ids: string[], options?: RawMessageQuery): RawMessage[];
+  getBySequenceRange(startSequence: number, endSequence: number, options?: RawMessageQuery): RawMessage[];
+  getRecentTail(turnCount: number, options?: RawMessageQuery): RawMessage[];
+  getRecentTailByTokens(tokenBudget: number, maxTurns: number, options?: RawMessageQuery): RawMessage[];
+  totalUncompactedTokens(options?: RawMessageQuery): number;
+  getUncompactedMessages(options?: RawMessageQuery): RawMessage[];
+  markCompacted(startTurn: number, endTurn: number, options?: RawMessageQuery): Promise<void>;
 }
 
 export interface ObservationEntry {
@@ -133,6 +150,7 @@ export interface SummaryEntry {
   sourceEndTimestamp?: string;
   sourceSequenceMin?: number;
   sourceSequenceMax?: number;
+  sourceBinding?: EvidenceBinding;
   sourceSummaryIds?: string[];
   parentSummaryId?: string;
   childSummaryIds?: string[];
@@ -148,18 +166,19 @@ export interface SummaryRepository {
   init(): Promise<void>;
   addSummary(entry: SummaryEntry): Promise<boolean>;
   upsertSummary(entry: SummaryEntry): Promise<void>;
-  getAllSummaries(): SummaryEntry[];
-  getActiveSummaries(): SummaryEntry[];
-  getRootSummaries(): SummaryEntry[];
-  getCoveredTurns(): Set<number>;
+  getAllSummaries(options?: { sessionId?: string }): SummaryEntry[];
+  getActiveSummaries(options?: { sessionId?: string }): SummaryEntry[];
+  getRootSummaries(options?: { sessionId?: string }): SummaryEntry[];
+  getCoveredTurns(options?: { sessionId?: string }): Set<number>;
   findBySourceCoverage(
     startTurn: number,
     endTurn: number,
     sourceHash?: string,
     sourceMessageCount?: number,
+    options?: { sessionId?: string },
   ): SummaryEntry | null;
-  search(query: string): SummaryEntry[];
-  getTotalTokens(): number;
+  search(query: string, options?: { sessionId?: string }): SummaryEntry[];
+  getTotalTokens(options?: { sessionId?: string }): number;
   attachParent(parentSummaryId: string, childSummaryIds: string[]): Promise<void>;
 }
 
@@ -197,6 +216,7 @@ export interface ProjectRegistryRepository {
 
 export type KnowledgeDocBucket = "decisions" | "patterns" | "facts" | "incidents";
 export type KnowledgeOrigin = "native" | "imported" | "synthesized";
+export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 
 export interface KnowledgePromotionDraft {
   shouldWrite: boolean;
@@ -281,6 +301,50 @@ export interface KnowledgePromotionResult {
   slug?: string;
   version?: number;
   filePath?: string;
+}
+
+export type KnowledgeRawStatus =
+  | "pending"
+  | "processing"
+  | "promoted"
+  | "duplicate"
+  | "skipped"
+  | "failed";
+
+export interface KnowledgeRawEntry {
+  id: string;
+  sessionId: string;
+  agentId?: string;
+  sourceSummaryId: string;
+  sourceSummary: SummaryEntry;
+  sourceBinding?: EvidenceBinding;
+  intakeReason: string;
+  status: KnowledgeRawStatus;
+  processReason?: string;
+  linkedDocId?: string;
+  linkedSlug?: string;
+  linkedVersion?: number;
+  linkedFilePath?: string;
+  createdAt: string;
+  updatedAt: string;
+  lastProcessedAt?: string;
+}
+
+export interface KnowledgeRawRepository {
+  init(): Promise<void>;
+  enqueue(entry: KnowledgeRawEntry): Promise<boolean>;
+  getAll(): KnowledgeRawEntry[];
+  findBySourceSummaryId(sourceSummaryId: string): KnowledgeRawEntry | null;
+  claimPending(limit?: number): Promise<KnowledgeRawEntry[]>;
+  markSettled(args: {
+    id: string;
+    status: Exclude<KnowledgeRawStatus, "pending" | "processing">;
+    reason: string;
+    docId?: string;
+    slug?: string;
+    version?: number;
+    filePath?: string;
+  }): Promise<void>;
 }
 
 export interface KnowledgeRepository {
@@ -408,8 +472,17 @@ export interface PrefixRouteHit {
   content: string;
 }
 
+export interface PrefixLoadOptions {
+  activeQuery?: string;
+}
+
 export interface FixedPrefixProvider {
-  load(sharedDataDir: string, workspaceDir: string, budget: number): Promise<ContextItem[]>;
+  load(
+    sharedDataDir: string,
+    workspaceDir: string,
+    budget: number,
+    options?: PrefixLoadOptions,
+  ): Promise<ContextItem[]>;
   getSharedInsightHit(sharedDataDir: string, query: string): Promise<PrefixRouteHit | null>;
   getKnowledgeBaseHit(sharedDataDir: string, query: string): Promise<PrefixRouteHit | null>;
   hasSharedInsightHint(sharedDataDir: string, query: string): Promise<boolean>;
@@ -497,6 +570,11 @@ export interface BridgeConfig {
   durableMemoryEnabled: boolean;
   autoRecallEnabled: boolean;
   knowledgePromotionEnabled: boolean;
+  knowledgeIntakeMode: KnowledgeIntakeMode;
+  knowledgeIntakeAllowProjectState: boolean;
+  knowledgeIntakeAllowBranchSummaries: boolean;
+  knowledgeIntakeUserOverrideEnabled: boolean;
+  knowledgeIntakeUserOverridePatterns: string[];
   emergencyBrake: boolean;
 }
 

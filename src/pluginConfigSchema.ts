@@ -82,6 +82,30 @@ export const pluginConfigSchema = {
       type: "boolean",
       description: "Enable promotion into the managed knowledge store. Disabled by default.",
     },
+    knowledgeIntakeMode: {
+      type: "string",
+      enum: ["conservative", "balanced", "aggressive"],
+      description: "Knowledge intake strictness before accepted summaries enter knowledge raw.",
+    },
+    knowledgeIntakeAllowProjectState: {
+      type: "boolean",
+      description: "Allow project_state summaries to enter knowledge raw more easily.",
+    },
+    knowledgeIntakeAllowBranchSummaries: {
+      type: "boolean",
+      description: "Allow branch/rollup summaries to enter knowledge raw.",
+    },
+    knowledgeIntakeUserOverrideEnabled: {
+      type: "boolean",
+      description: "Allow explicit user 'remember/store this' intent to bypass the normal knowledge intake gate.",
+    },
+    knowledgeIntakeUserOverridePatterns: {
+      type: "array",
+      items: {
+        type: "string",
+      },
+      description: "Additional literal phrases that should count as explicit user knowledge-intake override signals.",
+    },
     emergencyBrake: {
       type: "boolean",
       description: "Emergency stop: disables runtime capture, durable writes, auto recall, and knowledge promotion.",

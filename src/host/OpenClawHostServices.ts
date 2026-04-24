@@ -37,6 +37,11 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   durableMemoryEnabled: true,
   autoRecallEnabled: true,
   knowledgePromotionEnabled: false,
+  knowledgeIntakeMode: "balanced",
+  knowledgeIntakeAllowProjectState: false,
+  knowledgeIntakeAllowBranchSummaries: false,
+  knowledgeIntakeUserOverrideEnabled: true,
+  knowledgeIntakeUserOverridePatterns: [],
   emergencyBrake: false,
 };
 

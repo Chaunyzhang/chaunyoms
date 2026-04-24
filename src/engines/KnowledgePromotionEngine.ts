@@ -135,11 +135,9 @@ export class KnowledgePromotionEngine {
     return [
       "You are promoting compressed chat history into a git-friendly markdown knowledge base.",
       "History and knowledge are separate systems. Do NOT store raw chatter as knowledge.",
-      "Only write knowledge that has durable reuse value for future engineering work.",
+      "This summary has already passed knowledge intake and belongs in the knowledge module.",
       "Allowed buckets: decisions, patterns, facts, incidents.",
-      "Do NOT store greetings, generic encouragement, temporary session bookkeeping, pure tool receipts, host wrappers, heartbeats, or one-off noise.",
-      "Prefer SKIP when the content is too temporary or too narrow to help future work.",
-      "If related docs already cover the same canonical knowledge and this batch adds nothing material, return shouldWrite=false.",
+      "Do not re-evaluate whether the content deserves to enter the knowledge system. Focus on how to organize it.",
       "If the content refines an existing idea, keep the same slug/canonicalKey so the writer can create the next version automatically.",
       "Return JSON ONLY with exactly these keys:",
       "shouldWrite, reason, bucket, slug, title, summary, tags, canonicalKey, body, status",
@@ -147,8 +145,8 @@ export class KnowledgePromotionEngine {
       "body must be valid markdown WITHOUT frontmatter.",
       "Use a clean structure in body: '# Title', '## Why it matters', '## Canonical knowledge', '## Evidence'.",
       "Tags should be short lowercase identifiers.",
-      "If skipping, set shouldWrite=false and body='' with empty tags.",
-      "Use concise, final wording. Avoid contradictions. If there is uncertainty, prefer draft or skip.",
+      "Set shouldWrite=true unless the payload is structurally invalid.",
+      "Use concise, final wording. Avoid contradictions. If there is uncertainty, prefer draft.",
       "",
       `Compaction summary (${summaryEntry.startTurn}-${summaryEntry.endTurn}):`,
       summaryEntry.summary,
@@ -168,17 +166,13 @@ export class KnowledgePromotionEngine {
     }
 
     const record = candidate as Record<string, unknown>;
-    if (typeof record.shouldWrite !== "boolean") {
-      return null;
-    }
-
     const bucket = this.normalizeBucket(record.bucket);
     if (!bucket) {
       return null;
     }
 
     return {
-      shouldWrite: record.shouldWrite,
+      shouldWrite: true,
       reason: typeof record.reason === "string" ? record.reason : "model_generated_promotion",
       bucket,
       slug: typeof record.slug === "string" ? record.slug : "",

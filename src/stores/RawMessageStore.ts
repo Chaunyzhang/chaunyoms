@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { RawMessage } from "../types";
+import { RawMessage, RawMessageQuery } from "../types";
 
 export class RawMessageStore {
   private readonly filePath: string;
@@ -48,56 +48,67 @@ export class RawMessageStore {
     await this.flush();
   }
 
-  getAll(): RawMessage[] {
-    return [...this.messages];
+  getAll(options: RawMessageQuery = {}): RawMessage[] {
+    return this.filterBySession(this.messages, options);
   }
 
-  getByRange(startTurn: number, endTurn: number): RawMessage[] {
-    return this.messages.filter(
-      (message) => message.turnNumber >= startTurn && message.turnNumber <= endTurn,
+  getByRange(startTurn: number, endTurn: number, options: RawMessageQuery = {}): RawMessage[] {
+    return this.filterBySession(
+      this.messages.filter(
+        (message) => message.turnNumber >= startTurn && message.turnNumber <= endTurn,
+      ),
+      options,
     );
   }
 
-  getByIds(ids: string[]): RawMessage[] {
+  getByIds(ids: string[], options: RawMessageQuery = {}): RawMessage[] {
     if (ids.length === 0) {
       return [];
     }
 
     const wanted = new Set(ids);
-    return this.messages.filter((message) => wanted.has(message.id));
+    return this.filterBySession(
+      this.messages.filter((message) => wanted.has(message.id)),
+      options,
+    );
   }
 
-  getBySequenceRange(startSequence: number, endSequence: number): RawMessage[] {
-    return this.messages.filter((message) => {
-      if (!Number.isFinite(message.sequence)) {
-        return false;
-      }
-      return (message.sequence as number) >= startSequence && (message.sequence as number) <= endSequence;
-    });
+  getBySequenceRange(startSequence: number, endSequence: number, options: RawMessageQuery = {}): RawMessage[] {
+    return this.filterBySession(
+      this.messages.filter((message) => {
+        if (!Number.isFinite(message.sequence)) {
+          return false;
+        }
+        return (message.sequence as number) >= startSequence && (message.sequence as number) <= endSequence;
+      }),
+      options,
+    );
   }
 
-  getRecentTail(turnCount: number): RawMessage[] {
+  getRecentTail(turnCount: number, options: RawMessageQuery = {}): RawMessage[] {
     if (turnCount <= 0) {
       return [];
     }
 
-    const turnNumbers = [...new Set(this.messages.map((message) => message.turnNumber))];
+    const scopedMessages = this.filterBySession(this.messages, options);
+    const turnNumbers = [...new Set(scopedMessages.map((message) => message.turnNumber))];
     const protectedTurns = new Set(turnNumbers.slice(-turnCount));
-    return this.messages.filter((message) => protectedTurns.has(message.turnNumber));
+    return scopedMessages.filter((message) => protectedTurns.has(message.turnNumber));
   }
 
-  getRecentTailByTokens(tokenBudget: number, maxTurns: number): RawMessage[] {
+  getRecentTailByTokens(tokenBudget: number, maxTurns: number, options: RawMessageQuery = {}): RawMessage[] {
     if (tokenBudget <= 0 || maxTurns <= 0) {
       return [];
     }
 
-    const turnOrder = [...new Set(this.messages.map((message) => message.turnNumber))];
+    const scopedMessages = this.filterBySession(this.messages, options);
+    const turnOrder = [...new Set(scopedMessages.map((message) => message.turnNumber))];
     const selectedTurns: number[] = [];
     let consumed = 0;
 
     for (let index = turnOrder.length - 1; index >= 0; index -= 1) {
       const turnNumber = turnOrder[index];
-      const turnTokens = this.messages
+      const turnTokens = scopedMessages
         .filter((message) => message.turnNumber === turnNumber)
         .reduce((sum, message) => sum + message.tokenCount, 0);
 
@@ -114,24 +125,29 @@ export class RawMessageStore {
     }
 
     const selectedTurnSet = new Set(selectedTurns);
-    return this.messages.filter((message) => selectedTurnSet.has(message.turnNumber));
+    return scopedMessages.filter((message) => selectedTurnSet.has(message.turnNumber));
   }
 
-  totalUncompactedTokens(): number {
-    return this.messages.reduce((total, message) => {
+  totalUncompactedTokens(options: RawMessageQuery = {}): number {
+    return this.filterBySession(this.messages, options).reduce((total, message) => {
       return total + (message.compacted ? 0 : message.tokenCount);
     }, 0);
   }
 
-  getUncompactedMessages(): RawMessage[] {
-    return this.messages.filter((message) => !message.compacted);
+  getUncompactedMessages(options: RawMessageQuery = {}): RawMessage[] {
+    return this.filterBySession(this.messages, options).filter((message) => !message.compacted);
   }
 
-  async markCompacted(startTurn: number, endTurn: number): Promise<void> {
+  async markCompacted(startTurn: number, endTurn: number, options: RawMessageQuery = {}): Promise<void> {
     let changed = false;
 
     for (const message of this.messages) {
-      if (message.turnNumber >= startTurn && message.turnNumber <= endTurn && !message.compacted) {
+      if (
+        this.matchesSession(message, options) &&
+        message.turnNumber >= startTurn &&
+        message.turnNumber <= endTurn &&
+        !message.compacted
+      ) {
         message.compacted = true;
         changed = true;
       }
@@ -150,5 +166,13 @@ export class RawMessageStore {
   private nextSequence(): number {
     const lastSequence = this.messages[this.messages.length - 1]?.sequence;
     return Number.isFinite(lastSequence) ? (lastSequence as number) + 1 : 1;
+  }
+
+  private filterBySession(messages: RawMessage[], options: RawMessageQuery): RawMessage[] {
+    return messages.filter((message) => this.matchesSession(message, options));
+  }
+
+  private matchesSession(message: RawMessage, options: RawMessageQuery): boolean {
+    return !options.sessionId || message.sessionId === options.sessionId;
   }
 }

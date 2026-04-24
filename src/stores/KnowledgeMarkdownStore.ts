@@ -655,6 +655,14 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   ): string[] {
     const refs = [
       `session:${metadata.sessionId}:turns:${summary.startTurn}-${summary.endTurn}`,
+      summary.agentId ? `agent:${summary.agentId}` : null,
+      typeof summary.sourceBinding?.sequenceMin === "number" &&
+        typeof summary.sourceBinding?.sequenceMax === "number"
+        ? `session:${summary.sourceBinding.sessionId}:sequences:${summary.sourceBinding.sequenceMin}-${summary.sourceBinding.sequenceMax}`
+        : null,
+      summary.sourceBinding?.messageIds && summary.sourceBinding.messageIds.length > 0
+        ? `session:${summary.sourceBinding.sessionId}:messages:${summary.sourceBinding.messageIds[0]}..${summary.sourceBinding.messageIds[summary.sourceBinding.messageIds.length - 1]}`
+        : null,
       summary.sourceHash ? `summary_hash:${summary.sourceHash}` : null,
       typeof metadata.sourceMessageCount === "number"
         ? `message_count:${metadata.sourceMessageCount}`

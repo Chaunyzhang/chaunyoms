@@ -15,6 +15,7 @@ import {
   buildStableEventId,
   deriveProjectIdentityFromMessages,
 } from "../utils/projectIdentity";
+import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
 
 const SUMMARY_MEMORY_TYPES = [
   "project_state",
@@ -56,6 +57,7 @@ export class CompactionEngine {
     contextThreshold: number,
     freshTailTokens: number,
     maxFreshTailTurns: number,
+    sessionId?: string,
   ): boolean {
     const normalizedThreshold = this.normalizeThresholdRatio(contextThreshold, 0.7);
     return (
@@ -64,6 +66,7 @@ export class CompactionEngine {
         summaryStore,
         freshTailTokens,
         maxFreshTailTurns,
+        sessionId,
       ) > Math.floor(contextWindow * normalizedThreshold)
     );
   }
@@ -73,12 +76,14 @@ export class CompactionEngine {
     summaryStore: SummaryRepository,
     freshTailTokens: number,
     maxFreshTailTurns: number,
+    sessionId?: string,
   ): number {
     return this.getCompactionPressureTokens(
       rawStore,
       summaryStore,
       freshTailTokens,
       maxFreshTailTurns,
+      sessionId,
     );
   }
 
@@ -92,16 +97,18 @@ export class CompactionEngine {
     freshTailTokens: number,
     maxFreshTailTurns: number,
     maxTurns = 20,
+    sessionId?: string,
   ): { startTurn: number; endTurn: number; messages: RawMessage[] } | null {
-    const allMessages = rawStore.getAll();
+    const query = { sessionId };
+    const allMessages = rawStore.getAll(query);
     const lastClosedTurn = this.resolveLastClosedTurn(allMessages);
     if (lastClosedTurn <= 0) {
       return null;
     }
 
-    const coveredTurns = summaryStore.getCoveredTurns();
+    const coveredTurns = summaryStore.getCoveredTurns(query);
     const uncompacted = rawStore
-      .getUncompactedMessages()
+      .getUncompactedMessages(query)
       .filter(
         (message) =>
           message.turnNumber <= lastClosedTurn &&
@@ -125,7 +132,7 @@ export class CompactionEngine {
 
     const startTurn = candidateTurns[0];
     const endTurn = candidateTurns[candidateTurns.length - 1];
-    const messages = rawStore.getByRange(startTurn, endTurn).filter((message) => !message.compacted);
+    const messages = rawStore.getByRange(startTurn, endTurn, query).filter((message) => !message.compacted);
     return messages.length === 0 ? null : { startTurn, endTurn, messages };
   }
 
@@ -191,6 +198,7 @@ export class CompactionEngine {
         contextThreshold,
         freshTailTokens,
         maxFreshTailTurns,
+        sessionId,
       )
     ) {
       return null;
@@ -202,6 +210,7 @@ export class CompactionEngine {
       freshTailTokens,
       maxFreshTailTurns,
       maxTurns,
+      sessionId,
     );
     if (!candidate) {
       return null;
@@ -223,9 +232,10 @@ export class CompactionEngine {
         candidate.endTurn,
         sourceHash,
         sourceMessageCount,
+        { sessionId },
       );
       if (existing) {
-        await rawStore.markCompacted(candidate.startTurn, candidate.endTurn);
+        await rawStore.markCompacted(candidate.startTurn, candidate.endTurn, { sessionId });
         return existing;
       }
 
@@ -277,6 +287,13 @@ export class CompactionEngine {
         sourceEndTimestamp: candidate.messages[candidate.messages.length - 1]?.createdAt,
         sourceSequenceMin: candidate.messages[0]?.sequence,
         sourceSequenceMax: candidate.messages[candidate.messages.length - 1]?.sequence,
+        sourceBinding: SourceMessageResolver.bindingFromMessages({
+          sessionId,
+          agentId,
+          messages: candidate.messages,
+          sourceHash,
+          sourceMessageCount,
+        }),
         summaryLevel: 1,
         nodeKind: "leaf",
         tokenCount: estimateTokens(summary.summary),
@@ -286,7 +303,7 @@ export class CompactionEngine {
       };
 
       await summaryStore.addSummary(entry);
-      await rawStore.markCompacted(candidate.startTurn, candidate.endTurn);
+      await rawStore.markCompacted(candidate.startTurn, candidate.endTurn, { sessionId });
       return entry;
     } catch (error) {
       this.logger.warn("compaction_skipped", {
@@ -509,16 +526,18 @@ export class CompactionEngine {
     summaryStore: SummaryRepository,
     freshTailTokens: number,
     maxFreshTailTurns: number,
+    sessionId?: string,
   ): number {
-    const allMessages = rawStore.getAll();
+    const query = { sessionId };
+    const allMessages = rawStore.getAll(query);
     const lastClosedTurn = this.resolveLastClosedTurn(allMessages);
     if (lastClosedTurn <= 0) {
       return 0;
     }
 
-    const coveredTurns = summaryStore.getCoveredTurns();
+    const coveredTurns = summaryStore.getCoveredTurns(query);
     const uncompacted = rawStore
-      .getUncompactedMessages()
+      .getUncompactedMessages(query)
       .filter(
         (message) =>
           message.turnNumber <= lastClosedTurn &&

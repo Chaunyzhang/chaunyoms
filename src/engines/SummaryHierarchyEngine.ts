@@ -35,7 +35,7 @@ export class SummaryHierarchyEngine {
     summaryModel?: string,
     maxOutputTokens = 200,
   ): Promise<SummaryEntry | null> {
-    const candidateGroup = this.selectRollupGroup(summaryStore.getRootSummaries());
+    const candidateGroup = this.selectRollupGroup(summaryStore.getRootSummaries({ sessionId }));
     if (!candidateGroup) {
       return null;
     }
@@ -76,6 +76,17 @@ export class SummaryHierarchyEngine {
       sourceEndTimestamp: candidateGroup[candidateGroup.length - 1].sourceEndTimestamp,
       sourceSequenceMin: candidateGroup[0].sourceSequenceMin,
       sourceSequenceMax: candidateGroup[candidateGroup.length - 1].sourceSequenceMax,
+      sourceBinding: {
+        scope: "agent",
+        sessionId,
+        agentId,
+        messageIds: sourceMessageIds,
+        sequenceMin: candidateGroup[0].sourceSequenceMin,
+        sequenceMax: candidateGroup[candidateGroup.length - 1].sourceSequenceMax,
+        turnStart: candidateGroup[0].startTurn,
+        turnEnd: candidateGroup[candidateGroup.length - 1].endTurn,
+        sourceMessageCount: sourceMessageIds.length || undefined,
+      },
       sourceSummaryIds,
       childSummaryIds: [...sourceSummaryIds],
       summaryLevel: (candidateGroup[0].summaryLevel ?? 1) + 1,

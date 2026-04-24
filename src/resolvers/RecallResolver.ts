@@ -3,8 +3,11 @@ import {
   RecallResult,
   SummaryRepository,
 } from "../types";
+import { SourceMessageResolver } from "./SourceMessageResolver";
 
 export class RecallResolver {
+  private readonly sourceResolver = new SourceMessageResolver();
+
   resolve(
     query: string,
     summaryStore: SummaryRepository,
@@ -19,7 +22,7 @@ export class RecallResolver {
 
     for (const hit of hits) {
       const messages = this.prioritizeMessages(
-        this.resolveSourceMessages(rawStore, hit),
+        this.sourceResolver.resolve(rawStore, hit).messages,
         queryTerms,
         numericAnchors,
       );
@@ -41,33 +44,6 @@ export class RecallResolver {
     }
 
     return { items, consumedTokens };
-  }
-
-  private resolveSourceMessages(
-    rawStore: RawMessageRepository,
-    hit: ReturnType<SummaryRepository["getAllSummaries"]>[number],
-  ): ReturnType<RawMessageRepository["getAll"]> {
-    if (Array.isArray(hit.sourceMessageIds) && hit.sourceMessageIds.length > 0) {
-      const byIds = rawStore.getByIds(hit.sourceMessageIds);
-      if (byIds.length > 0) {
-        return byIds;
-      }
-    }
-
-    if (
-      Number.isFinite(hit.sourceSequenceMin) &&
-      Number.isFinite(hit.sourceSequenceMax)
-    ) {
-      const bySequence = rawStore.getBySequenceRange(
-        hit.sourceSequenceMin as number,
-        hit.sourceSequenceMax as number,
-      );
-      if (bySequence.length > 0) {
-        return bySequence;
-      }
-    }
-
-    return rawStore.getByRange(hit.startTurn, hit.endTurn);
   }
 
   private prioritizeMessages(
