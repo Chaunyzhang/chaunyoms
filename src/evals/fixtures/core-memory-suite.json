@@ -1,0 +1,144 @@
+{
+  "suiteId": "core-memory-suite-v1",
+  "title": "ChaunyOMS Core Memory Evaluation",
+  "description": "Formal evaluation suite for core memory behavior across exact recall, knowledge updates, project state, managed knowledge, and degraded-mode abstention.",
+  "cases": [
+    {
+      "id": "exact-fact-recall-long-history",
+      "title": "Exact Fact Recall Across Long History",
+      "description": "The system should recall an exact historical fact after multiple compactions and rollups.",
+      "tags": ["exact_fact", "compaction", "source_verified"],
+      "mode": "retrieve",
+      "query": "find the exact GATEWAY_PORT from earlier",
+      "generatedScenario": {
+        "kind": "marker_replay",
+        "turns": 72,
+        "markers": [
+          { "turn": 9, "text": "DEPLOY_TOKEN=alpha-09" },
+          { "turn": 27, "text": "GATEWAY_PORT=15432" },
+          { "turn": 45, "text": "ROLLUP_PHASE=validation" },
+          { "turn": 63, "text": "QUEUE_WINDOW=7m" }
+        ],
+        "fillerPrefix": "Replay turn"
+      },
+      "afterTurnEvery": 6,
+      "configOverrides": {
+        "contextWindow": 260,
+        "contextThreshold": 0.38,
+        "freshTailTokens": 30,
+        "maxFreshTailTurns": 1,
+        "compactionBatchTurns": 3,
+        "summaryMaxOutputTokens": 160,
+        "strictCompaction": true,
+        "compactionBarrierEnabled": true
+      },
+      "expected": {
+        "mustInclude": ["GATEWAY_PORT=15432"],
+        "requireSourceVerified": true,
+        "minSummaryCount": 4,
+        "requireBranchSummary": true,
+        "detailEquals": {
+          "retrievalHitType": "summary_tree_recall"
+        }
+      }
+    },
+    {
+      "id": "knowledge-update-latest-wins",
+      "title": "Knowledge Update Prefers Latest Fact",
+      "description": "Later corrections should override stale values when the user asks for the current exact fact.",
+      "tags": ["exact_fact", "knowledge_update"],
+      "mode": "retrieve",
+      "query": "find the exact current QUEUE_WINDOW from earlier",
+      "messages": [
+        { "role": "user", "content": "Initial rollout note: QUEUE_WINDOW=3m for workers." },
+        { "role": "assistant", "content": "Recorded initial queue window at 3m." },
+        { "role": "user", "content": "Status update: leave architecture notes in memory." },
+        { "role": "assistant", "content": "Architecture notes are preserved." },
+        { "role": "user", "content": "Correction: QUEUE_WINDOW=7m is the current setting now." },
+        { "role": "assistant", "content": "Updated current queue window to 7m." },
+        { "role": "user", "content": "Keep summarizing carefully for future recall." },
+        { "role": "assistant", "content": "Future recall remains source-grounded." }
+      ],
+      "afterTurnEvery": 2,
+      "configOverrides": {
+        "contextWindow": 110,
+        "contextThreshold": 0.32,
+        "freshTailTokens": 12,
+        "maxFreshTailTurns": 1,
+        "compactionBatchTurns": 2
+      },
+      "expected": {
+        "mustInclude": ["QUEUE_WINDOW=7m"],
+        "mustNotInclude": ["QUEUE_WINDOW=3m"],
+        "detailEquals": {
+          "retrievalHitType": "durable_memory"
+        }
+      }
+    },
+    {
+      "id": "project-state-route",
+      "title": "Project State Route Uses Structured State",
+      "description": "Current-work questions should route to structured state and answer with project status details.",
+      "tags": ["project_state", "route_accuracy"],
+      "mode": "retrieve",
+      "query": "what is the current task next step and blocker",
+      "messages": [
+        { "role": "user", "content": "Project Atlas status: active focus is hardening memory routing." },
+        { "role": "assistant", "content": "Current decision: preserve source trace as authority." },
+        { "role": "user", "content": "Next step is ship the verification suite this week." },
+        { "role": "assistant", "content": "Blocker: missing CI workflow on the repository." },
+        { "role": "user", "content": "Risk: release notes may lag behind the implementation." },
+        { "role": "assistant", "content": "Todo: finalize benchmark and failure corpus scripts." }
+      ],
+      "afterTurnEvery": 2,
+      "expected": {
+        "mustInclude": ["ship the verification suite", "missing CI workflow"],
+        "detailEquals": {
+          "retrievalHitType": "project_registry"
+        }
+      }
+    },
+    {
+      "id": "managed-knowledge-hit",
+      "title": "Managed Knowledge Retrieval",
+      "description": "Knowledge-base queries should surface governed long-term knowledge with provenance-aware routing.",
+      "tags": ["knowledge", "route_accuracy"],
+      "mode": "retrieve",
+      "query": "check the knowledge base for the queue retry policy",
+      "seedKnowledge": [
+        {
+          "id": "seed-knowledge-1",
+          "bucket": "patterns",
+          "slug": "queue-worker-retry-backoff",
+          "title": "Queue Worker Retry Backoff",
+          "summary": "Canonical retry and backoff policy for queue workers.",
+          "tags": ["queue", "workers", "retry", "backoff"],
+          "canonicalKey": "queue-worker-retry-backoff",
+          "body": "# Queue Worker Retry Backoff\n\nUse capped exponential backoff for queue workers after failures.\n",
+          "status": "active"
+        }
+      ],
+      "expected": {
+        "mustInclude": ["capped exponential backoff"],
+        "detailEquals": {
+          "retrievalHitType": "knowledge"
+        }
+      }
+    },
+    {
+      "id": "shared-insights-needs-embeddings",
+      "title": "Shared Insights Prompt For Embeddings",
+      "description": "When fuzzy shared-insights retrieval requires embeddings, the system should prompt instead of inventing results.",
+      "tags": ["abstention", "degraded_mode", "route_accuracy"],
+      "mode": "route",
+      "query": "search shared insights something related",
+      "expected": {
+        "mustInclude": ["configure an embeddings API"],
+        "detailEquals": {
+          "promptForApi": true,
+          "requiresEmbeddings": true
+        }
+      }
+    }
+  ]
+}

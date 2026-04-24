@@ -31,6 +31,11 @@ const UNCERTAINTY_PATTERNS = [
   /(?:不确定|不清楚|需要更多上下文|可能缺少信息)/,
 ];
 
+const STRONG_FACT_ASSIGNMENT_RE = /\b([A-Z][A-Z0-9_]{1,40})\s*=\s*([^\s,;:=]{1,80})/;
+const FACT_ASSIGNMENT_RE = /\b([A-Z][A-Z0-9_]{1,40}|[a-zA-Z][\w-]{1,40})\s*[:=]\s*([^\s,;:=]{1,80})/;
+const FACT_UPDATE_RE = /\b(?:current|latest|now|updated|correction|corrected|override|new value)\b/i;
+const FACT_UPDATE_ZH_RE = /(?:当前|现在|最新|更新为|修正|改为|新值)/;
+
 export class MemoryExtractionEngine {
   extractFromRawMessage(message: RawMessage): DurableMemoryEntry[] {
     if (!message.content.trim()) {
@@ -140,26 +145,37 @@ export class MemoryExtractionEngine {
 
     const identity = deriveProjectIdentityFromMessages([sourceMessage], sourceMessage.sessionId);
 
-    return segments.map((segment) => ({
-      id: `memory-${this.hash(`${sourceMessage.sessionId}|${kind}|${segment}`)}`,
-      eventId: buildStableEventId("memory", `${sourceMessage.sessionId}|${kind}|${segment}`),
-      sessionId: sourceMessage.sessionId,
-      agentId: sourceMessage.agentId,
-      projectId: identity.projectId,
-      topicId: identity.topicId,
-      kind,
-      recordStatus: "active",
-      text: segment,
-      fingerprint: this.hash(`${kind}|${segment}`),
-      tags: [...baseTags, ...this.extractTags(segment)],
-      createdAt,
-      sourceType,
-      sourceIds,
-      sourceSequenceMin: sourceMessage.sequence,
-      sourceSequenceMax: sourceMessage.sequence,
-      sourceStartTimestamp: createdAt,
-      sourceEndTimestamp: createdAt,
-    }));
+    return segments.map((segment) => {
+      const structuredFact = this.extractStructuredFact(segment);
+      return {
+        id: `memory-${this.hash(`${sourceMessage.sessionId}|${kind}|${segment}`)}`,
+        eventId: buildStableEventId("memory", `${sourceMessage.sessionId}|${kind}|${segment}`),
+        sessionId: sourceMessage.sessionId,
+        agentId: sourceMessage.agentId,
+        projectId: identity.projectId,
+        topicId: identity.topicId,
+        kind,
+        recordStatus: "active",
+        text: segment,
+        fingerprint: this.hash(`${kind}|${segment}`),
+        tags: [...baseTags, ...this.extractTags(segment)],
+        createdAt,
+        sourceType,
+        sourceIds,
+        sourceSequenceMin: sourceMessage.sequence,
+        sourceSequenceMax: sourceMessage.sequence,
+        sourceStartTimestamp: createdAt,
+        sourceEndTimestamp: createdAt,
+        metadata: structuredFact
+          ? {
+              factKey: structuredFact.factKey,
+              factValue: structuredFact.factValue,
+              factScope: structuredFact.factScope,
+              factRecencyHint: structuredFact.factRecencyHint,
+            }
+          : undefined,
+      };
+    });
   }
 
   private classifyToolObservation(content: string): DurableMemoryEntry["kind"] {
@@ -198,7 +214,35 @@ export class MemoryExtractionEngine {
     if (/config|setting|parameter|token|timeout|port/.test(lower)) tags.add("config");
     if (/fix|fixed|changed|updated|created|deleted/.test(lower)) tags.add("change");
     if (/next step|plan|todo|decision|risk|blocker/.test(lower)) tags.add("plan");
+    const structuredFact = this.extractStructuredFact(segment);
+    if (structuredFact) {
+      tags.add("fact");
+      tags.add(structuredFact.factKey.toLowerCase());
+      if (structuredFact.factRecencyHint) {
+        tags.add("current");
+      }
+    }
     return [...tags];
+  }
+
+  private extractStructuredFact(segment: string): {
+    factKey: string;
+    factValue: string;
+    factScope: "session";
+    factRecencyHint: boolean;
+  } | null {
+    const match = segment.match(STRONG_FACT_ASSIGNMENT_RE) ?? segment.match(FACT_ASSIGNMENT_RE);
+    if (!match) {
+      return null;
+    }
+    return {
+      factKey: match[1].trim().toUpperCase(),
+      factValue: match[2].trim(),
+      factScope: "session",
+      factRecencyHint:
+        FACT_UPDATE_RE.test(segment) ||
+        FACT_UPDATE_ZH_RE.test(segment),
+    };
   }
 
   private hash(input: string): string {

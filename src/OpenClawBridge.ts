@@ -49,6 +49,11 @@ export class OpenClawBridge {
     this.api = api;
     this.logger = api?.logger ?? this.logger;
     this.runtime.updateHost(this.logger, new OpenClawLlmCaller(api, this.logger));
+    const resolvedConfig = this.payloadAdapter.resolveLifecycleContext(
+      undefined,
+      this.runtime.getConfig(),
+    ).config;
+    const configGuidance = this.payloadAdapter.describeConfigGuidance(resolvedConfig);
 
     const toolConfig = this.payloadAdapter.resolveToolConfig();
     this.logger.info("tool_config_resolved", {
@@ -57,6 +62,24 @@ export class OpenClawBridge {
       runtimeEnableTools: toolConfig.runtimeEnableTools,
       fileEnableTools: toolConfig.fileEnableTools,
     });
+    this.logger.info("config_preset_resolved", {
+      preset: configGuidance.preset,
+      semanticCandidateExpansionEnabled: resolvedConfig.semanticCandidateExpansionEnabled,
+      semanticCandidateLimit: resolvedConfig.semanticCandidateLimit,
+      warnings: configGuidance.warnings,
+    });
+    if (
+      resolvedConfig.semanticCandidateExpansionEnabled &&
+      !this.payloadAdapter.hasEmbeddingsRetrievalReady()
+    ) {
+      this.logger.info("semantic_candidate_degraded_to_heuristic_mode", {
+        preset: configGuidance.preset,
+        reason: "embeddings_unavailable",
+      });
+    }
+    for (const warning of configGuidance.warnings) {
+      this.logger.warn("config_guidance_warning", { warning });
+    }
 
     if (toolConfig.enabled && typeof api?.registerTool === "function") {
       this.registerTools(api);

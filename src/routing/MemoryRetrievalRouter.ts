@@ -1,6 +1,7 @@
 ﻿import { RetrievalDecision, RetrievalLayerScore, RetrievalRoute } from "../types";
 
 const FACT_RECALL_RE = /(原话|原文|精确|准确|参数|细节|约束|配置|quote|exact|verbatim|parameter|constraint|detail)/i;
+const CURRENT_FACT_RE = /(current|latest|now|currently|updated|correction|after correction|现在|当前|最新|修正后|更新后)/i;
 const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未解决|阻塞|决策|status|state|progress|next step|next action|todo|pending|blocker|blocked|decision|where we left off)/i;
 const CURRENT_WORK_RE = /(这个项目|当前任务|当前工作|这件事|我们现在|当前主线|this project|current task|current work|our work|what we are doing)/i;
 const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|history|what happened earlier|why did we)/i;
@@ -39,6 +40,7 @@ export class MemoryRetrievalRouter {
     }
 
     const needsFacts = FACT_RECALL_RE.test(normalized);
+    const asksCurrentFact = CURRENT_FACT_RE.test(normalized);
     const asksProjectState = PROJECT_STATE_RE.test(normalized);
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
     const asksHistory = HISTORY_RE.test(normalized);
@@ -61,6 +63,20 @@ export class MemoryRetrievalRouter {
         context.matchedProjectTitle
           ? `The query asks for stable constraints/decisions, so durable memory is the primary layer for the matched project (${context.matchedProjectTitle}).`
           : "The query asks for stable constraints/decisions, so durable memory is the primary layer.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
+      );
+    }
+
+    if (needsFacts && asksCurrentFact && context.hasDurableHits) {
+      return this.decision(
+        "durable_memory",
+        "current_fact_prefers_active_durable_memory",
+        false,
+        false,
+        true,
+        ["durable_memory", "summary_tree", "project_registry"],
+        "The query asks for the current/latest fact value, so active durable memory should outrank older summary recall.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
@@ -227,6 +243,7 @@ export class MemoryRetrievalRouter {
     }
 
     const needsFacts = FACT_RECALL_RE.test(query);
+    const asksCurrentFact = CURRENT_FACT_RE.test(query);
     const asksProjectState = PROJECT_STATE_RE.test(query);
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(query);
     const asksHistory = HISTORY_RE.test(query);
@@ -238,6 +255,7 @@ export class MemoryRetrievalRouter {
     const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
 
     if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
+    if (needsFacts && asksCurrentFact) add("durable_memory", 6, "current_fact_terms");
     if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
     if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");
 

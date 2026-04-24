@@ -64,6 +64,25 @@ interface CompactionBudgetState {
   triggerExceeded: boolean;
 }
 
+interface CompactionDiagnostics {
+  sessionId: string;
+  mode: "manual" | "barrier" | "after_turn";
+  triggerExceeded: boolean;
+  triggerThreshold: number;
+  compressibleHistoryTokens: number;
+  compressibleHistoryBudget: number;
+  hostFixedTokens: number;
+  hostFixedTokenSource: "systemPromptTokens" | "workspaceBootstrapEstimate";
+  pluginFixedTokens: number;
+  freshTailTokens: number;
+  candidateStartTurn?: number;
+  candidateEndTurn?: number;
+  candidateMessageCount?: number;
+  passes?: number;
+  status: "pending" | "compacted" | "deduped" | "skipped" | "failed";
+  reason?: string;
+}
+
 export interface AssembleResult {
   items: ContextItem[];
   estimatedTokens: number;
@@ -116,6 +135,7 @@ export class ChaunyomsSessionRuntime {
   private llmCaller: LlmCaller | null;
   private compactionInFlight: Promise<CompactionRunResult> | null = null;
   private knowledgeMaintenanceInFlight: Promise<void> | null = null;
+  private lastCompactionDiagnostics: CompactionDiagnostics | null = null;
   private readonly pendingKnowledgeMaintenance = new Map<string, {
     sessionId: string;
     config: BridgeConfig;
@@ -302,6 +322,35 @@ export class ChaunyomsSessionRuntime {
       context.runtimeMessages,
     );
     const tokensBefore = rawStore.totalUncompactedTokens({ sessionId: context.sessionId });
+    const budgetState = await this.measureCompactionBudgetState(
+      context,
+      rawStore,
+      summaryStore,
+    );
+    const candidate = this.compactionEngine.selectTurnsForCompaction(
+      rawStore,
+      summaryStore,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+      this.config.compactionBatchTurns,
+      context.sessionId,
+    );
+    this.lastCompactionDiagnostics = {
+      sessionId: context.sessionId,
+      mode: "manual",
+      triggerExceeded: budgetState.triggerExceeded,
+      triggerThreshold: budgetState.triggerBudget,
+      compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+      compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+      hostFixedTokens: budgetState.hostFixedTokens,
+      hostFixedTokenSource: budgetState.hostFixedTokenSource,
+      pluginFixedTokens: budgetState.pluginFixedTokens,
+      freshTailTokens: budgetState.freshTailTokens,
+      candidateStartTurn: candidate?.startTurn,
+      candidateEndTurn: candidate?.endTurn,
+      candidateMessageCount: candidate?.messages.length,
+      status: "pending",
+    };
     const compaction = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
@@ -309,6 +358,22 @@ export class ChaunyomsSessionRuntime {
     );
 
     if (compaction.status !== "compacted" && compaction.status !== "deduped") {
+      this.lastCompactionDiagnostics = {
+        ...(this.lastCompactionDiagnostics ?? {
+          sessionId: context.sessionId,
+          mode: "manual",
+          triggerExceeded: false,
+          triggerThreshold: 0,
+          compressibleHistoryTokens: 0,
+          compressibleHistoryBudget: 0,
+          hostFixedTokens: 0,
+          hostFixedTokenSource: "systemPromptTokens",
+          pluginFixedTokens: 0,
+          freshTailTokens: 0,
+        }),
+        status: compaction.status,
+        reason: compaction.reason,
+      };
       return {
         ok: true,
         compacted: false,
@@ -332,6 +397,25 @@ export class ChaunyomsSessionRuntime {
       this.getActiveStores().projectStore,
       this.config.agentId,
     );
+    this.lastCompactionDiagnostics = {
+      ...(this.lastCompactionDiagnostics ?? {
+        sessionId: context.sessionId,
+        mode: "manual",
+        triggerExceeded: false,
+        triggerThreshold: 0,
+        compressibleHistoryTokens: 0,
+        compressibleHistoryBudget: 0,
+        hostFixedTokens: 0,
+        hostFixedTokenSource: "systemPromptTokens",
+        pluginFixedTokens: 0,
+        freshTailTokens: 0,
+      }),
+      candidateStartTurn: entry.startTurn,
+      candidateEndTurn: entry.endTurn,
+      candidateMessageCount: entry.sourceMessageCount,
+      status: compaction.status,
+      reason: "manual_compaction_completed",
+    };
 
     return {
       ok: true,
@@ -345,6 +429,11 @@ export class ChaunyomsSessionRuntime {
           endTurn: entry.endTurn,
           summaryId: entry.id,
           sourceTrace: compaction.sourceTrace,
+          diagnostics: {
+            ...(this.lastCompactionDiagnostics ?? {}),
+            status: compaction.status,
+            reason: "manual_compaction_completed",
+          },
         },
       },
     };
@@ -395,6 +484,10 @@ export class ChaunyomsSessionRuntime {
       durableMemoryEnabled: this.config.durableMemoryEnabled,
       autoRecallEnabled: this.config.autoRecallEnabled,
       knowledgePromotionEnabled: this.config.knowledgePromotionEnabled,
+      configPreset: this.config.configPreset,
+      semanticCandidateExpansionEnabled: this.config.semanticCandidateExpansionEnabled,
+      semanticCandidateLimit: this.config.semanticCandidateLimit,
+      lastCompactionDiagnostics: this.lastCompactionDiagnostics,
       emergencyBrake: this.config.emergencyBrake,
     };
     this.logger.info("after_turn_stats", stats);
@@ -746,6 +839,20 @@ export class ChaunyomsSessionRuntime {
       activeQuery,
     );
     if (!budgetState.triggerExceeded) {
+      this.lastCompactionDiagnostics = {
+        sessionId: context.sessionId,
+        mode: "barrier",
+        triggerExceeded: false,
+        triggerThreshold: budgetState.triggerBudget,
+        compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+        compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+        hostFixedTokens: budgetState.hostFixedTokens,
+        hostFixedTokenSource: budgetState.hostFixedTokenSource,
+        pluginFixedTokens: budgetState.pluginFixedTokens,
+        freshTailTokens: budgetState.freshTailTokens,
+        status: "skipped",
+        reason: "barrier_not_required",
+      };
       return;
     }
 
@@ -809,6 +916,21 @@ export class ChaunyomsSessionRuntime {
       passes,
       strictCompaction: this.config.strictCompaction,
     });
+    this.lastCompactionDiagnostics = {
+      sessionId: context.sessionId,
+      mode: "barrier",
+      triggerExceeded: true,
+      triggerThreshold: budgetState.triggerBudget,
+      compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+      compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+      hostFixedTokens: budgetState.hostFixedTokens,
+      hostFixedTokenSource: budgetState.hostFixedTokenSource,
+      pluginFixedTokens: budgetState.pluginFixedTokens,
+      freshTailTokens: budgetState.freshTailTokens,
+      passes,
+      status: "compacted",
+      reason: "barrier_recovered_context_budget",
+    };
   }
 
   private async measureCompactionBudgetState(
@@ -1074,6 +1196,7 @@ export class ChaunyomsSessionRuntime {
             version: result.version,
             filePath: result.filePath,
           });
+          const trustModel = knowledgeStore.describeTrustModel();
           this.logger.info("knowledge_raw_candidate_processed", {
             candidateId: candidate.id,
             summaryId: candidate.sourceSummaryId,
@@ -1081,6 +1204,12 @@ export class ChaunyomsSessionRuntime {
             reason: result.reason,
             slug: result.slug,
             version: result.version,
+            bucket: result.draft?.bucket,
+            canonicalKey: result.draft?.canonicalKey,
+            sourceVerified: sourceResolution.verified,
+            sourceMessageCount: sourceResolution.messages.length,
+            trustLayer: trustModel.layer,
+            requiresProvenance: trustModel.requiresProvenance,
           });
         } catch (error) {
           await knowledgeRawStore.markSettled({

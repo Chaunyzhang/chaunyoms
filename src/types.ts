@@ -218,6 +218,7 @@ export interface ProjectRegistryRepository {
 export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "incidents";
 export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
+export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
 
 export interface KnowledgePromotionDraft {
   shouldWrite: boolean;
@@ -511,6 +512,7 @@ export interface BridgeConfig {
   dataDir: string;
   sessionId: string;
   agentId: string;
+  configPreset: ConfigPreset;
   workspaceDir: string;
   sharedDataDir: string;
   knowledgeBaseDir: string;
@@ -534,6 +536,8 @@ export interface BridgeConfig {
   knowledgeIntakeAllowBranchSummaries: boolean;
   knowledgeIntakeUserOverrideEnabled: boolean;
   knowledgeIntakeUserOverridePatterns: string[];
+  semanticCandidateExpansionEnabled: boolean;
+  semanticCandidateLimit: number;
   emergencyBrake: boolean;
 }
 
@@ -625,6 +629,26 @@ export interface RetrievalLayerScore {
   route: RetrievalRoute;
   score: number;
   reasons: string[];
+}
+
+export type SemanticCandidateKind =
+  | "project_registry"
+  | "durable_memory"
+  | "summary"
+  | "knowledge"
+  | "vector_hint";
+
+export interface SemanticCandidate {
+  kind: SemanticCandidateKind;
+  id: string;
+  title: string;
+  score: number;
+  reasons: string[];
+  authority: "authoritative" | "hint";
+  sourceRoute: RetrievalRoute | "semantic_candidate_expansion";
+  requiresSourceRecall?: boolean;
+  matchedProjectId?: string;
+  matchedProjectTitle?: string;
 }
 
 export type CompactionRunResult =

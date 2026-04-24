@@ -44,6 +44,7 @@ export class DurableMemoryStore {
       if (entry.kind === "project_state" && entry.projectId) {
         this.supersedeActiveProjectState(entry.projectId, entry.id);
       }
+      this.supersedeActiveFactEntry(entry);
       this.memories.push(entry);
       added += 1;
     }
@@ -112,6 +113,33 @@ export class DurableMemoryStore {
     });
   }
 
+  private supersedeActiveFactEntry(entry: DurableMemoryEntry): void {
+    const factKey = this.factKey(entry);
+    const factValue = this.factValue(entry);
+    if (!factKey || !factValue) {
+      return;
+    }
+    this.memories = this.memories.map((current) => {
+      if (current.recordStatus !== "active") {
+        return current;
+      }
+      if (current.id === entry.id) {
+        return current;
+      }
+      if (this.factKey(current) !== factKey) {
+        return current;
+      }
+      if (this.factValue(current) === factValue) {
+        return current;
+      }
+      return this.normalizeEntry({
+        ...current,
+        recordStatus: "superseded",
+        supersededById: entry.id,
+      });
+    });
+  }
+
   private scoreEntry(entry: DurableMemoryEntry, terms: string[]): number {
     const haystack = `${entry.kind} ${entry.projectId ?? ""} ${entry.topicId ?? ""} ${entry.tags.join(" ")} ${entry.text}`.toLowerCase();
     let score = 0;
@@ -126,7 +154,28 @@ export class DurableMemoryStore {
       score += 4;
     }
 
+    if (entry.metadata?.factRecencyHint === true) {
+      score += 3;
+    }
+    if (this.factKey(entry) && terms.some((term) => this.factKey(entry)?.toLowerCase().includes(term))) {
+      score += 4;
+    }
+
     return score;
+  }
+
+  private factKey(entry: DurableMemoryEntry): string | null {
+    const value = entry.metadata?.factKey;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : null;
+  }
+
+  private factValue(entry: DurableMemoryEntry): string | null {
+    const value = entry.metadata?.factValue;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : null;
   }
 
   private async flush(): Promise<void> {

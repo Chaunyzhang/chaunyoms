@@ -106,11 +106,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
 
   searchRelatedDocuments(query: string, limit = 3): KnowledgeDocumentIndexEntry[] {
     this.refreshManualRawDocuments();
-    const terms = query
-      .toLowerCase()
-      .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
-      .map((term) => term.trim())
-      .filter((term) => term.length >= 2);
+    const terms = this.queryTerms(query);
     if (terms.length === 0) {
       return [];
     }
@@ -118,12 +114,16 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
     return [...this.documents]
       .map((entry) => ({
         entry,
-        score: this.scoreDocument(entry, terms),
+        score: this.scoreDocument(entry, terms, query),
       }))
       .filter((item) => item.score > 0)
       .sort((left, right) => {
         if (right.score !== left.score) {
           return right.score - left.score;
+        }
+        const governanceDelta = this.governanceWeight(right.entry) - this.governanceWeight(left.entry);
+        if (governanceDelta !== 0) {
+          return governanceDelta;
         }
         return right.entry.updatedAt.localeCompare(left.entry.updatedAt);
       })
@@ -222,6 +222,8 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         "AI-generated promotions write a system raw intake artifact before the final versioned document is committed.",
         "Documents must keep provenance back to summaries and source references.",
         "Knowledge can be superseded, reconciled, and version-audited.",
+        "Search ranking prefers active, provenance-rich, better-governed records over weaker duplicates.",
+        "Semantic duplicate detection links new evidence onto existing records before creating another near-clone.",
       ],
     };
   }
@@ -274,6 +276,9 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
 
     const normalizedDraft = this.normalizeDraft(draft, summary);
     const existingDocument = this.findDocument(normalizedDraft);
+    const semanticDuplicate = existingDocument
+      ? null
+      : this.findSemanticDuplicate(normalizedDraft);
     const contentHash = this.hash(
       `${normalizedDraft.title}\n${normalizedDraft.summary}\n${normalizedDraft.body}`,
     );
@@ -311,6 +316,41 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         version: latestVersion?.version,
         filePath: latestVersion
           ? path.join(this.baseDir, existingDocument.bucket, latestVersion.fileName)
+          : undefined,
+      };
+    }
+
+    if (semanticDuplicate) {
+      const latestVersion = semanticDuplicate.versions.at(-1);
+      await this.linkPromotionEvidence(semanticDuplicate, summary, metadata);
+      await this.recordLedger({
+        id: this.buildId(`ledger:${summary.id}:semantic-duplicate`),
+        sessionId: metadata.sessionId,
+        summaryEntryId: summary.id,
+        sourceHash: metadata.sourceHash,
+        sourceMessageCount: metadata.sourceMessageCount,
+        startTurn: summary.startTurn,
+        endTurn: summary.endTurn,
+        status: "duplicate",
+        reason: "semantic_duplicate_of_existing_document",
+        promptVersion: metadata.promptVersion,
+        createdAt: new Date().toISOString(),
+        docId: semanticDuplicate.docId,
+        slug: semanticDuplicate.slug,
+        version: latestVersion?.version,
+        filePath: latestVersion
+          ? path.join(this.baseDir, semanticDuplicate.bucket, latestVersion.fileName)
+          : undefined,
+      });
+      return {
+        status: "duplicate",
+        reason: "semantic_duplicate_of_existing_document",
+        draft: normalizedDraft,
+        docId: semanticDuplicate.docId,
+        slug: semanticDuplicate.slug,
+        version: latestVersion?.version,
+        filePath: latestVersion
+          ? path.join(this.baseDir, semanticDuplicate.bucket, latestVersion.fileName)
           : undefined,
       };
     }
@@ -438,6 +478,51 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       this.documents.find((entry) => entry.slug === draft.slug) ??
       null
     );
+  }
+
+  private findSemanticDuplicate(draft: KnowledgePromotionDraft): KnowledgeDocumentIndexEntry | null {
+    const draftText = [draft.title, draft.summary, draft.body, draft.canonicalKey, ...draft.tags].join(" ");
+    const draftTerms = this.queryTerms(draftText);
+    const candidates = this.documents
+      .filter((entry) => entry.status !== "superseded")
+      .map((entry) => ({
+        entry,
+        score:
+          this.computeSimilarity(
+          draftText,
+          this.loadEntrySearchText(entry),
+        ) +
+          this.computeTermOverlapScore(draftTerms, this.queryTerms(this.loadEntrySearchText(entry))),
+      }))
+      .filter((item) => item.score >= 0.3)
+      .sort((left, right) => right.score - left.score || right.entry.updatedAt.localeCompare(left.entry.updatedAt));
+    return candidates[0]?.entry ?? null;
+  }
+
+  private async linkPromotionEvidence(
+    entry: KnowledgeDocumentIndexEntry,
+    summary: SummaryEntry,
+    metadata: {
+      sessionId: string;
+      sourceHash?: string;
+      sourceMessageCount?: number;
+      promptVersion: string;
+      modelName?: string;
+    },
+  ): Promise<void> {
+    const sourceRefs = this.buildPromotionSourceRefs(summary, metadata);
+    entry.linkedSummaryIds = this.uniqueStrings([
+      ...(entry.linkedSummaryIds ?? []),
+      summary.id,
+    ]);
+    entry.sourceRefs = this.uniqueStrings([
+      ...(entry.sourceRefs ?? []),
+      ...sourceRefs,
+    ]);
+    entry.updatedAt = new Date().toISOString();
+    this.documents = this.normalizeDocuments(this.documents);
+    await this.flushDocumentIndex();
+    await this.updateLatestFrontmatter(entry);
   }
 
   private buildFrontmatter(args: {
@@ -612,7 +697,11 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  private scoreDocument(entry: KnowledgeDocumentIndexEntry, terms: string[]): number {
+  private scoreDocument(
+    entry: KnowledgeDocumentIndexEntry,
+    terms: string[],
+    query: string,
+  ): number {
     const haystack = `${entry.slug} ${entry.canonicalKey} ${entry.title} ${entry.summary} ${entry.tags.join(" ")} ${entry.sourceRefs.join(" ")}`.toLowerCase();
     let score = 0;
     for (const term of terms) {
@@ -620,10 +709,110 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         score += term.length >= 6 ? 3 : 2;
       }
     }
-    if (terms.every((term) => haystack.includes(term))) {
+    if (terms.length > 0 && terms.every((term) => haystack.includes(term))) {
       score += 4;
     }
+    const similarity = this.computeSimilarity(query, haystack);
+    if (similarity >= 0.12) {
+      score += Math.round(similarity * 20);
+    }
+    score += this.governanceWeight(entry);
     return score;
+  }
+
+  private governanceWeight(entry: KnowledgeDocumentIndexEntry): number {
+    let score = 0;
+    if (entry.status === "active") {
+      score += 5;
+    } else if (entry.status === "draft") {
+      score += 2;
+    } else {
+      score -= 2;
+    }
+    if (entry.origin === "synthesized" || entry.origin === "native") {
+      score += 2;
+    }
+    score += Math.min(entry.sourceRefs.length, 3);
+    score += Math.min(entry.linkedSummaryIds.length, 2);
+    score += Math.min(entry.versions.length, 2);
+    return score;
+  }
+
+  private queryTerms(query: string): string[] {
+    const baseTerms = query
+      .toLowerCase()
+      .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2);
+    const synonyms = new Map<string, string[]>([
+      ["retry", ["backoff", "retries"]],
+      ["backoff", ["retry", "retries"]],
+      ["knowledge", ["docs", "reference", "manual"]],
+      ["constraint", ["rule", "must", "limit"]],
+      ["状态", ["进度", "当前"]],
+      ["知识库", ["文档", "资料"]],
+    ]);
+    const expanded = [...baseTerms];
+    for (const term of baseTerms) {
+      expanded.push(...(synonyms.get(term) ?? []));
+    }
+    return [...new Set(expanded)];
+  }
+
+  private computeSimilarity(left: string, right: string): number {
+    const leftSet = this.buildTrigramSet(left.toLowerCase());
+    const rightSet = this.buildTrigramSet(right.toLowerCase());
+    if (leftSet.size === 0 || rightSet.size === 0) {
+      return 0;
+    }
+    let intersection = 0;
+    for (const item of leftSet) {
+      if (rightSet.has(item)) {
+        intersection += 1;
+      }
+    }
+    return intersection / Math.max(leftSet.size, rightSet.size);
+  }
+
+  private computeTermOverlapScore(left: string[], right: string[]): number {
+    if (left.length === 0 || right.length === 0) {
+      return 0;
+    }
+    const rightSet = new Set(right);
+    const matches = left.filter((term) => rightSet.has(term)).length;
+    return matches / Math.max(left.length, right.length);
+  }
+
+  private buildTrigramSet(value: string): Set<string> {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (normalized.length < 3) {
+      return new Set(normalized ? [normalized] : []);
+    }
+    const grams = new Set<string>();
+    for (let index = 0; index <= normalized.length - 3; index += 1) {
+      grams.add(normalized.slice(index, index + 3));
+    }
+    return grams;
+  }
+
+  private loadEntrySearchText(entry: KnowledgeDocumentIndexEntry): string {
+    const latestVersion = entry.versions.at(-1);
+    let body = "";
+    if (latestVersion) {
+      const filePath = path.join(this.baseDir, entry.bucket, latestVersion.fileName);
+      try {
+        body = readFileSync(filePath, "utf8");
+      } catch {
+        body = "";
+      }
+    }
+    return [
+      entry.title,
+      entry.summary,
+      entry.canonicalKey,
+      ...entry.tags,
+      body,
+    ].join(" ");
   }
 
   private async recordLedger(entry: PromotionLedgerEntry): Promise<void> {

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "recall-disabled-falls-back-cleanly",
+    "kind": "recall_disabled",
+    "query": "find the exact retry parameter from earlier",
+    "expectedTextIncludes": [
+      "Source recall is currently disabled"
+    ],
+    "expectedDetails": {
+      "autoRecallReason": "auto_recall_disabled"
+    }
+  },
+  {
+    "id": "vector-hint-does-not-pretend-authority",
+    "kind": "vector_hint_only",
+    "query": "something related to architecture docs in the knowledge base",
+    "expectedTextIncludes": [
+      "Semantic vector hint only",
+      "candidate, not as source-verified fact"
+    ],
+    "expectedDetails": {
+      "retrievalHitType": "vector_retrieval",
+      "vectorActsAsAuthority": false
+    }
+  },
+  {
+    "id": "embeddings-required-prompts-instead-of-faking-results",
+    "kind": "prompt_for_api",
+    "query": "search shared insights something related",
+    "expectedTextIncludes": [
+      "configure an embeddings API"
+    ],
+    "expectedDetails": {
+      "promptForApi": true,
+      "requiresEmbeddings": true
+    }
+  }
+]

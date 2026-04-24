@@ -33,6 +33,7 @@ const fixtures: Array<{
   { name: "current project next step", query: "this project next step", context: { hasProjectRegistry: true }, route: "project_registry" },
   { name: "durable constraint", query: "what constraint config must we remember?", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "durable rule", query: "remember the rule", context: { hasDurableHits: true }, route: "durable_memory" },
+  { name: "current exact fact prefers durable", query: "what is the current exact queue_window now", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "shared insight fuzzy", query: "search shared insights something related", route: "vector_search" },
   { name: "shared insight direct", query: "shared insights", context: { hasSharedInsightHint: true }, route: "shared_insights" },
   { name: "knowledge hit", query: "knowledge base architecture docs", context: { hasKnowledgeHits: true }, route: "knowledge" },

@@ -7,6 +7,7 @@
     "properties": {
       "dataDir": { "type": "string" },
       "agentId": { "type": "string" },
+      "configPreset": { "type": "string" },
       "workspaceDir": { "type": "string" },
       "sharedDataDir": { "type": "string" },
       "memoryVaultDir": { "type": "string" },
@@ -25,6 +26,8 @@
       "durableMemoryEnabled": { "type": "boolean" },
       "autoRecallEnabled": { "type": "boolean" },
       "knowledgePromotionEnabled": { "type": "boolean" },
+      "semanticCandidateExpansionEnabled": { "type": "boolean" },
+      "semanticCandidateLimit": { "type": "number" },
       "emergencyBrake": { "type": "boolean" }
     }
   }

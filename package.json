@@ -22,6 +22,9 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
     "test:compiled": "node scripts/run-compiled-tests.cjs",
     "test": "npm run build && npm run test:compiled",
-    "check": "npm test && npm audit --omit=dev"
+    "eval:memory": "npm run build && node dist/src/evals/run-eval-suite.js",
+    "benchmark": "npm run build && node dist/src/benchmarks/benchmark-runtime.js",
+    "failure-corpus": "npm run build && node dist/src/tests/test-failure-corpus.js",
+    "check": "npm test && npm run eval:memory && npm run benchmark && npm audit --omit=dev"
   }
 }

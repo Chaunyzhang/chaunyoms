@@ -10,6 +10,11 @@ export const pluginConfigSchema = {
       type: "string",
       description: "Canonical agent identity used for long-term memory boundaries.",
     },
+    configPreset: {
+      type: "string",
+      enum: ["safe", "balanced", "enhanced_recall"],
+      description: "Named config preset. Safe reduces automation, balanced keeps current defaults, enhanced_recall enables stronger retrieval helpers.",
+    },
     workspaceDir: {
       type: "string",
       description: "OpenClaw workspace directory used for navigation snapshots and project-local runtime state.",
@@ -105,6 +110,14 @@ export const pluginConfigSchema = {
         type: "string",
       },
       description: "Additional literal phrases that should count as explicit user knowledge-intake override signals.",
+    },
+    semanticCandidateExpansionEnabled: {
+      type: "boolean",
+      description: "Allow heuristic/semantic candidate expansion to propose authoritative follow-up retrieval paths.",
+    },
+    semanticCandidateLimit: {
+      type: "number",
+      description: "Maximum number of semantic candidates to surface in retrieval diagnostics.",
     },
     emergencyBrake: {
       type: "boolean",

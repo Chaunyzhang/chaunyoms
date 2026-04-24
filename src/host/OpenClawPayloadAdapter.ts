@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import { BridgeConfig, LoggerLike, RawMessage } from "../types";
+import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
 import { isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
 
@@ -208,6 +208,32 @@ export class OpenClawPayloadAdapter {
     return "";
   }
 
+  describeConfigGuidance(config: BridgeConfig): {
+    preset: ConfigPreset;
+    warnings: string[];
+  } {
+    const warnings: string[] = [];
+    if (config.emergencyBrake) {
+      warnings.push("Emergency brake is enabled; runtime capture, durable writes, auto recall, and knowledge promotion are forced off.");
+    }
+    if (!config.strictCompaction && config.knowledgePromotionEnabled) {
+      warnings.push("Knowledge promotion is enabled while strict compaction is off; weaker summaries may reduce promotion quality.");
+    }
+    if (!config.runtimeCaptureEnabled && config.semanticCandidateExpansionEnabled) {
+      warnings.push("Semantic candidate expansion is enabled without runtime capture; only stored assets can contribute candidates.");
+    }
+    if (config.semanticCandidateExpansionEnabled && config.semanticCandidateLimit <= 0) {
+      warnings.push("Semantic candidate expansion is enabled but semanticCandidateLimit is non-positive.");
+    }
+    if (config.knowledgePromotionEnabled && !config.durableMemoryEnabled) {
+      warnings.push("Knowledge promotion is enabled while durable memory extraction is disabled; promotion inputs will be thinner than expected.");
+    }
+    return {
+      preset: config.configPreset,
+      warnings,
+    };
+  }
+
   private resolveConfig(
     payload: OpenClawPayloadLike,
     currentConfig: BridgeConfig,
@@ -223,6 +249,15 @@ export class OpenClawPayloadAdapter {
         this.getApi()?.config,
     ) ?? {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
+    const configPreset = this.resolveStringEnum(
+      [
+        pluginConfig.configPreset,
+        pluginConfig.preset,
+      ],
+      ["safe", "balanced", "enhanced_recall"],
+      baseConfig.configPreset,
+    ) as ConfigPreset;
+    const presetDefaults = this.resolvePresetDefaults(configPreset, baseConfig);
     const sharedDataDir = this.resolveDirectoryValue(
       pluginConfig.sharedDataDir,
       baseConfig.sharedDataDir,
@@ -294,7 +329,7 @@ export class OpenClawPayloadAdapter {
             this.inverseBoolean(pluginConfig.disableAutoRecall),
             this.inverseBoolean(pluginConfig.stopAutoRecall),
           ],
-          baseConfig.autoRecallEnabled,
+          presetDefaults.autoRecallEnabled,
         );
 
     const knowledgePromotionEnabled = emergencyBrake
@@ -350,6 +385,7 @@ export class OpenClawPayloadAdapter {
       dataDir,
       sessionId: this.resolveSessionId(payload, baseConfig),
       agentId: this.resolveAgentId(payload, baseConfig),
+      configPreset,
       workspaceDir,
       sharedDataDir,
       memoryVaultDir,
@@ -415,8 +451,55 @@ export class OpenClawPayloadAdapter {
       knowledgeIntakeAllowBranchSummaries,
       knowledgeIntakeUserOverrideEnabled,
       knowledgeIntakeUserOverridePatterns,
+      semanticCandidateExpansionEnabled: emergencyBrake
+        ? false
+        : this.resolveBooleanFlag(
+            [
+              pluginConfig.semanticCandidateExpansionEnabled,
+              pluginConfig.enableSemanticCandidateExpansion,
+              pluginConfig.semanticCandidatesEnabled,
+            ],
+            presetDefaults.semanticCandidateExpansionEnabled,
+          ),
+      semanticCandidateLimit: this.resolveNumberFlag(
+        [
+          pluginConfig.semanticCandidateLimit,
+          pluginConfig.maxSemanticCandidates,
+        ],
+        presetDefaults.semanticCandidateLimit,
+      ),
       emergencyBrake,
     };
+  }
+
+  private resolvePresetDefaults(
+    configPreset: ConfigPreset,
+    baseConfig: BridgeConfig,
+  ): Pick<
+    BridgeConfig,
+    "autoRecallEnabled" | "semanticCandidateExpansionEnabled" | "semanticCandidateLimit"
+  > {
+    switch (configPreset) {
+      case "safe":
+        return {
+          autoRecallEnabled: false,
+          semanticCandidateExpansionEnabled: false,
+          semanticCandidateLimit: 3,
+        };
+      case "enhanced_recall":
+        return {
+          autoRecallEnabled: true,
+          semanticCandidateExpansionEnabled: true,
+          semanticCandidateLimit: Math.max(baseConfig.semanticCandidateLimit, 8),
+        };
+      case "balanced":
+      default:
+        return {
+          autoRecallEnabled: baseConfig.autoRecallEnabled,
+          semanticCandidateExpansionEnabled: baseConfig.semanticCandidateExpansionEnabled,
+          semanticCandidateLimit: baseConfig.semanticCandidateLimit,
+        };
+    }
   }
 
   private hasDirectoryValue(value: unknown): value is string {
@@ -770,6 +853,20 @@ export class OpenClawPayloadAdapter {
         if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
           return false;
         }
+      }
+    }
+    return fallback;
+  }
+
+  private resolveNumberFlag(candidates: unknown[], fallback: number): number {
+    for (const candidate of candidates) {
+      const value = typeof candidate === "number"
+        ? candidate
+        : typeof candidate === "string" && candidate.trim().length > 0
+          ? Number(candidate)
+          : Number.NaN;
+      if (Number.isFinite(value) && value > 0) {
+        return value;
       }
     }
     return fallback;

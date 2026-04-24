@@ -20,6 +20,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(DEFAULT_SHARED_DATA_DIR, "data", "chaunyoms"),
   sessionId: "default-session",
   agentId: "main",
+  configPreset: "balanced",
   workspaceDir: DEFAULT_WORKSPACE_DIR,
   sharedDataDir: DEFAULT_SHARED_DATA_DIR,
   memoryVaultDir: path.join(
@@ -48,6 +49,8 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   knowledgeIntakeAllowBranchSummaries: false,
   knowledgeIntakeUserOverrideEnabled: true,
   knowledgeIntakeUserOverridePatterns: [],
+  semanticCandidateExpansionEnabled: true,
+  semanticCandidateLimit: 5,
   emergencyBrake: false,
 };
 
