@@ -434,7 +434,7 @@ Near-term directions:
 
 - stronger semantic dedupe for durable / knowledge raw layers
 - asynchronous wiki rewrite pipeline
-- cleaner separation between runtime memory and managed knowledge
+- cleaner separation between runtime memory and unified knowledge
 - broader end-to-end conversation validation under real OpenClaw sessions
 
 ---

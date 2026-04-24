@@ -156,7 +156,7 @@ flowchart LR
 - structured compaction pipeline
 - summary tree rollup path
 - project registry organization
-- managed knowledge promotion path in code
+- unified knowledge promotion path in code
 - retrieval routing across recent tail / project registry / durable memory / summary tree / knowledge / vector fallback
 
 ### Safe by default

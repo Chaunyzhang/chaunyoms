@@ -16,6 +16,7 @@ import {
   EvalAggregateMetrics,
   EvalCaseDefinition,
   EvalCaseResult,
+  EvalRateMetric,
   EvalSuiteDefinition,
   EvalSuiteReport,
 } from "./types";
@@ -41,6 +42,18 @@ function average(values: number[]): number {
     return 0;
   }
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function rateMetric(passed: number, total: number): EvalRateMetric {
+  return {
+    rate: total === 0 ? 0 : Number((passed / total).toFixed(4)),
+    passed,
+    total,
+  };
+}
+
+function percentageLabel(metric: EvalRateMetric): string {
+  return `${(metric.rate * 100).toFixed(1)}% (${metric.passed}/${metric.total})`;
 }
 
 function evaluateCaseResult(
@@ -117,28 +130,32 @@ function aggregateMetrics(results: EvalCaseResult[]): EvalAggregateMetrics {
   return {
     totalCases,
     passedCases,
-    passRate: totalCases === 0 ? 0 : Number((passedCases / totalCases).toFixed(4)),
-    routeAccuracyRate: routeCases.length === 0
-      ? 0
-      : Number((routeCases.filter((item) => item.passed).length / routeCases.length).toFixed(4)),
-    exactFactRecoveryRate: exactFactCases.length === 0
-      ? 0
-      : Number((exactFactCases.filter((item) => item.passed).length / exactFactCases.length).toFixed(4)),
-    sourceVerificationRate: sourceCases.length === 0
-      ? 0
-      : Number((sourceCases.filter((item) => item.sourceVerified).length / sourceCases.length).toFixed(4)),
-    knowledgeUpdateSuccessRate: updateCases.length === 0
-      ? 0
-      : Number((updateCases.filter((item) => item.passed).length / updateCases.length).toFixed(4)),
-    projectStateSuccessRate: projectCases.length === 0
-      ? 0
-      : Number((projectCases.filter((item) => item.passed).length / projectCases.length).toFixed(4)),
-    abstentionSuccessRate: abstentionCases.length === 0
-      ? 0
-      : Number((abstentionCases.filter((item) => item.passed).length / abstentionCases.length).toFixed(4)),
-    falseRecallRate: totalCases === 0
-      ? 0
-      : Number((falseRecallCases.length / totalCases).toFixed(4)),
+    passRate: rateMetric(passedCases, totalCases),
+    routeAccuracyRate: rateMetric(
+      routeCases.filter((item) => item.passed).length,
+      routeCases.length,
+    ),
+    exactFactRecoveryRate: rateMetric(
+      exactFactCases.filter((item) => item.passed).length,
+      exactFactCases.length,
+    ),
+    sourceVerificationRate: rateMetric(
+      sourceCases.filter((item) => item.sourceVerified).length,
+      sourceCases.length,
+    ),
+    knowledgeUpdateSuccessRate: rateMetric(
+      updateCases.filter((item) => item.passed).length,
+      updateCases.length,
+    ),
+    projectStateSuccessRate: rateMetric(
+      projectCases.filter((item) => item.passed).length,
+      projectCases.length,
+    ),
+    abstentionSuccessRate: rateMetric(
+      abstentionCases.filter((item) => item.passed).length,
+      abstentionCases.length,
+    ),
+    falseRecallRate: rateMetric(falseRecallCases.length, totalCases),
     avgLatencyMs: Number(average(latencies).toFixed(2)),
     p50LatencyMs: Number(percentile(latencies, 50).toFixed(2)),
     p95LatencyMs: Number(percentile(latencies, 95).toFixed(2)),
@@ -157,14 +174,14 @@ function reportMarkdown(report: EvalSuiteReport): string {
     "",
     `- totalCases: ${report.metrics.totalCases}`,
     `- passedCases: ${report.metrics.passedCases}`,
-    `- passRate: ${report.metrics.passRate}`,
-    `- routeAccuracyRate: ${report.metrics.routeAccuracyRate}`,
-    `- exactFactRecoveryRate: ${report.metrics.exactFactRecoveryRate}`,
-    `- sourceVerificationRate: ${report.metrics.sourceVerificationRate}`,
-    `- knowledgeUpdateSuccessRate: ${report.metrics.knowledgeUpdateSuccessRate}`,
-    `- projectStateSuccessRate: ${report.metrics.projectStateSuccessRate}`,
-    `- abstentionSuccessRate: ${report.metrics.abstentionSuccessRate}`,
-    `- falseRecallRate: ${report.metrics.falseRecallRate}`,
+    `- passRate: ${percentageLabel(report.metrics.passRate)}`,
+    `- routeAccuracyRate: ${percentageLabel(report.metrics.routeAccuracyRate)}`,
+    `- exactFactRecoveryRate: ${percentageLabel(report.metrics.exactFactRecoveryRate)}`,
+    `- sourceVerificationRate: ${percentageLabel(report.metrics.sourceVerificationRate)}`,
+    `- knowledgeUpdateSuccessRate: ${percentageLabel(report.metrics.knowledgeUpdateSuccessRate)}`,
+    `- projectStateSuccessRate: ${percentageLabel(report.metrics.projectStateSuccessRate)}`,
+    `- abstentionSuccessRate: ${percentageLabel(report.metrics.abstentionSuccessRate)}`,
+    `- falseRecallRate: ${percentageLabel(report.metrics.falseRecallRate)}`,
     `- avgLatencyMs: ${report.metrics.avgLatencyMs}`,
     `- p50LatencyMs: ${report.metrics.p50LatencyMs}`,
     `- p95LatencyMs: ${report.metrics.p95LatencyMs}`,

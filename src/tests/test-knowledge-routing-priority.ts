@@ -75,7 +75,7 @@ async function main(): Promise<void> {
       summary: "Canonical retry policy for queue workers.",
       tags: ["retry", "queue"],
       canonicalKey: "queue-retry-policy",
-      body: "# Queue Retry Policy\n\n## Canonical knowledge\n\nManaged knowledge says to use capped exponential backoff with five retries.\n",
+      body: "# Queue Retry Policy\n\n## Canonical knowledge\n\nUnified knowledge says to use capped exponential backoff with five retries.\n",
       status: "active",
     },
     {
@@ -136,7 +136,7 @@ async function main(): Promise<void> {
     query: "Check the knowledge base for the queue retry policy",
   });
   const knowledgeText = String(knowledgeRetrieve.content[0]?.text ?? "");
-  assert(/Managed knowledge says/i.test(knowledgeText), "expected retrieval to return managed knowledge content");
+  assert(/Unified knowledge says/i.test(knowledgeText), "expected retrieval to return unified knowledge content");
   assert(/Manual raw knowledge says queue retries must stop/i.test(knowledgeText), "expected retrieval to also return user-provided raw knowledge content");
   assert(knowledgeRetrieve.details.topRecordType === "knowledge_record", "expected unified knowledge query to return undifferentiated knowledge records");
   assert(
@@ -159,7 +159,7 @@ async function main(): Promise<void> {
   });
   const rawText = String(rawRetrieve.content[0]?.text ?? "");
   assert(/Manual raw knowledge says queue retries must stop/i.test(rawText), "expected raw knowledge queries to surface manual raw content through the unified corpus");
-  assert(!("importedHitCount" in rawRetrieve.details), "expected retrieval metadata to stop splitting imported/internal counts");
+  assert(!("sourceClassHitCount" in rawRetrieve.details), "expected retrieval metadata to avoid source-class split counts");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-knowledge-routing-priority passed");

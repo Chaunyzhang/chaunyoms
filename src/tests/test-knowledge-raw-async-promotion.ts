@@ -119,7 +119,7 @@ async function main(): Promise<void> {
   );
 
   const docs = stores.knowledgeStore.searchRelatedDocuments("queue retry policy", 3);
-  assert(docs.length > 0, "expected managed knowledge store to contain promoted wiki output");
+  assert(docs.length > 0, "expected unified knowledge store to contain promoted wiki output");
   assert(
     docs.some((entry) => entry.canonicalKey === "queue-retry-policy"),
     "expected promoted wiki output to keep the canonical key",

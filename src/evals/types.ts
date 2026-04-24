@@ -74,17 +74,23 @@ export interface EvalCaseResult {
   failures: string[];
 }
 
+export interface EvalRateMetric {
+  rate: number;
+  passed: number;
+  total: number;
+}
+
 export interface EvalAggregateMetrics {
   totalCases: number;
   passedCases: number;
-  passRate: number;
-  routeAccuracyRate: number;
-  exactFactRecoveryRate: number;
-  sourceVerificationRate: number;
-  knowledgeUpdateSuccessRate: number;
-  projectStateSuccessRate: number;
-  abstentionSuccessRate: number;
-  falseRecallRate: number;
+  passRate: EvalRateMetric;
+  routeAccuracyRate: EvalRateMetric;
+  exactFactRecoveryRate: EvalRateMetric;
+  sourceVerificationRate: EvalRateMetric;
+  knowledgeUpdateSuccessRate: EvalRateMetric;
+  projectStateSuccessRate: EvalRateMetric;
+  abstentionSuccessRate: EvalRateMetric;
+  falseRecallRate: EvalRateMetric;
   avgLatencyMs: number;
   p50LatencyMs: number;
   p95LatencyMs: number;

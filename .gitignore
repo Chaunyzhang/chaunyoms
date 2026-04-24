@@ -1,5 +1,6 @@
 node_modules/
 dist/
+artifacts/
 .chaunyoms/
 *.log
 npm-debug.log*

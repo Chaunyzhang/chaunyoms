@@ -26,7 +26,7 @@ interface PromotionLedgerFileV1 {
   entries: PromotionLedgerEntry[];
 }
 
-const README_CONTENT = `# ChaunyOMS Managed Knowledge
+const README_CONTENT = `# ChaunyOMS Unified Knowledge
 
 This directory stores the unified ChaunyOMS knowledge corpus.
 
@@ -37,7 +37,7 @@ This directory stores the unified ChaunyOMS knowledge corpus.
 - facts/: stable facts and constraints
 - incidents/: incident write-ups and postmortems
 - indexes/: promotion ledger and document index
-- origin is provenance metadata only; retrieval does not split internal vs external knowledge weights
+- origin is provenance metadata only; retrieval does not split knowledge by source-class weights
 `;
 
 const VERSIONED_BUCKETS: Exclude<KnowledgeDocBucket, "raw">[] = [
@@ -938,7 +938,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       this.documents = this.normalizeDocuments([...nonRawDocuments, ...rawDocuments]);
       this.flushDocumentIndexSync();
     } catch {
-      // Manual raw indexing is best-effort; versioned managed knowledge remains usable.
+      // Manual raw indexing is best-effort; versioned unified knowledge remains usable.
     }
   }
 

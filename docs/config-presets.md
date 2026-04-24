@@ -24,7 +24,7 @@ This matches the current default posture.
 - keeps safe defaults
 - keeps auto recall on
 - keeps semantic candidate expansion on
-- still treats source recall and managed knowledge as the final authority
+- still treats source recall and unified knowledge as the final authority
 
 ```json
 {
@@ -38,7 +38,7 @@ Use when you want stronger retrieval helpers without switching to RAG-first beha
 
 - enables semantic candidate expansion
 - increases semantic candidate limit
-- keeps source recall and managed knowledge as the final authority
+- keeps source recall and unified knowledge as the final authority
 
 ```json
 {

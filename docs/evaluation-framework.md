@@ -50,7 +50,7 @@ Each case defines:
 - tags
 - query mode: `retrieve` or `route`
 - replay messages or a generated scenario
-- optional seeded managed knowledge
+- optional seeded unified knowledge
 - expected output substrings
 - forbidden substrings
 - expected detail fields

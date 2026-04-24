@@ -1502,7 +1502,7 @@ export class ChaunyomsRetrievalService {
       case "summary_tree":
         return "summary tree -> raw recall";
       case "knowledge":
-        return "managed knowledge";
+        return "unified knowledge";
       case "navigation":
         return "navigation route hit";
       case "shared_insights":

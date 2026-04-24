@@ -8,7 +8,7 @@ const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|his
 const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
 const SHARED_INSIGHTS_RE = /(shared[- ]?insights|共享洞察|insight)/i;
 const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
-const RAW_KNOWLEDGE_RE = /(imported knowledge|import source|obsidian|graph provider|graph|外部知识|外部资料|外部文档|第三方知识|第三方文档|导入知识|导入资料|raw knowledge|raw notes|原始知识|原始资料)/i;
+const RAW_KNOWLEDGE_RE = /(raw knowledge|raw notes|manual knowledge|manual notes|原始知识|原始资料|手动知识|手动资料|手动笔记)/i;
 const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
 const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|what's left|what remains)/i;
 
@@ -152,7 +152,7 @@ export class MemoryRetrievalRouter {
         false,
         true,
         ["knowledge", "summary_tree"],
-        "The query explicitly mentions raw/imported knowledge, which is retrieved through the same unified knowledge corpus.",
+        "The query explicitly mentions raw/manual knowledge, which is retrieved through the same unified knowledge corpus.",
       );
     }
 
