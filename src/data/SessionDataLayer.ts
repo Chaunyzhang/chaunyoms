@@ -299,7 +299,7 @@ export class SessionDataLayer {
   }
 
   private resolveSharedKnowledgeDir(config: BridgeConfig): string {
-    return path.join(config.memoryVaultDir, "shared", "knowledge");
+    return config.knowledgeBaseDir;
   }
 
   private async validateUpgradedState(

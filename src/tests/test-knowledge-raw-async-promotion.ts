@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     { info(): void {}, warn(): void {}, error(): void {} },
     {
       async call(params: { prompt: string }): Promise<string> {
-        if (params.prompt.includes("git-friendly markdown knowledge base")) {
+        if (params.prompt.includes("git-friendly unified markdown knowledge base")) {
           return JSON.stringify({
             shouldWrite: true,
             reason: "accepted_knowledge_raw_candidate",

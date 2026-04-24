@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -68,6 +68,7 @@ async function main(): Promise<void> {
   assert(record?.entry.origin === "synthesized", "expected promoted knowledge to record synthesized origin");
   assert(record?.entry.linkedSummaryIds.includes(summary.id), "expected promoted document to link back to the source summary");
   assert(record?.entry.sourceRefs.some((value) => value.includes("session:session-1:turns:1-4")), "expected promoted document to keep a source reference");
+  await access(path.join(dir, "raw", "system", "worker-retry-policy-summary-1.md"));
 
   const versions = store.listVersions("worker-retry-policy");
   assert(versions.length === 1, "expected exactly one document version");
@@ -84,11 +85,11 @@ async function main(): Promise<void> {
   assert(superseded?.entry.supersededById === "worker-retry-policy-v2", "expected superseded link to be recorded");
 
   const trustModel = store.describeTrustModel();
-  assert(trustModel.layer === "managed_knowledge", "expected trust model to describe the managed knowledge layer");
+  assert(trustModel.layer === "unified_knowledge", "expected trust model to describe the unified knowledge layer");
   assert(trustModel.requiresProvenance === true, "expected trust model to require provenance");
 
   await rm(dir, { recursive: true, force: true });
-  console.log("test-internal-formal-knowledge-store passed");
+  console.log("test-unified-knowledge-store passed");
 }
 
 void main();

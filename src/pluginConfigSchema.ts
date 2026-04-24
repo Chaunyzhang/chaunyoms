@@ -24,7 +24,7 @@ export const pluginConfigSchema = {
     },
     knowledgeBaseDir: {
       type: "string",
-      description: "Optional external/imported markdown knowledge directory. Treated as a read-only reference layer by default; any ChaunyOMS cache lives under sharedDataDir/plugin-cache.",
+      description: "Unified markdown knowledge directory. AI promotions and user-provided raw/ files are indexed as one corpus with provenance metadata only.",
     },
     enableTools: {
       type: "boolean",
@@ -80,7 +80,7 @@ export const pluginConfigSchema = {
     },
     knowledgePromotionEnabled: {
       type: "boolean",
-      description: "Enable promotion into the managed knowledge store. Disabled by default.",
+      description: "Enable promotion from accepted knowledge raw into the unified knowledge store. Disabled by default.",
     },
     knowledgeIntakeMode: {
       type: "string",

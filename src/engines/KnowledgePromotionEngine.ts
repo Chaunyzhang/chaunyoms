@@ -133,7 +133,7 @@ export class KnowledgePromotionEngine {
       .join("\n\n");
 
     return [
-      "You are promoting compressed chat history into a git-friendly markdown knowledge base.",
+      "You are promoting accepted knowledge raw into a git-friendly unified markdown knowledge base.",
       "History and knowledge are separate systems. Do NOT store raw chatter as knowledge.",
       "This summary has already passed knowledge intake and belongs in the knowledge module.",
       "Allowed buckets: decisions, patterns, facts, incidents.",

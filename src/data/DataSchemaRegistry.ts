@@ -12,7 +12,7 @@ const CURRENT_STORE_VERSIONS: Record<string, number> = {
   observations: 1,
   durable_memory: 2,
   knowledge_raw: 1,
-  knowledge_markdown: 1,
+  knowledge_markdown: 2,
 };
 
 export class DataSchemaRegistry {

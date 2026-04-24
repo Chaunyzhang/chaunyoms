@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -27,15 +28,24 @@ interface PromotionLedgerFileV1 {
 
 const README_CONTENT = `# ChaunyOMS Managed Knowledge
 
-This directory stores versioned knowledge managed by ChaunyOMS.
+This directory stores the unified ChaunyOMS knowledge corpus.
 
+- raw/: user-provided raw knowledge notes; files dropped here are indexed with the same retrieval weight as AI-promoted knowledge
+- raw/system/: system intake artifacts written before AI-generated promotions are finalized
 - decisions/: versioned decision records
 - patterns/: reusable engineering patterns
 - facts/: stable facts and constraints
 - incidents/: incident write-ups and postmortems
 - indexes/: promotion ledger and document index
-- every document keeps provenance, origin, and source references
+- origin is provenance metadata only; retrieval does not split internal vs external knowledge weights
 `;
+
+const VERSIONED_BUCKETS: Exclude<KnowledgeDocBucket, "raw">[] = [
+  "decisions",
+  "patterns",
+  "facts",
+  "incidents",
+];
 
 export class KnowledgeMarkdownStore implements KnowledgeRepository {
   private documents: KnowledgeDocumentIndexEntry[] = [];
@@ -63,6 +73,8 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       mkdir(path.join(this.baseDir, "patterns"), { recursive: true }),
       mkdir(path.join(this.baseDir, "facts"), { recursive: true }),
       mkdir(path.join(this.baseDir, "incidents"), { recursive: true }),
+      mkdir(path.join(this.baseDir, "raw"), { recursive: true }),
+      mkdir(path.join(this.baseDir, "raw", "system"), { recursive: true }),
       mkdir(this.indexesDir, { recursive: true }),
     ]);
 
@@ -93,6 +105,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   }
 
   searchRelatedDocuments(query: string, limit = 3): KnowledgeDocumentIndexEntry[] {
+    this.refreshManualRawDocuments();
     const terms = query
       .toLowerCase()
       .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
@@ -198,13 +211,15 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   describeTrustModel(): KnowledgeTrustModel {
     return {
       owner: "chaunyoms",
-      layer: "managed_knowledge",
+      layer: "unified_knowledge",
       writable: true,
       versioned: true,
       requiresProvenance: true,
       notes: [
-        "This repository stores knowledge managed by ChaunyOMS as a unified corpus.",
-        "Origin is tracked as metadata instead of splitting the corpus into separate internal/external silos.",
+        "This repository stores AI-promoted and user-provided knowledge as one unified corpus.",
+        "Origin is tracked as provenance metadata only; retrieval does not split internal vs external weights.",
+        "User raw files can be dropped into raw/ and are indexed as first-class knowledge.",
+        "AI-generated promotions write a system raw intake artifact before the final versioned document is committed.",
         "Documents must keep provenance back to summaries and source references.",
         "Knowledge can be superseded, reconciled, and version-audited.",
       ],
@@ -223,6 +238,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
     },
   ): Promise<KnowledgePromotionResult> {
     await this.init();
+    await this.writePromotionRawIntake(summary, draft, metadata);
 
     const existingPromotion = this.findPromotion(summary);
     if (existingPromotion) {
@@ -499,9 +515,8 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   }
 
   private async rebuildDocumentsFromFilesystem(): Promise<KnowledgeDocumentIndexEntry[]> {
-    const buckets: KnowledgeDocBucket[] = ["decisions", "patterns", "facts", "incidents"];
     const docs: KnowledgeDocumentIndexEntry[] = [];
-    for (const bucket of buckets) {
+    for (const bucket of VERSIONED_BUCKETS) {
       const dir = path.join(this.baseDir, bucket);
       let files: string[] = [];
       try {
@@ -578,7 +593,10 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         }
       }
     }
-    return this.normalizeDocuments(docs);
+    return this.normalizeDocuments([
+      ...docs,
+      ...(await this.rebuildManualRawDocumentsFromFilesystem()),
+    ]);
   }
 
   private normalizeDocuments(entries: KnowledgeDocumentIndexEntry[]): KnowledgeDocumentIndexEntry[] {
@@ -588,7 +606,7 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         tags: this.uniqueStrings(entry.tags ?? []),
         linkedSummaryIds: this.uniqueStrings(entry.linkedSummaryIds ?? []),
         sourceRefs: this.uniqueStrings(entry.sourceRefs ?? []),
-        origin: entry.origin ?? "synthesized",
+        origin: this.normalizeOrigin(entry.origin),
         versions: [...entry.versions].sort((a, b) => a.version - b.version),
       }))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
@@ -619,6 +637,14 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
       documents: this.documents,
     };
     await writeFile(this.documentIndexPath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
+  private flushDocumentIndexSync(): void {
+    const payload: KnowledgeDocumentIndexFileV1 = {
+      schemaVersion: 1,
+      documents: this.documents,
+    };
+    writeFileSync(this.documentIndexPath, JSON.stringify(payload, null, 2), "utf8");
   }
 
   private async flushLedger(): Promise<void> {
@@ -669,6 +695,184 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
         : null,
     ].filter((value): value is string => Boolean(value));
     return this.uniqueStrings(refs);
+  }
+
+  private async writePromotionRawIntake(
+    summary: SummaryEntry,
+    draft: KnowledgePromotionDraft,
+    metadata: {
+      sessionId: string;
+      sourceHash?: string;
+      sourceMessageCount?: number;
+      promptVersion: string;
+      modelName?: string;
+    },
+  ): Promise<void> {
+    const rawDir = path.join(this.baseDir, "raw", "system");
+    await mkdir(rawDir, { recursive: true });
+    const slug = this.slugify(draft.slug || draft.title || summary.id);
+    const filePath = path.join(rawDir, `${slug}-${this.slugify(summary.id)}.md`);
+    const frontmatter = [
+      "---",
+      `id: system-raw-${this.buildId(`${summary.id}:${metadata.promptVersion}`)}`,
+      `slug: ${slug}`,
+      `origin: synthesized`,
+      `title: ${this.escapeFrontmatterValue(draft.title || summary.summary.slice(0, 80) || summary.id)}`,
+      `summary_entry_id: ${summary.id}`,
+      `session_id: ${metadata.sessionId}`,
+      `source_hash: ${metadata.sourceHash ?? ""}`,
+      `prompt_version: ${metadata.promptVersion}`,
+      `model: ${metadata.modelName ?? "fallback"}`,
+      "tags:",
+      "  - system-intake",
+      "---",
+      "",
+    ].join("\n");
+    const body = [
+      `# ${draft.title || "Knowledge raw intake"}`,
+      "",
+      "## Source summary",
+      "",
+      summary.summary,
+      "",
+      "## AI draft",
+      "",
+      draft.body || draft.summary || "",
+    ].join("\n");
+    await writeFile(filePath, `${frontmatter}${body.trim()}\n`, "utf8");
+  }
+
+  private refreshManualRawDocuments(): void {
+    try {
+      const rawDocuments = this.rebuildManualRawDocumentsFromFilesystemSync();
+      const nonRawDocuments = this.documents.filter((entry) => entry.bucket !== "raw");
+      this.documents = this.normalizeDocuments([...nonRawDocuments, ...rawDocuments]);
+      this.flushDocumentIndexSync();
+    } catch {
+      // Manual raw indexing is best-effort; versioned managed knowledge remains usable.
+    }
+  }
+
+  private async rebuildManualRawDocumentsFromFilesystem(): Promise<KnowledgeDocumentIndexEntry[]> {
+    const rawDir = path.join(this.baseDir, "raw");
+    const files = await this.readRawCandidateFiles(rawDir);
+    const docs: KnowledgeDocumentIndexEntry[] = [];
+    for (const filePath of files) {
+      const content = await readFile(filePath, "utf8");
+      const fileStat = await stat(filePath);
+      docs.push(this.buildRawDocumentEntry(filePath, content, fileStat.mtime.toISOString()));
+    }
+    return docs;
+  }
+
+  private rebuildManualRawDocumentsFromFilesystemSync(): KnowledgeDocumentIndexEntry[] {
+    const rawDir = path.join(this.baseDir, "raw");
+    const files = this.readRawCandidateFilesSync(rawDir);
+    return files.map((filePath) => {
+      const content = readFileSync(filePath, "utf8");
+      const fileStat = statSync(filePath);
+      return this.buildRawDocumentEntry(filePath, content, fileStat.mtime.toISOString());
+    });
+  }
+
+  private async readRawCandidateFiles(dir: string): Promise<string[]> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const files: string[] = [];
+    for (const entry of entries) {
+      if (entry.name === "system") {
+        continue;
+      }
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...await this.readRawCandidateFiles(fullPath));
+      } else if (/\.(md|txt|json)$/i.test(entry.name)) {
+        files.push(fullPath);
+      }
+    }
+    return files.sort();
+  }
+
+  private readRawCandidateFilesSync(dir: string): string[] {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const files: string[] = [];
+    for (const entry of entries) {
+      if (entry.name === "system") {
+        continue;
+      }
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...this.readRawCandidateFilesSync(fullPath));
+      } else if (/\.(md|txt|json)$/i.test(entry.name)) {
+        files.push(fullPath);
+      }
+    }
+    return files.sort();
+  }
+
+  private buildRawDocumentEntry(
+    filePath: string,
+    content: string,
+    updatedAt: string,
+  ): KnowledgeDocumentIndexEntry {
+    const rawDir = path.join(this.baseDir, "raw");
+    const relativePath = path.relative(rawDir, filePath);
+    const metadata = this.parseFrontmatter(content);
+    const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+    const title = this.normalizeOptionalString(metadata.title) ??
+      this.firstHeading(body) ??
+      path.basename(filePath, path.extname(filePath));
+    const slug = this.slugify(
+      this.normalizeOptionalString(metadata.slug) ??
+        path.basename(filePath, path.extname(filePath)),
+    );
+    const canonicalKey = this.slugify(
+      this.normalizeOptionalString(metadata.canonical_key) ??
+        this.normalizeOptionalString(metadata.canonicalKey) ??
+        slug,
+    );
+    const docId = this.normalizeOptionalString(metadata.id) ??
+      `raw-${this.hash(path.normalize(relativePath)).slice(0, 16)}`;
+    const summary = this.normalizeOptionalString(metadata.summary) ??
+      this.previewBody(body || content);
+    const tags = this.normalizeTagList(metadata.tags);
+    const sourceRefs = this.uniqueStrings([
+      `raw:${relativePath.replace(/\\/g, "/")}`,
+      ...this.normalizeTagList(metadata.source_refs),
+    ]);
+    return {
+      docId,
+      slug,
+      bucket: "raw",
+      title,
+      latestVersion: 1,
+      latestFile: relativePath,
+      summary,
+      tags,
+      canonicalKey,
+      origin: this.normalizeOrigin(metadata.origin ?? "manual"),
+      status: "active",
+      linkedSummaryIds: this.uniqueStrings(this.normalizeTagList(metadata.linked_summary_ids)),
+      sourceRefs,
+      updatedAt,
+      versions: [{
+        version: 1,
+        docId,
+        fileName: relativePath,
+        createdAt: updatedAt,
+        contentHash: this.hash(content),
+        summaryEntryId: this.normalizeOptionalString(metadata.summary_entry_id) ?? "manual-raw",
+      }],
+    };
   }
 
   private async updateLatestFrontmatter(entry: KnowledgeDocumentIndexEntry): Promise<void> {
@@ -787,13 +991,32 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
 
   private normalizeOrigin(value: unknown): KnowledgeDocumentIndexEntry["origin"] {
     switch (String(value ?? "").trim()) {
+      case "manual":
       case "native":
       case "imported":
       case "synthesized":
         return String(value).trim() as KnowledgeDocumentIndexEntry["origin"];
       default:
-        return "synthesized";
+        return "manual";
     }
+  }
+
+  private firstHeading(content: string): string | null {
+    const heading = content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /^#\s+/.test(line));
+    return heading ? heading.replace(/^#\s+/, "").trim() : null;
+  }
+
+  private previewBody(content: string): string {
+    const preview = content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .join(" ");
+    return preview.length > 800 ? `${preview.slice(0, 800)}...` : preview;
   }
 
   private parseTurnRange(value: unknown): [number, number] {

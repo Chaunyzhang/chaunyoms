@@ -7,7 +7,7 @@ const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|his
 const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
 const SHARED_INSIGHTS_RE = /(shared[- ]?insights|共享洞察|insight)/i;
 const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
-const IMPORTED_KNOWLEDGE_RE = /(imported knowledge|import source|obsidian|graph provider|graph|外部知识|外部资料|外部文档|第三方知识|第三方文档|导入知识|导入资料)/i;
+const RAW_KNOWLEDGE_RE = /(imported knowledge|import source|obsidian|graph provider|graph|外部知识|外部资料|外部文档|第三方知识|第三方文档|导入知识|导入资料|raw knowledge|raw notes|原始知识|原始资料)/i;
 const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
 const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|what's left|what remains)/i;
 
@@ -17,7 +17,7 @@ export interface RouteContext {
   hasNavigationHint?: boolean;
   hasStructuredNavigationState?: boolean;
   hasKnowledgeHits?: boolean;
-  hasKnowledgeImportHint?: boolean;
+  hasKnowledgeRawHint?: boolean;
   hasCompactedHistory?: boolean;
   hasProjectRegistry?: boolean;
   hasDurableHits?: boolean;
@@ -45,7 +45,7 @@ export class MemoryRetrievalRouter {
     const asksDurable = DURABLE_RE.test(normalized);
     const mentionsInsights = SHARED_INSIGHTS_RE.test(normalized);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(normalized);
-    const asksImportedKnowledge = IMPORTED_KNOWLEDGE_RE.test(normalized);
+    const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
     const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
     const stateAvailable = context.hasStructuredNavigationState || context.hasNavigationHint || context.hasProjectRegistry;
@@ -128,15 +128,15 @@ export class MemoryRetrievalRouter {
       return this.decision("shared_insights", "shared_insights_route_hit", false, false, true, ["shared_insights"], "The query explicitly asks for shared insights.");
     }
 
-    if (asksImportedKnowledge && mentionsKnowledge) {
+    if (asksRawKnowledge && mentionsKnowledge) {
       return this.decision(
         "knowledge",
-        "explicit_imported_knowledge_query",
+        "explicit_raw_knowledge_query",
         false,
         false,
         true,
         ["knowledge", "summary_tree"],
-        "The query explicitly mentions imported knowledge, but imported material is still retrieved through the unified knowledge corpus.",
+        "The query explicitly mentions raw/imported knowledge, which is retrieved through the same unified knowledge corpus.",
       );
     }
 
@@ -164,7 +164,7 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if (mentionsKnowledge && (fuzzyLookup || context.hasKnowledgeImportHint || !context.hasKnowledgeHits)) {
+    if (mentionsKnowledge && (fuzzyLookup || context.hasKnowledgeRawHint || !context.hasKnowledgeHits)) {
       return this.decision(
         "knowledge",
         "knowledge_query_requires_unified_lookup",
@@ -233,7 +233,7 @@ export class MemoryRetrievalRouter {
     const asksDurable = DURABLE_RE.test(query);
     const mentionsInsights = SHARED_INSIGHTS_RE.test(query);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(query);
-    const asksImportedKnowledge = IMPORTED_KNOWLEDGE_RE.test(query);
+    const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(query);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(query);
     const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
 
@@ -251,9 +251,9 @@ export class MemoryRetrievalRouter {
     if (context.matchedProjectId && context.hasDurableHits) add("durable_memory", 2, "matched_project_durable_hits");
 
     if (mentionsKnowledge) add("knowledge", 8, "knowledge_terms");
-    if (asksImportedKnowledge) add("knowledge", 5, "imported_knowledge_terms");
+    if (asksRawKnowledge) add("knowledge", 3, "raw_knowledge_terms");
     if (context.hasKnowledgeHits) add("knowledge", 4, "knowledge_hits_available");
-    if (context.hasKnowledgeImportHint) add("knowledge", 3, "knowledge_import_hint");
+    if (context.hasKnowledgeRawHint) add("knowledge", 3, "knowledge_raw_hint");
 
     if (mentionsInsights) add("shared_insights", 7, "shared_insight_terms");
     if (context.hasSharedInsightHint) add("shared_insights", 4, "shared_insight_hint");

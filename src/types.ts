@@ -215,8 +215,8 @@ export interface ProjectRegistryRepository {
   findByCanonicalKey(canonicalKey: string): ProjectRecord | null;
 }
 
-export type KnowledgeDocBucket = "decisions" | "patterns" | "facts" | "incidents";
-export type KnowledgeOrigin = "native" | "imported" | "synthesized";
+export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "incidents";
+export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 
 export interface KnowledgePromotionDraft {
@@ -269,7 +269,7 @@ export interface KnowledgeDocumentRecord {
 
 export interface KnowledgeTrustModel {
   owner: "chaunyoms";
-  layer: "managed_knowledge";
+  layer: "unified_knowledge";
   writable: boolean;
   versioned: boolean;
   requiresProvenance: boolean;
@@ -371,73 +371,6 @@ export interface KnowledgeRepository {
       modelName?: string;
     },
   ): Promise<KnowledgePromotionResult>;
-}
-
-export interface KnowledgeImportCapabilities {
-  read: boolean;
-  write: boolean;
-  supportsVersions: boolean;
-  supportsBacklinks: boolean;
-}
-
-export interface KnowledgeImportHit {
-  id: string;
-  sourceId: string;
-  sourceKind: "imported";
-  title: string;
-  summary: string;
-  tags: string[];
-  canonicalKey?: string;
-  filePath?: string;
-  ref?: string;
-  score?: number;
-}
-
-export interface KnowledgeImportDocument {
-  id: string;
-  sourceId: string;
-  title: string;
-  content: string;
-  summary: string;
-  tags: string[];
-  canonicalKey?: string;
-  filePath?: string;
-  ref?: string;
-}
-
-export interface KnowledgeImportMetadata {
-  id: string;
-  sourceId: string;
-  title: string;
-  canonicalKey?: string;
-  tags: string[];
-  filePath?: string;
-}
-
-export interface KnowledgeImportProvenance {
-  sourceId: string;
-  ref: string;
-  trustModel: string;
-}
-
-export interface KnowledgeImportTrustModel {
-  owner: "external-provider";
-  layer: "external_knowledge";
-  writableByChaunyoms: boolean;
-  versionedByChaunyoms: boolean;
-  notes: string[];
-}
-
-export interface KnowledgeImportSource {
-  id: string;
-  init(): Promise<void>;
-  describeCapabilities(): KnowledgeImportCapabilities;
-  getById(id: string): Promise<KnowledgeImportDocument | null> | KnowledgeImportDocument | null;
-  resolveRef(ref: string): Promise<KnowledgeImportDocument | null> | KnowledgeImportDocument | null;
-  getMetadata(id: string): Promise<KnowledgeImportMetadata | null> | KnowledgeImportMetadata | null;
-  getProvenance(id: string): Promise<KnowledgeImportProvenance | null> | KnowledgeImportProvenance | null;
-  describeTrustModel(): KnowledgeImportTrustModel;
-  search(query: string, limit?: number): Promise<KnowledgeImportHit[]> | KnowledgeImportHit[];
 }
 
 export interface ContextBudget {

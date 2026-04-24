@@ -1,8 +1,6 @@
-import path from "node:path";
-
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
-import { KnowledgeDocumentIndexEntry, KnowledgeImportDocument, KnowledgeImportHit, ContextItem, DurableMemoryEntry, FixedPrefixProvider, KnowledgeRepository, NavigationRepository, ProjectRecord, RetrievalDecision, VectorSearchFallbackRepository } from "../types";
+import { KnowledgeDocumentIndexEntry, ContextItem, DurableMemoryEntry, FixedPrefixProvider, KnowledgeRepository, NavigationRepository, ProjectRecord, RetrievalDecision, VectorSearchFallbackRepository } from "../types";
 import {
   LifecycleContext,
   OpenClawPayloadAdapter,
@@ -12,7 +10,6 @@ import {
   OpenClawApiLike,
 } from "../host/OpenClawHostTypes";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
-import { KnowledgeImportStore } from "../stores/KnowledgeImportStore";
 
 const EMBEDDINGS_API_PROMPT =
   "Current retrieval path needs embeddings search. Ask the user whether to configure an embeddings API now (for example OpenAI or SiliconFlow), or let them skip for now.";
@@ -34,7 +31,6 @@ export class ChaunyomsRetrievalService {
   private readonly fixedPrefixProvider: FixedPrefixProvider;
   private readonly navigationRepository: NavigationRepository;
   private readonly vectorSearchFallback: VectorSearchFallbackRepository;
-  private readonly knowledgeImportStores = new Map<string, KnowledgeImportStore>();
 
   constructor(
     private readonly runtime: ChaunyomsSessionRuntime,
@@ -170,9 +166,7 @@ export class ChaunyomsRetrievalService {
       matchedProject?.id,
       3,
     );
-    const managedKnowledgeHits = knowledgeStore.searchRelatedDocuments(query, 3);
-    const knowledgeImportStore = this.createKnowledgeImportStore(context);
-    const importedKnowledgeHits = await knowledgeImportStore.search(query, 3);
+    const managedKnowledgeHits = knowledgeStore.searchRelatedDocuments(query, 6);
     if (promptForApi) {
       return this.buildEmbeddingsPromptResponse(decision);
     }
@@ -207,13 +201,11 @@ export class ChaunyomsRetrievalService {
       };
     }
 
-    if (decision.route === "knowledge" && (managedKnowledgeHits.length > 0 || importedKnowledgeHits.length > 0)) {
+    if (decision.route === "knowledge" && managedKnowledgeHits.length > 0) {
       return await this.buildUnifiedKnowledgeResult(
         query,
         knowledgeStore,
         managedKnowledgeHits,
-        knowledgeImportStore,
-        importedKnowledgeHits,
         decision,
       );
     }
@@ -373,7 +365,7 @@ export class ChaunyomsRetrievalService {
   ): Promise<{ decision: RetrievalDecision; promptForApi: boolean }> {
     const memorySearchEnabled = this.payloadAdapter.hasEmbeddingsRetrievalReady();
     const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
-    const [hasKnowledgeImportHint, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
+    const [hasKnowledgeRawHint, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
       await Promise.all([
         this.fixedPrefixProvider.hasKnowledgeBaseTopicHit(
           context.config.sharedDataDir,
@@ -403,7 +395,7 @@ export class ChaunyomsRetrievalService {
     const decision = this.retrievalRouter.decide(query, {
       memorySearchEnabled,
       hasKnowledgeHits,
-      hasKnowledgeImportHint,
+      hasKnowledgeRawHint,
       hasSharedInsightHint,
       hasNavigationHint,
       hasStructuredNavigationState,
@@ -584,20 +576,6 @@ export class ChaunyomsRetrievalService {
     return this.scoreHaystack(haystack, terms);
   }
 
-  private scoreImportedKnowledge(
-    document: KnowledgeImportDocument | null,
-    terms: string[],
-  ): number {
-    const haystack = [
-      document?.title ?? "",
-      document?.summary ?? "",
-      document?.canonicalKey ?? "",
-      document?.ref ?? "",
-      ...(document?.tags ?? []),
-    ].join(" ").toLowerCase();
-    return this.scoreHaystack(haystack, terms);
-  }
-
   private scoreHaystack(haystack: string, terms: string[]): number {
     let score = 0;
     for (const term of terms) {
@@ -611,56 +589,24 @@ export class ChaunyomsRetrievalService {
     return score;
   }
 
-  private prefersImportedKnowledge(query: string): boolean {
-    return /(imported knowledge|import source|obsidian|graph|外部知识|外部资料|导入知识|导入资料)/i.test(query);
-  }
-
-  private createKnowledgeImportStore(
-    context: LifecycleContext,
-  ): KnowledgeImportStore {
-    const cacheKey = path.normalize(context.config.knowledgeBaseDir);
-    const existing = this.knowledgeImportStores.get(cacheKey);
-    if (existing) {
-      return existing;
-    }
-    const store = new KnowledgeImportStore(context.config.knowledgeBaseDir, {
-      cacheDir: path.join(
-        context.config.sharedDataDir,
-        "plugin-cache",
-        "knowledge-import",
-        Buffer.from(cacheKey).toString("hex").slice(0, 24),
-      ),
-    });
-    this.knowledgeImportStores.set(cacheKey, store);
-    return store;
-  }
-
   private async buildUnifiedKnowledgeResult(
     query: string,
     knowledgeStore: KnowledgeRepository,
     managedHits: Array<ReturnType<KnowledgeRepository["searchRelatedDocuments"]>[number]>,
-    importStore: KnowledgeImportStore,
-    importHits: KnowledgeImportHit[],
     decision: RetrievalDecision,
   ): Promise<ToolResponse> {
     const terms = this.queryTerms(query);
-    const importedPreference = this.prefersImportedKnowledge(query);
     const managedDocuments = (
       await Promise.all(managedHits.map((hit) => knowledgeStore.getById(hit.docId)))
     ).filter((document): document is NonNullable<typeof document> => Boolean(document));
-    const importedDocuments = (
-      await Promise.all(importHits.map((hit) => importStore.getById(hit.id)))
-    ).filter((document): document is NonNullable<typeof document> => Boolean(document));
-    const unifiedHits = [
-      ...managedDocuments.map((document) => ({
-        recordType: "managed_record" as const,
-        score:
-          this.scoreManagedKnowledge(document.entry, terms) +
-          (importedPreference ? 0 : 1.5),
+    const unifiedHits = managedDocuments
+      .map((document) => ({
+        recordType: "knowledge_record" as const,
+        score: this.scoreManagedKnowledge(document.entry, terms),
         title: document.entry.title,
         body: document.content.trim(),
         metadata: [
-          `type: managed_record`,
+          `type: knowledge_record`,
           `origin: ${document.entry.origin}`,
           `bucket: ${document.entry.bucket}`,
           `canonicalKey: ${document.entry.canonicalKey}`,
@@ -668,29 +614,9 @@ export class ChaunyomsRetrievalService {
           `linked summaries: ${document.entry.linkedSummaryIds.join(", ") || "none"}`,
           `source refs: ${document.entry.sourceRefs.join(", ") || "none"}`,
         ],
-      })),
-      ...importedDocuments.map((document, index) => ({
-        recordType: "source_record" as const,
-        score:
-          (importHits[index]?.score ?? this.scoreImportedKnowledge(document, terms)) +
-          (importedPreference ? 3 : 0),
-        title: document.title,
-        body: document.content.trim() || document.summary.trim(),
-        metadata: [
-          "type: external_reference",
-          "origin: imported_reference",
-          `source: ${document.sourceId}`,
-          `canonicalKey: ${document.canonicalKey ?? "none"}`,
-          `ref: ${document.ref ?? document.filePath ?? document.id}`,
-        ],
-      })),
-    ]
+      }))
       .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
       .slice(0, 6);
-    const conflictCanonicalKeys = this.detectKnowledgeConflicts(
-      managedDocuments.map((document) => document.entry),
-      importedDocuments,
-    );
 
     const text = unifiedHits.length > 0
       ? unifiedHits
@@ -701,7 +627,7 @@ export class ChaunyomsRetrievalService {
           hit.body,
         ].join("\n"))
         .join("\n\n---\n\n")
-      : `No managed knowledge documents matched query: ${query}`;
+      : `No knowledge documents matched query: ${query}`;
 
     return {
       content: [{ type: "text", text }],
@@ -711,11 +637,8 @@ export class ChaunyomsRetrievalService {
         retrievalLabel: this.describeRetrievalRoute(decision),
         query,
         hitCount: unifiedHits.length,
-        managedHitCount: managedDocuments.length,
-        importedHitCount: importedDocuments.length,
+        knowledgeHitCount: managedDocuments.length,
         topRecordType: unifiedHits[0]?.recordType ?? null,
-        conflictDetected: conflictCanonicalKeys.length > 0,
-        conflictCanonicalKeys,
         retrievalHitType: "knowledge",
         autoRecall: false,
         autoRecallReason: null,
@@ -723,24 +646,7 @@ export class ChaunyomsRetrievalService {
         layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
       },
-      };
-  }
-
-  private detectKnowledgeConflicts(
-    managedEntries: KnowledgeDocumentIndexEntry[],
-    importedDocuments: KnowledgeImportDocument[],
-  ): string[] {
-    const managedKeys = new Set(
-      managedEntries
-        .map((entry) => entry.canonicalKey)
-        .filter((value): value is string => typeof value === "string" && value.trim().length > 0),
-    );
-    return [...new Set(
-      importedDocuments
-        .map((document) => document.canonicalKey)
-        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-        .filter((value) => managedKeys.has(value)),
-    )];
+    };
   }
 
   private buildMissingQueryResponse(toolName: string): ToolResponse {

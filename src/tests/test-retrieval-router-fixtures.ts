@@ -36,7 +36,7 @@ const fixtures: Array<{
   { name: "shared insight fuzzy", query: "search shared insights something related", route: "vector_search" },
   { name: "shared insight direct", query: "shared insights", context: { hasSharedInsightHint: true }, route: "shared_insights" },
   { name: "knowledge hit", query: "knowledge base architecture docs", context: { hasKnowledgeHits: true }, route: "knowledge" },
-  { name: "imported knowledge", query: "imported knowledge in knowledge base", route: "knowledge" },
+  { name: "raw knowledge", query: "raw knowledge in knowledge base", route: "knowledge" },
   { name: "knowledge fuzzy vector", query: "knowledge base something related", context: { hasKnowledgeHits: false }, route: "vector_search" },
   { name: "knowledge unified miss", query: "知识库里有没有资料", context: { hasKnowledgeHits: false, memorySearchEnabled: false }, route: "knowledge" },
   { name: "navigation complex current work", query: "current task plan risk", context: { hasStructuredNavigationState: true }, route: "navigation" },
@@ -44,7 +44,7 @@ const fixtures: Array<{
   { name: "durable terms without hits", query: "constraint config", context: { hasDurableHits: false }, route: "summary_tree" },
   { name: "plain recent", query: "hello there", context: { hasCompactedHistory: false }, route: "recent_tail" },
   { name: "generic fuzzy stays tail", query: "find something related", context: { hasCompactedHistory: false }, route: "recent_tail" },
-  { name: "knowledge import hint", query: "knowledge base docs", context: { hasKnowledgeImportHint: true, hasKnowledgeHits: false }, route: "knowledge" },
+  { name: "knowledge raw hint", query: "knowledge base docs", context: { hasKnowledgeRawHint: true, hasKnowledgeHits: false }, route: "knowledge" },
   { name: "project state with navigation only", query: "current task plan next action", context: { hasStructuredNavigationState: true }, route: "navigation" },
 ];
 

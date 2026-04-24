@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -87,23 +87,24 @@ async function main(): Promise<void> {
     },
   );
 
+  await mkdir(path.join(config.knowledgeBaseDir, "raw"), { recursive: true });
   await writeFile(
-    path.join(config.knowledgeBaseDir, "topic-index.json"),
-    JSON.stringify({
-      topics: [
-        {
-          topicId: "queue retry policy",
-          latestVersion: 1,
-          latestFile: "queue-retry-policy-v1.md",
-          summary: "External policy note for queue retries.",
-        },
-      ],
-    }, null, 2),
-    "utf8",
-  );
-  await writeFile(
-    path.join(config.knowledgeBaseDir, "queue-retry-policy-v1.md"),
-    "# Imported Queue Retry Policy\n\nImported knowledge says to retry indefinitely.\n",
+    path.join(config.knowledgeBaseDir, "raw", "queue-retry-manual-note.md"),
+    [
+      "---",
+      "title: Queue Retry Manual Note",
+      "summary: Manual raw note for queue retry policy.",
+      "canonical_key: queue-retry-manual-note",
+      "tags:",
+      "  - retry",
+      "  - queue",
+      "---",
+      "",
+      "# Queue Retry Manual Note",
+      "",
+      "Manual raw knowledge says queue retries must stop rather than retry indefinitely.",
+      "",
+    ].join("\n"),
     "utf8",
   );
 
@@ -136,48 +137,29 @@ async function main(): Promise<void> {
   });
   const knowledgeText = String(knowledgeRetrieve.content[0]?.text ?? "");
   assert(/Managed knowledge says/i.test(knowledgeText), "expected retrieval to return managed knowledge content");
-  assert(/Imported knowledge says to retry indefinitely/i.test(knowledgeText), "expected retrieval to also return imported knowledge content");
-  assert(/1\.\s+Queue Retry Policy/i.test(knowledgeText), "expected the managed canonical hit to rank first for generic knowledge queries");
-  assert(knowledgeRetrieve.details.topRecordType === "managed_record", "expected generic knowledge query to prefer managed records");
-  assert(knowledgeRetrieve.details.conflictDetected === true, "expected unified knowledge retrieval to flag internal/external canonical conflicts");
+  assert(/Manual raw knowledge says queue retries must stop/i.test(knowledgeText), "expected retrieval to also return user-provided raw knowledge content");
+  assert(knowledgeRetrieve.details.topRecordType === "knowledge_record", "expected unified knowledge query to return undifferentiated knowledge records");
   assert(
-    Array.isArray(knowledgeRetrieve.details.conflictCanonicalKeys) &&
-      knowledgeRetrieve.details.conflictCanonicalKeys.includes("queue-retry-policy"),
-    "expected conflict metadata to include the shared canonical key",
+    typeof knowledgeRetrieve.details.knowledgeHitCount === "number" &&
+      knowledgeRetrieve.details.knowledgeHitCount >= 2,
+    "expected managed and manual raw records to share the same knowledge hit path",
   );
 
-  const importedRoute = await retrieval.executeMemoryRoute({
+  const rawRoute = await retrieval.executeMemoryRoute({
     sessionId: config.sessionId,
     config,
-    query: "Look in imported knowledge in the knowledge base for the queue retry policy",
+    query: "Look in raw knowledge in the knowledge base for the queue retry policy",
   });
-  assert(importedRoute.details.route === "knowledge", "expected imported knowledge queries to still use the unified knowledge route");
+  assert(rawRoute.details.route === "knowledge", "expected raw knowledge queries to still use the unified knowledge route");
 
-  const importedRetrieve = await retrieval.executeMemoryRetrieve({
+  const rawRetrieve = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
     config,
-    query: "Look in imported knowledge in the knowledge base for the queue retry policy",
+    query: "Look in raw knowledge in the knowledge base for the queue retry policy",
   });
-  const importedText = String(importedRetrieve.content[0]?.text ?? "");
-  assert(/Imported knowledge says to retry indefinitely/i.test(importedText), "expected imported knowledge queries to surface imported content through the unified corpus");
-  assert(/1\.\s+queue retry policy/i.test(importedText), "expected imported source record to rank first when the query explicitly prefers imported knowledge");
-
-  const importCachePath = path.join(
-    config.sharedDataDir,
-    "plugin-cache",
-    "knowledge-import",
-    Buffer.from(path.normalize(config.knowledgeBaseDir)).toString("hex").slice(0, 24),
-    ".chaunyoms-import-index.json",
-  );
-  await access(importCachePath);
-  let cacheLeakedIntoKnowledgeDir = false;
-  try {
-    await access(path.join(config.knowledgeBaseDir, ".chaunyoms-import-index.json"));
-    cacheLeakedIntoKnowledgeDir = true;
-  } catch {
-    // Expected: the cache file should not exist inside the external knowledge dir.
-  }
-  assert(!cacheLeakedIntoKnowledgeDir, "expected imported knowledge cache to stay outside the external knowledge directory");
+  const rawText = String(rawRetrieve.content[0]?.text ?? "");
+  assert(/Manual raw knowledge says queue retries must stop/i.test(rawText), "expected raw knowledge queries to surface manual raw content through the unified corpus");
+  assert(!("importedHitCount" in rawRetrieve.details), "expected retrieval metadata to stop splitting imported/internal counts");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-knowledge-routing-priority passed");
