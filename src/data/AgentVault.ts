@@ -64,6 +64,8 @@ export class AgentVault {
       `phase: ${entry.phase ?? ""}`,
       `promotion_intent: ${entry.promotionIntent ?? "candidate"}`,
       `parent_summary_id: ${entry.parentSummaryId ?? ""}`,
+      "parent_summary_ids:",
+      ...(entry.parentSummaryIds ?? []).map((item) => `  - ${item}`),
       `session_id: ${entry.sessionId}`,
       `created_at: ${entry.createdAt}`,
       `start_turn: ${entry.startTurn}`,

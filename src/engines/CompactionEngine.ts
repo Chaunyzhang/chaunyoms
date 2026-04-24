@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  CompactionRunResult,
   LlmCaller,
   LoggerLike,
   RawMessage,
@@ -188,7 +189,7 @@ export class CompactionEngine {
     agentId: string,
     maxTurns: number,
     bypassThreshold = false,
-  ): Promise<SummaryEntry | null> {
+  ): Promise<CompactionRunResult> {
     if (
       !bypassThreshold &&
       !this.shouldCompact(
@@ -201,7 +202,7 @@ export class CompactionEngine {
         sessionId,
       )
     ) {
-      return null;
+      return { status: "skipped", reason: "threshold_not_met" };
     }
 
     const candidate = this.selectTurnsForCompaction(
@@ -213,7 +214,7 @@ export class CompactionEngine {
       sessionId,
     );
     if (!candidate) {
-      return null;
+      return { status: "skipped", reason: "no_compaction_candidate" };
     }
 
     try {
@@ -222,11 +223,30 @@ export class CompactionEngine {
           sessionId,
           reason: "llm_unavailable",
         });
-        return null;
+        return { status: "skipped", reason: "strict_compaction_requires_llm" };
       }
 
       const sourceHash = hashRawMessages(candidate.messages);
       const sourceMessageCount = candidate.messages.length;
+      const sourceBinding = SourceMessageResolver.bindingFromMessages({
+        sessionId,
+        agentId,
+        messages: candidate.messages,
+        sourceHash,
+        sourceMessageCount,
+      });
+      const sourceTrace = SourceMessageResolver.traceFromResolution(
+        {
+          binding: sourceBinding,
+          messages: candidate.messages,
+          strategy: "message_ids",
+          verified: true,
+          reason: "compaction_source_messages_verified",
+          actualHash: sourceHash,
+          actualMessageCount: sourceMessageCount,
+        },
+        { route: "compaction" },
+      );
       const existing = summaryStore.findBySourceCoverage(
         candidate.startTurn,
         candidate.endTurn,
@@ -236,7 +256,12 @@ export class CompactionEngine {
       );
       if (existing) {
         await rawStore.markCompacted(candidate.startTurn, candidate.endTurn, { sessionId });
-        return existing;
+        return {
+          status: "deduped",
+          summary: existing,
+          sourceBinding: existing.sourceBinding ?? sourceBinding,
+          sourceTrace,
+        };
       }
 
       const summary = strictCompaction
@@ -248,7 +273,7 @@ export class CompactionEngine {
           startTurn: candidate.startTurn,
           endTurn: candidate.endTurn,
         });
-        return null;
+        return { status: "skipped", reason: "summary_unavailable" };
       }
 
       const projectIdentity = deriveProjectIdentityFromMessages(
@@ -287,13 +312,7 @@ export class CompactionEngine {
         sourceEndTimestamp: candidate.messages[candidate.messages.length - 1]?.createdAt,
         sourceSequenceMin: candidate.messages[0]?.sequence,
         sourceSequenceMax: candidate.messages[candidate.messages.length - 1]?.sequence,
-        sourceBinding: SourceMessageResolver.bindingFromMessages({
-          sessionId,
-          agentId,
-          messages: candidate.messages,
-          sourceHash,
-          sourceMessageCount,
-        }),
+        sourceBinding,
         summaryLevel: 1,
         nodeKind: "leaf",
         tokenCount: estimateTokens(summary.summary),
@@ -304,12 +323,16 @@ export class CompactionEngine {
 
       await summaryStore.addSummary(entry);
       await rawStore.markCompacted(candidate.startTurn, candidate.endTurn, { sessionId });
-      return entry;
+      return { status: "compacted", summary: entry, sourceBinding, sourceTrace };
     } catch (error) {
       this.logger.warn("compaction_skipped", {
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      return {
+        status: "failed",
+        reason: "compaction_error",
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

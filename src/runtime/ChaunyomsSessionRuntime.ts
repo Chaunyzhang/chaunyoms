@@ -15,6 +15,7 @@ import {
 import { ExternalSystemBootstrap } from "../system/ExternalSystemBootstrap";
 import {
   BridgeConfig,
+  CompactionRunResult,
   ContextItem,
   ContextViewRepository,
   DurableMemoryRepository,
@@ -110,7 +111,7 @@ export class ChaunyomsSessionRuntime {
   private compactionEngine: CompactionEngine;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private llmCaller: LlmCaller | null;
-  private compactionInFlight: Promise<SummaryEntry | null> | null = null;
+  private compactionInFlight: Promise<CompactionRunResult> | null = null;
   private knowledgeMaintenanceInFlight: Promise<void> | null = null;
   private readonly pendingKnowledgeMaintenance = new Map<string, {
     sessionId: string;
@@ -298,19 +299,20 @@ export class ChaunyomsSessionRuntime {
       context.runtimeMessages,
     );
     const tokensBefore = rawStore.totalUncompactedTokens({ sessionId: context.sessionId });
-    const entry = await this.runSerializedCompaction(
+    const compaction = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
       context,
     );
 
-    if (!entry) {
+    if (compaction.status !== "compacted" && compaction.status !== "deduped") {
       return {
         ok: true,
         compacted: false,
-        reason: "threshold_not_met_or_no_candidate",
+        reason: compaction.reason,
       };
     }
+    const entry = compaction.summary;
 
     await this.enqueueSummaryForKnowledge(entry, context);
     await this.rollUpSummaryTree(summaryStore, context);
@@ -339,6 +341,7 @@ export class ChaunyomsSessionRuntime {
           startTurn: entry.startTurn,
           endTurn: entry.endTurn,
           summaryId: entry.id,
+          sourceTrace: compaction.sourceTrace,
         },
       },
     };
@@ -710,11 +713,14 @@ export class ChaunyomsSessionRuntime {
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
   ): Promise<{ compacted: boolean; entry: SummaryEntry | null }> {
-    const entry = await this.runSerializedCompaction(
+    const compaction = await this.runSerializedCompaction(
       rawStore,
       summaryStore,
       context,
     );
+    const entry = compaction.status === "compacted" || compaction.status === "deduped"
+      ? compaction.summary
+      : null;
     return { compacted: Boolean(entry), entry };
   }
 
@@ -746,17 +752,18 @@ export class ChaunyomsSessionRuntime {
         );
       }
 
-      const entry = await this.runSerializedCompaction(
+      const compaction = await this.runSerializedCompaction(
         rawStore,
         summaryStore,
         context,
         true,
       );
-      if (!entry) {
+      if (compaction.status !== "compacted" && compaction.status !== "deduped") {
         throw new Error(
-          `Compaction barrier could not recover compressible history budget (session=${context.sessionId}, compressibleTokens=${budgetState.compressibleHistoryTokens}, budget=${budgetState.compressibleHistoryBudget})`,
+          `Compaction barrier could not recover compressible history budget (session=${context.sessionId}, reason=${compaction.reason}, compressibleTokens=${budgetState.compressibleHistoryTokens}, budget=${budgetState.compressibleHistoryBudget})`,
         );
       }
+      const entry = compaction.summary;
 
       await this.enqueueSummaryForKnowledge(entry, context);
       await this.rollUpSummaryTree(summaryStore, context);
@@ -1165,7 +1172,7 @@ export class ChaunyomsSessionRuntime {
     summaryStore: SummaryRepository,
     context: LifecycleContext,
     bypassThreshold = false,
-  ): Promise<SummaryEntry | null> {
+  ): Promise<CompactionRunResult> {
     if (this.compactionInFlight) {
       return await this.compactionInFlight;
     }
@@ -1188,11 +1195,11 @@ export class ChaunyomsSessionRuntime {
     this.compactionInFlight = run;
 
     try {
-      const entry = await run;
-      if (entry) {
+      const result = await run;
+      if (result.status === "compacted" || result.status === "deduped") {
         this.navigationSnapshotPending = true;
       }
-      return entry;
+      return result;
     } finally {
       if (this.compactionInFlight === run) {
         this.compactionInFlight = null;

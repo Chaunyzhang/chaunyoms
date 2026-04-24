@@ -69,10 +69,12 @@ export class SummaryIndexStore implements SummaryRepository {
       if (!childSummaryIds.includes(summary.id)) {
         return summary;
       }
+      const parentSummaryIds = [...new Set([...(summary.parentSummaryIds ?? []), parentSummaryId])];
       changed = true;
       return this.normalizeSummary({
         ...summary,
-        parentSummaryId,
+        parentSummaryId: summary.parentSummaryId ?? parentSummaryId,
+        parentSummaryIds,
       });
     });
 
@@ -102,7 +104,10 @@ export class SummaryIndexStore implements SummaryRepository {
   }
 
   getRootSummaries(options: { sessionId?: string } = {}): SummaryEntry[] {
-    return this.getActiveSummaries(options).filter((entry) => !entry.parentSummaryId);
+    return this.getActiveSummaries(options).filter((entry) => (
+      !entry.parentSummaryId &&
+      (!Array.isArray(entry.parentSummaryIds) || entry.parentSummaryIds.length === 0)
+    ));
   }
 
   getCoveredTurns(options: { sessionId?: string } = {}): Set<number> {
@@ -278,6 +283,10 @@ export class SummaryIndexStore implements SummaryRepository {
       recordStatus: entry.recordStatus ?? "active",
       childSummaryIds: [...new Set(entry.childSummaryIds ?? [])],
       sourceSummaryIds: [...new Set(entry.sourceSummaryIds ?? [])],
+      parentSummaryIds: [...new Set([
+        ...(entry.parentSummaryIds ?? []),
+        ...(entry.parentSummaryId ? [entry.parentSummaryId] : []),
+      ])],
       sourceMessageIds: [...new Set(entry.sourceMessageIds ?? [])],
       sourceBinding: entry.sourceBinding,
       summaryLevel: entry.summaryLevel ?? 1,

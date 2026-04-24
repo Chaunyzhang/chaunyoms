@@ -2,6 +2,7 @@ import {
   EvidenceBinding,
   RawMessage,
   RawMessageRepository,
+  SourceTrace,
   SummaryEntry,
 } from "../types";
 import { hashRawMessages } from "../utils/integrity";
@@ -70,6 +71,34 @@ export class SourceMessageResolver {
       turnEnd: messages[messages.length - 1]?.turnNumber,
       sourceHash: args.sourceHash ?? hashRawMessages(messages),
       sourceMessageCount: args.sourceMessageCount ?? messages.length,
+    };
+  }
+
+  static traceFromResolution(
+    resolution: SourceMessageResolution,
+    args: {
+      route: SourceTrace["route"];
+      summaryId?: string;
+    },
+  ): SourceTrace {
+    const { binding } = resolution;
+    return {
+      route: args.route,
+      summaryId: args.summaryId,
+      sessionId: binding.sessionId,
+      agentId: binding.agentId,
+      strategy: resolution.strategy,
+      verified: resolution.verified,
+      reason: resolution.reason,
+      sourceHash: binding.sourceHash,
+      actualHash: resolution.actualHash,
+      sourceMessageCount: binding.sourceMessageCount,
+      resolvedMessageCount: resolution.messages.length,
+      turnStart: binding.turnStart,
+      turnEnd: binding.turnEnd,
+      sequenceMin: binding.sequenceMin,
+      sequenceMax: binding.sequenceMax,
+      messageIds: binding.messageIds.length > 0 ? binding.messageIds : undefined,
     };
   }
 

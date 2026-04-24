@@ -4,9 +4,11 @@ import {
   SummaryRepository,
 } from "../types";
 import { SourceMessageResolver } from "./SourceMessageResolver";
+import { SummaryDagResolver } from "./SummaryDagResolver";
 
 export class RecallResolver {
   private readonly sourceResolver = new SourceMessageResolver();
+  private readonly dagResolver = new SummaryDagResolver();
 
   resolve(
     query: string,
@@ -16,19 +18,27 @@ export class RecallResolver {
   ): RecallResult {
     const queryTerms = this.queryTerms(query);
     const numericAnchors = query.match(/\b\d{2,}\b/g) ?? [];
-    const hits = summaryStore.search(query);
+    const traversal = this.dagResolver.resolve(query, summaryStore);
+    const hits = traversal.summaries;
     const items: RecallResult["items"] = [];
+    const sourceTrace: RecallResult["sourceTrace"] = [];
+    const dagTrace: RecallResult["dagTrace"] = traversal.trace;
     let consumedTokens = 0;
 
     for (const hit of hits) {
+      const resolution = this.sourceResolver.resolve(rawStore, hit);
+      sourceTrace.push(SourceMessageResolver.traceFromResolution(resolution, {
+        route: "summary_tree",
+        summaryId: hit.id,
+      }));
       const messages = this.prioritizeMessages(
-        this.sourceResolver.resolve(rawStore, hit).messages,
+        resolution.messages,
         queryTerms,
         numericAnchors,
       );
       for (const message of messages) {
         if (consumedTokens + message.tokenCount > recallBudget && items.length > 0) {
-          return { items, consumedTokens };
+          return { items, consumedTokens, sourceTrace, dagTrace };
         }
 
         consumedTokens += message.tokenCount;
@@ -38,12 +48,17 @@ export class RecallResolver {
           turnNumber: message.turnNumber,
           role: message.role,
           content: message.content,
-          metadata: message.metadata,
+          metadata: {
+            ...(message.metadata ?? {}),
+            sourceSummaryId: hit.id,
+            sourceResolutionStrategy: resolution.strategy,
+            sourceVerified: resolution.verified,
+          },
         });
       }
     }
 
-    return { items, consumedTokens };
+    return { items, consumedTokens, sourceTrace, dagTrace };
   }
 
   private prioritizeMessages(

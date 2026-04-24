@@ -89,6 +89,7 @@ export class SummaryHierarchyEngine {
       },
       sourceSummaryIds,
       childSummaryIds: [...sourceSummaryIds],
+      parentSummaryIds: [],
       summaryLevel: (candidateGroup[0].summaryLevel ?? 1) + 1,
       nodeKind: "branch",
       tokenCount: estimateTokens(result.summary),

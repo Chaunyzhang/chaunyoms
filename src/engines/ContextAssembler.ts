@@ -85,22 +85,27 @@ export class ContextAssembler {
     const recentMessages = rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns, { sessionId });
     const selected: ContextItem[] = [];
     let consumed = 0;
+    const turnNumbers = [...new Set(recentMessages.map((message) => message.turnNumber))];
 
-    for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
-      const message = recentMessages[index];
-      if (consumed + message.tokenCount > budget && selected.length > 0) {
+    for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
+      const turnNumber = turnNumbers[index];
+      const turnMessages = recentMessages.filter((message) => message.turnNumber === turnNumber);
+      const turnTokens = turnMessages.reduce((sum, message) => sum + message.tokenCount, 0);
+      if (consumed + turnTokens > budget && selected.length > 0) {
         break;
       }
 
-      consumed += message.tokenCount;
-      selected.unshift({
-        kind: "message",
-        tokenCount: message.tokenCount,
-        turnNumber: message.turnNumber,
-        role: message.role,
-        content: message.content,
-        metadata: message.metadata,
-      });
+      consumed += turnTokens;
+      selected.unshift(
+        ...turnMessages.map((message) => ({
+          kind: "message" as const,
+          tokenCount: message.tokenCount,
+          turnNumber: message.turnNumber,
+          role: message.role,
+          content: message.content,
+          metadata: message.metadata,
+        })),
+      );
     }
 
     return selected;
@@ -145,6 +150,7 @@ export class ContextAssembler {
           summaryLevel: summary.summaryLevel,
           nodeKind: summary.nodeKind,
           parentSummaryId: summary.parentSummaryId,
+          parentSummaryIds: summary.parentSummaryIds,
           childSummaryIds: summary.childSummaryIds,
           sourceSummaryIds: summary.sourceSummaryIds,
           startTurn: summary.startTurn,

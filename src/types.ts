@@ -153,6 +153,7 @@ export interface SummaryEntry {
   sourceBinding?: EvidenceBinding;
   sourceSummaryIds?: string[];
   parentSummaryId?: string;
+  parentSummaryIds?: string[];
   childSummaryIds?: string[];
   summaryLevel?: number;
   nodeKind?: SummaryNodeKind;
@@ -459,6 +460,31 @@ export interface ContextItem {
   metadata?: Record<string, unknown>;
 }
 
+export interface SourceTrace {
+  route: RetrievalRoute | "compaction" | "knowledge_promotion";
+  summaryId?: string;
+  sessionId: string;
+  agentId?: string;
+  strategy: "message_ids" | "sequence_range" | "turn_range" | "none";
+  verified: boolean;
+  reason: string;
+  sourceHash?: string;
+  actualHash?: string;
+  sourceMessageCount?: number;
+  resolvedMessageCount: number;
+  turnStart?: number;
+  turnEnd?: number;
+  sequenceMin?: number;
+  sequenceMax?: number;
+  messageIds?: string[];
+}
+
+export interface FallbackTrace {
+  from: RetrievalRoute | "assemble" | "compaction" | "knowledge_promotion";
+  to: RetrievalRoute | "recent_tail" | "durable_memory" | "none";
+  reason: string;
+}
+
 export interface ContextViewRepository {
   setItems(items: ContextItem[]): void;
   getItems(): ContextItem[];
@@ -581,6 +607,20 @@ export interface BridgeConfig {
 export interface RecallResult {
   items: ContextItem[];
   consumedTokens: number;
+  sourceTrace: SourceTrace[];
+  dagTrace: DagTraversalStep[];
+}
+
+export interface DagTraversalStep {
+  summaryId: string;
+  sessionId: string;
+  summaryLevel: number;
+  nodeKind: SummaryNodeKind;
+  score: number;
+  reasons: string[];
+  action: "root_candidate" | "descend" | "leaf_selected" | "branch_fallback" | "direct_leaf_hit";
+  parentSummaryIds?: string[];
+  childSummaryIds?: string[];
 }
 
 export interface ProjectStateSnapshot {
@@ -619,4 +659,34 @@ export interface RetrievalDecision {
   explanation: string;
   matchedProjectId?: string;
   matchedProjectTitle?: string;
+  layerScores?: RetrievalLayerScore[];
 }
+
+export interface RetrievalLayerScore {
+  route: RetrievalRoute;
+  score: number;
+  reasons: string[];
+}
+
+export type CompactionRunResult =
+  | {
+      status: "compacted";
+      summary: SummaryEntry;
+      sourceBinding: EvidenceBinding;
+      sourceTrace: SourceTrace;
+    }
+  | {
+      status: "deduped";
+      summary: SummaryEntry;
+      sourceBinding: EvidenceBinding;
+      sourceTrace: SourceTrace;
+    }
+  | {
+      status: "skipped";
+      reason: string;
+    }
+  | {
+      status: "failed";
+      reason: string;
+      error?: string;
+    };

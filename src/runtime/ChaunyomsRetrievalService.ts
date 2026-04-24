@@ -62,6 +62,7 @@ export class ChaunyomsRetrievalService {
               requiresSourceRecall: decision.requiresSourceRecall,
               canAnswerDirectly: decision.canAnswerDirectly,
               routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
               explanation: decision.explanation,
               matchedProjectId: decision.matchedProjectId ?? null,
               matchedProjectTitle: decision.matchedProjectTitle ?? null,
@@ -83,6 +84,7 @@ export class ChaunyomsRetrievalService {
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
         retrievalHitType: this.getRetrievalHitType(decision),
         matchedProjectId: decision.matchedProjectId ?? null,
@@ -137,7 +139,10 @@ export class ChaunyomsRetrievalService {
         hitCount: result.items.length,
         retrievalHitType: this.getRetrievalHitType(decision),
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
+        dagTrace: result.dagTrace,
+        sourceTrace: result.sourceTrace,
       },
     };
   }
@@ -184,6 +189,7 @@ export class ChaunyomsRetrievalService {
           ok: true,
           route: decision.route,
           routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
           explanation: decision.explanation,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
@@ -228,7 +234,10 @@ export class ChaunyomsRetrievalService {
             autoRecall: true,
             autoRecallReason: this.explainAutoRecall(decision, context),
             routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
             explanation: decision.explanation,
+            dagTrace: result.dagTrace,
+            sourceTrace: result.sourceTrace,
           },
         };
     }
@@ -273,6 +282,7 @@ export class ChaunyomsRetrievalService {
             autoRecall: false,
             autoRecallReason: null,
             routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
             explanation: decision.explanation,
             source: vector.source,
             score: vector.score ?? null,
@@ -293,10 +303,16 @@ export class ChaunyomsRetrievalService {
           retrievalHitType: "durable_memory",
           autoRecall: false,
           autoRecallReason: null,
-          routePlan: decision.routePlan,
-          explanation: decision.explanation,
-        },
-      };
+            routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
+            explanation: decision.explanation,
+            fallbackTrace: [{
+              from: decision.route,
+              to: "durable_memory",
+              reason: "primary_route_empty_but_durable_hits_available",
+            }],
+          },
+        };
     }
 
     const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
@@ -312,7 +328,15 @@ export class ChaunyomsRetrievalService {
         hitCount: result.items.length,
         retrievalHitType: this.getRetrievalHitType(decision),
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
+        fallbackTrace: [{
+          from: decision.route,
+          to: "summary_tree",
+          reason: "primary_route_empty_or_no_direct_hit",
+        }],
+        dagTrace: result.dagTrace,
+        sourceTrace: result.sourceTrace,
       },
     };
   }
@@ -674,6 +698,7 @@ export class ChaunyomsRetrievalService {
         autoRecall: false,
         autoRecallReason: null,
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
       },
       };
@@ -719,7 +744,13 @@ export class ChaunyomsRetrievalService {
         requiresEmbeddings: true,
         retrievalHitType: this.getRetrievalHitType(decision),
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
+        fallbackTrace: [{
+          from: decision.route,
+          to: "none",
+          reason: "embeddings_configuration_required",
+        }],
       },
     };
   }
@@ -747,7 +778,13 @@ export class ChaunyomsRetrievalService {
         emergencyBrake: context.config.emergencyBrake,
         autoRecallEnabled: context.config.autoRecallEnabled,
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
+        fallbackTrace: [{
+          from: decision.route,
+          to: durableHits.length > 0 ? "durable_memory" : "none",
+          reason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
+        }],
       },
     };
   }
@@ -941,6 +978,7 @@ export class ChaunyomsRetrievalService {
         query,
         retrievalHitType: "project_registry",
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
         matchedProjectId: project?.id ?? decision.matchedProjectId ?? null,
         matchedProjectTitle: project?.title ?? decision.matchedProjectTitle ?? null,
@@ -1011,9 +1049,15 @@ export class ChaunyomsRetrievalService {
         autoRecall: false,
         autoRecallReason: null,
         routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
         matchedProjectId: decision.matchedProjectId ?? null,
         matchedProjectTitle: decision.matchedProjectTitle ?? null,
+        fallbackTrace: hit ? [] : [{
+          from: decision.route,
+          to: "none",
+          reason: "route_hit_not_found",
+        }],
       },
     };
   }

@@ -1,4 +1,4 @@
-﻿import { RetrievalDecision, RetrievalRoute } from "../types";
+﻿import { RetrievalDecision, RetrievalLayerScore, RetrievalRoute } from "../types";
 
 const FACT_RECALL_RE = /(原话|原文|精确|准确|参数|细节|约束|配置|quote|exact|verbatim|parameter|constraint|detail)/i;
 const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未解决|阻塞|决策|status|state|progress|next step|next action|todo|pending|blocker|blocked|decision|where we left off)/i;
@@ -29,8 +29,11 @@ export interface RouteContext {
 }
 
 export class MemoryRetrievalRouter {
+  private currentLayerScores: RetrievalLayerScore[] = [];
+
   decide(query: string, context: RouteContext): RetrievalDecision {
     const normalized = query.trim();
+    this.currentLayerScores = this.scoreLayers(normalized, context);
     if (!normalized) {
       return this.decision("recent_tail", "empty_query_defaults_to_recent_tail", false, false, true, ["recent_tail"], "Empty query defaults to the recent conversational tail.");
     }
@@ -205,6 +208,85 @@ export class MemoryRetrievalRouter {
       explanation,
       matchedProjectId,
       matchedProjectTitle,
+      layerScores: this.currentLayerScores,
     };
+  }
+
+  private scoreLayers(query: string, context: RouteContext): RetrievalLayerScore[] {
+    const scores = new Map<RetrievalRoute, { score: number; reasons: string[] }>();
+    const add = (route: RetrievalRoute, score: number, reason: string) => {
+      const current = scores.get(route) ?? { score: 0, reasons: [] };
+      current.score += score;
+      current.reasons.push(reason);
+      scores.set(route, current);
+    };
+
+    if (!query) {
+      add("recent_tail", 5, "empty_query");
+      return this.sortedScores(scores);
+    }
+
+    const needsFacts = FACT_RECALL_RE.test(query);
+    const asksProjectState = PROJECT_STATE_RE.test(query);
+    const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(query);
+    const asksHistory = HISTORY_RE.test(query);
+    const asksDurable = DURABLE_RE.test(query);
+    const mentionsInsights = SHARED_INSIGHTS_RE.test(query);
+    const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(query);
+    const asksImportedKnowledge = IMPORTED_KNOWLEDGE_RE.test(query);
+    const fuzzyLookup = FUZZY_SEARCH_RE.test(query);
+    const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
+
+    if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
+    if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
+    if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");
+
+    if (asksProjectState) add("project_registry", 7, "project_state_terms");
+    if (referencesCurrentWork) add("project_registry", 4, "references_current_work");
+    if (context.hasProjectRegistry) add("project_registry", 2, "project_registry_available");
+    if (context.matchedProjectId) add("project_registry", 3, "matched_project");
+
+    if (asksDurable) add("durable_memory", 7, "durable_terms");
+    if (context.hasDurableHits) add("durable_memory", 4, "durable_hits_available");
+    if (context.matchedProjectId && context.hasDurableHits) add("durable_memory", 2, "matched_project_durable_hits");
+
+    if (mentionsKnowledge) add("knowledge", 8, "knowledge_terms");
+    if (asksImportedKnowledge) add("knowledge", 5, "imported_knowledge_terms");
+    if (context.hasKnowledgeHits) add("knowledge", 4, "knowledge_hits_available");
+    if (context.hasKnowledgeImportHint) add("knowledge", 3, "knowledge_import_hint");
+
+    if (mentionsInsights) add("shared_insights", 7, "shared_insight_terms");
+    if (context.hasSharedInsightHint) add("shared_insights", 4, "shared_insight_hint");
+
+    if (context.hasStructuredNavigationState) add("navigation", 4, "structured_navigation_available");
+    if (context.hasNavigationHint) add("navigation", 4, "navigation_hint");
+    if ((complexTask || context.recentAssistantUncertainty) && referencesCurrentWork) {
+      add("navigation", 3, complexTask ? "complex_current_work_query" : "assistant_uncertainty");
+    }
+
+    if (fuzzyLookup && context.memorySearchEnabled) add("vector_search", 6, "fuzzy_lookup_with_embeddings");
+    if (mentionsKnowledge && fuzzyLookup && !context.hasKnowledgeHits && context.memorySearchEnabled) {
+      add("vector_search", 3, "knowledge_fuzzy_without_direct_hit");
+    }
+    if (mentionsInsights && fuzzyLookup && context.memorySearchEnabled) {
+      add("vector_search", 3, "shared_insights_fuzzy_lookup");
+    }
+
+    add("recent_tail", 1, "default_available");
+    if (!needsFacts && !asksHistory && !mentionsKnowledge && !asksDurable && !asksProjectState) {
+      add("recent_tail", 3, "no_structured_signal");
+    }
+
+    return this.sortedScores(scores);
+  }
+
+  private sortedScores(scores: Map<RetrievalRoute, { score: number; reasons: string[] }>): RetrievalLayerScore[] {
+    return [...scores.entries()]
+      .map(([route, item]) => ({
+        route,
+        score: item.score,
+        reasons: [...new Set(item.reasons)],
+      }))
+      .sort((left, right) => right.score - left.score || left.route.localeCompare(right.route));
   }
 }
