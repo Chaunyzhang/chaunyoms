@@ -19,6 +19,9 @@
     "typescript": "^5.9.0"
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json"
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
+    "test:compiled": "node scripts/run-compiled-tests.cjs",
+    "test": "npm run build && npm run test:compiled",
+    "check": "npm test && npm audit --omit=dev"
   }
 }

@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { BridgeConfig, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
+import { isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
 
 export interface ToolConfigResult {
   enabled: boolean;
@@ -40,42 +41,76 @@ export interface IngestPayload {
   metadata?: Record<string, unknown>;
 }
 
+interface PayloadMessage extends Record<string, unknown> {
+  content?: unknown;
+  id?: unknown;
+  metadata?: unknown;
+  role?: unknown;
+  turnNumber?: unknown;
+}
+
+interface OpenClawPayloadLike extends Record<string, unknown> {
+  agent?: Record<string, unknown>;
+  agentId?: unknown;
+  config?: Record<string, unknown>;
+  content?: unknown;
+  context?: Record<string, unknown>;
+  contextWindow?: unknown;
+  conversation?: Record<string, unknown>;
+  id?: unknown;
+  input?: Record<string, unknown>;
+  message?: PayloadMessage;
+  messages?: unknown;
+  metadata?: unknown;
+  model?: unknown;
+  role?: unknown;
+  session?: Record<string, unknown>;
+  sessionId?: unknown;
+  systemPrompt?: unknown;
+  systemPromptTokens?: unknown;
+  tokenBudget?: unknown;
+  turn?: Record<string, unknown>;
+  turnNumber?: unknown;
+}
+
 export class OpenClawPayloadAdapter {
   constructor(
-    private readonly getApi: () => any,
+    private readonly getApi: () => OpenClawApiLike | undefined,
     private readonly getLogger: () => LoggerLike,
   ) {}
 
   resolveLifecycleContext(
-    payload?: any,
+    payload?: unknown,
     currentConfig: BridgeConfig = DEFAULT_BRIDGE_CONFIG,
   ): LifecycleContext {
-    const config = this.resolveConfig(payload, currentConfig);
+    const payloadRecord = this.toPayloadRecord(payload);
+    const config = this.resolveConfig(payloadRecord, currentConfig);
     return {
-      sessionId: this.resolveSessionId(payload, currentConfig),
+      sessionId: this.resolveSessionId(payloadRecord, currentConfig),
       config,
-      totalBudget: this.resolveContextWindow(payload, config),
-      systemPromptTokens: this.resolveSystemPromptTokens(payload),
-      summaryModel: this.resolveSummaryModel(payload, config),
-      runtimeMessages: this.extractRuntimeMessages(payload),
+      totalBudget: this.resolveContextWindow(payloadRecord, config),
+      systemPromptTokens: this.resolveSystemPromptTokens(payloadRecord),
+      summaryModel: this.resolveSummaryModel(payloadRecord, config),
+      runtimeMessages: this.extractRuntimeMessages(payloadRecord),
     };
   }
 
   resolveIngestPayload(
-    payload?: any,
+    payload?: unknown,
     currentConfig: BridgeConfig = DEFAULT_BRIDGE_CONFIG,
   ): IngestPayload {
-    const context = this.resolveLifecycleContext(payload, currentConfig);
+    const payloadRecord = this.toPayloadRecord(payload);
+    const context = this.resolveLifecycleContext(payloadRecord, currentConfig);
     return {
       sessionId: context.sessionId,
       config: context.config,
-      id: this.resolveMessageId(payload),
-      role: this.resolveRole(payload),
+      id: this.resolveMessageId(payloadRecord),
+      role: this.resolveRole(payloadRecord),
       content: this.extractTextFromContent(
-        payload?.message?.content ?? payload?.content,
+        payloadRecord.message?.content ?? payloadRecord.content,
       ),
-      turnNumber: this.resolveExplicitTurnNumber(payload),
-      metadata: this.resolveMetadata(payload),
+      turnNumber: this.resolveExplicitTurnNumber(payloadRecord),
+      metadata: this.resolveMetadata(payloadRecord),
     };
   }
 
@@ -87,7 +122,9 @@ export class OpenClawPayloadAdapter {
       api?.runtime?.config ??
       api?.context?.config ??
       {};
-    const runtimeEnableTools = runtimeConfig?.enableTools;
+    const runtimeEnableTools = isHostRecord(runtimeConfig)
+      ? runtimeConfig.enableTools
+      : undefined;
     if (runtimeEnableTools === true) {
       return {
         enabled: true,
@@ -172,19 +209,19 @@ export class OpenClawPayloadAdapter {
   }
 
   private resolveConfig(
-    payload: any,
+    payload: OpenClawPayloadLike,
     currentConfig: BridgeConfig,
   ): BridgeConfig {
-    const pluginConfig =
-      payload?.config ??
+    const pluginConfig = this.firstRecordCandidate(
+      payload.config,
       this.getApi()?.pluginConfig ??
-      this.getApi()?.context?.pluginConfig ??
-      this.getApi()?.runtime?.pluginConfig ??
-      this.getApi()?.config?.plugins?.entries?.chaunyoms?.config ??
-      this.getApi()?.context?.config?.plugins?.entries?.chaunyoms?.config ??
-      this.getApi()?.runtime?.config?.plugins?.entries?.chaunyoms?.config ??
-      this.getApi()?.config ??
-      {};
+        this.getApi()?.context?.pluginConfig ??
+        this.getApi()?.runtime?.pluginConfig ??
+        this.getApi()?.config?.plugins?.entries?.chaunyoms?.config ??
+        this.getApi()?.context?.config?.plugins?.entries?.chaunyoms?.config ??
+        this.getApi()?.runtime?.config?.plugins?.entries?.chaunyoms?.config ??
+        this.getApi()?.config,
+    ) ?? {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
     const sharedDataDir = this.resolveDirectoryValue(
       pluginConfig.sharedDataDir,
@@ -408,20 +445,22 @@ export class OpenClawPayloadAdapter {
   }
 
   private resolveSessionId(
-    payload: any,
+    payload: OpenClawPayloadLike,
     currentConfig: BridgeConfig,
   ): string {
-    return (
+    const value =
       payload?.sessionId ??
       payload?.session?.id ??
       this.getApi()?.session?.id ??
       currentConfig.sessionId ??
-      DEFAULT_BRIDGE_CONFIG.sessionId
-    );
+      DEFAULT_BRIDGE_CONFIG.sessionId;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : DEFAULT_BRIDGE_CONFIG.sessionId;
   }
 
   private resolveAgentId(
-    payload: any,
+    payload: OpenClawPayloadLike,
     currentConfig: BridgeConfig,
   ): string {
     const direct =
@@ -439,15 +478,24 @@ export class OpenClawPayloadAdapter {
       : DEFAULT_BRIDGE_CONFIG.agentId;
   }
 
-  private resolveMessageId(payload: any): string {
-    return payload?.message?.id ?? payload?.id ?? crypto.randomUUID();
+  private resolveMessageId(payload: OpenClawPayloadLike): string {
+    const value = payload?.message?.id ?? payload?.id;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : crypto.randomUUID();
   }
 
-  private resolveRole(payload: any): RawMessage["role"] {
-    return payload?.message?.role ?? payload?.role ?? "user";
+  private resolveRole(payload: OpenClawPayloadLike): RawMessage["role"] {
+    const value = payload?.message?.role ?? payload?.role;
+    return value === "system" ||
+      value === "user" ||
+      value === "assistant" ||
+      value === "tool"
+      ? value
+      : "user";
   }
 
-  private resolveExplicitTurnNumber(payload: any): number | undefined {
+  private resolveExplicitTurnNumber(payload: OpenClawPayloadLike): number | undefined {
     if (typeof payload?.turnNumber === "number") {
       return payload.turnNumber;
     }
@@ -457,12 +505,13 @@ export class OpenClawPayloadAdapter {
     return undefined;
   }
 
-  private resolveMetadata(payload: any): Record<string, unknown> | undefined {
-    return payload?.message?.metadata ?? payload?.metadata;
+  private resolveMetadata(payload: OpenClawPayloadLike): Record<string, unknown> | undefined {
+    const metadata = payload?.message?.metadata ?? payload?.metadata;
+    return isHostRecord(metadata) ? metadata : undefined;
   }
 
   private resolveContextWindow(
-    payload: any,
+    payload: OpenClawPayloadLike,
     config: BridgeConfig,
   ): number {
     const runtimeBudget = Number(
@@ -483,15 +532,17 @@ export class OpenClawPayloadAdapter {
     return configuredBudget;
   }
 
-  private resolveSystemPromptTokens(payload: any): number {
+  private resolveSystemPromptTokens(payload: OpenClawPayloadLike): number {
     if (typeof payload?.systemPromptTokens === "number") {
       return payload.systemPromptTokens;
     }
-    return this.estimateTokens(payload?.systemPrompt ?? "");
+    return this.estimateTokens(
+      typeof payload?.systemPrompt === "string" ? payload.systemPrompt : "",
+    );
   }
 
   private resolveSummaryModel(
-    payload: any,
+    payload: OpenClawPayloadLike,
     config: BridgeConfig,
   ): string | undefined {
     if (typeof config.summaryModel === "string" && config.summaryModel.trim()) {
@@ -560,7 +611,7 @@ export class OpenClawPayloadAdapter {
     return modelId;
   }
 
-  private extractRuntimeMessages(payload: any): RuntimeMessageSnapshot[] {
+  private extractRuntimeMessages(payload: OpenClawPayloadLike): RuntimeMessageSnapshot[] {
     const candidates = [
       payload?.messages,
       payload?.conversation?.messages,
@@ -782,6 +833,16 @@ export class OpenClawPayloadAdapter {
       });
       return undefined;
     }
+  }
+
+  private toPayloadRecord(payload: unknown): OpenClawPayloadLike {
+    return isHostRecord(payload) ? payload : {};
+  }
+
+  private firstRecordCandidate(
+    ...candidates: unknown[]
+  ): Record<string, unknown> | null {
+    return candidates.find(isHostRecord) ?? null;
   }
 }
 

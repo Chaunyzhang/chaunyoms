@@ -28,6 +28,16 @@ export class DataSchemaRegistry {
 
   async init(): Promise<void> {
     await mkdir(this.baseDir, { recursive: true });
+    const registry = await this.readExistingRegistry();
+    if (registry) {
+      this.registry = registry;
+      return;
+    }
+
+    await this.flush();
+  }
+
+  private async readExistingRegistry(): Promise<DataSchemaRegistryFileV1 | null> {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as DataSchemaRegistryFileV1;
@@ -38,12 +48,13 @@ export class DataSchemaRegistry {
         parsed.stores &&
         typeof parsed.stores === "object"
       ) {
-        this.registry = parsed;
-        return;
+        return parsed;
       }
-    } catch {}
-
-    await this.flush();
+    } catch {
+      // Missing or corrupt registry files are expected on first run or after
+      // manual cleanup; init() rewrites a clean registry below.
+    }
+    return null;
   }
 
   async ensureCurrentVersions(): Promise<Array<{ storeKey: string; from: number; to: number }>> {

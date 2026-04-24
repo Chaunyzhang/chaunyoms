@@ -8,6 +8,7 @@ import {
   OpenClawPayloadAdapter,
   ToolConfigResult,
 } from "./host/OpenClawPayloadAdapter";
+import { OpenClawApiLike } from "./host/OpenClawHostTypes";
 import {
   ChaunyomsSessionRuntime,
 } from "./runtime/ChaunyomsSessionRuntime";
@@ -17,7 +18,7 @@ import { StablePrefixAdapter } from "./data/StablePrefixAdapter";
 import { VectorSearchFallbackStore } from "./data/VectorSearchFallbackStore";
 
 export class OpenClawBridge {
-  private api: any;
+  private api?: OpenClawApiLike;
   private logger: LoggerLike = new ConsoleLogger();
   private readonly payloadAdapter = new OpenClawPayloadAdapter(
     () => this.api,
@@ -44,7 +45,7 @@ export class OpenClawBridge {
   );
   private readonly embeddingsPromptedSessions = new Set<string>();
 
-  register(api: any): void {
+  register(api: OpenClawApiLike): void {
     this.api = api;
     this.logger = api?.logger ?? this.logger;
     this.runtime.updateHost(this.logger, new OpenClawLlmCaller(api, this.logger));
@@ -82,7 +83,7 @@ export class OpenClawBridge {
     }
   }
 
-  async bootstrap(payload?: any): Promise<{
+  async bootstrap(payload?: unknown): Promise<{
     bootstrapped: boolean;
     importedMessages?: number;
     reason?: string;
@@ -100,7 +101,7 @@ export class OpenClawBridge {
     };
   }
 
-  async ingest(payload?: any): Promise<{ ingested: boolean }> {
+  async ingest(payload?: unknown): Promise<{ ingested: boolean }> {
     const ingestPayload = this.payloadAdapter.resolveIngestPayload(
       payload,
       this.runtime.getConfig(),
@@ -108,7 +109,7 @@ export class OpenClawBridge {
     return await this.runtime.ingest(ingestPayload);
   }
 
-  async assemble(payload?: any): Promise<{
+  async assemble(payload?: unknown): Promise<{
     messages: Array<Record<string, unknown>>;
     estimatedTokens: number;
     systemPromptAddition?: string;
@@ -147,7 +148,7 @@ export class OpenClawBridge {
     };
   }
 
-  async compact(payload?: any): Promise<{
+  async compact(payload?: unknown): Promise<{
     ok: boolean;
     compacted: boolean;
     reason?: string;
@@ -165,7 +166,7 @@ export class OpenClawBridge {
     return await this.runtime.compact(context);
   }
 
-  async afterTurn(payload?: any): Promise<{ ok: true }> {
+  async afterTurn(payload?: unknown): Promise<{ ok: true }> {
     const context = this.payloadAdapter.resolveLifecycleContext(
       payload,
       this.runtime.getConfig(),
@@ -174,14 +175,14 @@ export class OpenClawBridge {
     return { ok: true };
   }
 
-  private registerTools(api: any): void {
+  private registerTools(api: OpenClawApiLike): void {
     const register = (
       name: string,
       description: string,
       parameters: Record<string, unknown>,
-      execute: (_toolCallId: string, args: any) => Promise<unknown>,
+      execute: (_toolCallId: string, args: unknown) => Promise<unknown>,
     ) => {
-      api.registerTool({
+      api.registerTool?.({
         name,
         description,
         parameters,
@@ -203,7 +204,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeMemoryRoute(args),
     );
 
@@ -225,7 +226,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeRecallDetail(args),
     );
 
@@ -247,7 +248,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeMemoryRetrieve(args),
     );
 
@@ -259,7 +260,7 @@ export class OpenClawBridge {
         properties: {},
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) => {
+      async (_toolCallId: string, args: unknown) => {
         const context = this.payloadAdapter.resolveLifecycleContext(
           args,
           this.runtime.getConfig(),
@@ -279,7 +280,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeMemoryRoute(args),
     );
 
@@ -298,7 +299,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeRecallDetail(args),
     );
 
@@ -317,7 +318,7 @@ export class OpenClawBridge {
         required: ["query"],
         additionalProperties: false,
       },
-      async (_toolCallId: string, args: any) =>
+      async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeMemoryRetrieve(args),
     );
   }

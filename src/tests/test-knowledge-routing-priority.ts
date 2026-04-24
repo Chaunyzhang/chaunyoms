@@ -174,7 +174,9 @@ async function main(): Promise<void> {
   try {
     await access(path.join(config.knowledgeBaseDir, ".chaunyoms-import-index.json"));
     cacheLeakedIntoKnowledgeDir = true;
-  } catch {}
+  } catch {
+    // Expected: the cache file should not exist inside the external knowledge dir.
+  }
   assert(!cacheLeakedIntoKnowledgeDir, "expected imported knowledge cache to stay outside the external knowledge directory");
 
   await rm(dir, { recursive: true, force: true });

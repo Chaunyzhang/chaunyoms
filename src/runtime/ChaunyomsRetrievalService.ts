@@ -7,6 +7,10 @@ import {
   LifecycleContext,
   OpenClawPayloadAdapter,
 } from "../host/OpenClawPayloadAdapter";
+import {
+  HostFunctionContainer,
+  OpenClawApiLike,
+} from "../host/OpenClawHostTypes";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
 import { KnowledgeImportStore } from "../stores/KnowledgeImportStore";
 
@@ -35,7 +39,7 @@ export class ChaunyomsRetrievalService {
   constructor(
     private readonly runtime: ChaunyomsSessionRuntime,
     private readonly payloadAdapter: OpenClawPayloadAdapter,
-    private readonly getApi: () => any,
+    private readonly getApi: () => OpenClawApiLike | undefined,
     dependencies: RetrievalLayerDependencies,
   ) {
     this.fixedPrefixProvider = dependencies.fixedPrefixProvider;
@@ -43,7 +47,7 @@ export class ChaunyomsRetrievalService {
     this.vectorSearchFallback = dependencies.vectorSearchFallback;
   }
 
-  async executeMemoryRoute(args: any): Promise<ToolResponse> {
+  async executeMemoryRoute(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
@@ -98,7 +102,7 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  async executeRecallDetail(args: any): Promise<ToolResponse> {
+  async executeRecallDetail(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const { rawStore, summaryStore, durableMemoryStore, projectStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
@@ -147,7 +151,7 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  async executeMemoryRetrieve(args: any): Promise<ToolResponse> {
+  async executeMemoryRetrieve(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
@@ -341,20 +345,23 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  private resolveContext(args: any): LifecycleContext {
+  private resolveContext(args: unknown): LifecycleContext {
     return this.payloadAdapter.resolveLifecycleContext(args, this.runtime.getConfig());
   }
 
-  private getQuery(args: any): string {
-    return typeof args?.query === "string" ? args.query.trim() : "";
+  private getQuery(args: unknown): string {
+    return this.isRecord(args) && typeof args.query === "string"
+      ? args.query.trim()
+      : "";
   }
 
-  private resolveRecallBudget(args: any, totalBudget: number): number {
+  private resolveRecallBudget(args: unknown, totalBudget: number): number {
+    const budget = this.isRecord(args) ? args.budget : undefined;
     return Math.max(
       256,
       Math.floor(
-        typeof args?.budget === "number" && Number.isFinite(args.budget)
-          ? args.budget
+        typeof budget === "number" && Number.isFinite(budget)
+          ? budget
           : totalBudget * 0.2,
       ),
     );
@@ -809,84 +816,112 @@ export class ChaunyomsRetrievalService {
     config: LifecycleContext["config"],
   ): Promise<{ text: string; source?: string; score?: number } | null> {
     const api = this.getApi();
-    const callCandidate = async (
-      target: any,
-      method: "search" | "query",
-    ): Promise<{ text: string; source?: string; score?: number } | null> => {
-      const fn = target?.[method];
-      if (typeof fn !== "function") {
-        return null;
-      }
-
-      const tryParse = (
-        value: any,
-      ): { text: string; source?: string; score?: number } | null => {
-        if (!value) {
-          return null;
-        }
-        const list = Array.isArray(value)
-          ? value
-          : Array.isArray(value?.hits)
-            ? value.hits
-            : Array.isArray(value?.items)
-              ? value.items
-              : Array.isArray(value?.results)
-                ? value.results
-                : [];
-        const first = list[0] ?? value?.hit ?? value?.result;
-        if (!first) {
-          return null;
-        }
-        if (typeof first === "string") {
-          return { text: first, source: method };
-        }
-        const text =
-          first.content ??
-          first.text ??
-          first.chunk ??
-          first.snippet ??
-          first.document;
-        if (typeof text !== "string" || !text.trim()) {
-          return null;
-        }
-        return {
-          text: text.trim(),
-          source: first.source ?? first.filePath ?? first.path ?? method,
-          score: typeof first.score === "number" ? first.score : undefined,
-        };
-      };
-
-      try {
-        const byObject = await Promise.resolve(fn.call(target, { query, topK: 3, k: 3 }));
-        const parsed = tryParse(byObject);
-        if (parsed) {
-          return parsed;
-        }
-      } catch {}
-
-      try {
-        const byString = await Promise.resolve(fn.call(target, query));
-        const parsed = tryParse(byString);
-        if (parsed) {
-          return parsed;
-        }
-      } catch {}
-
-      return null;
-    };
 
     const runtimeCandidate =
-      (await callCandidate(api?.memorySearch, "search")) ??
-      (await callCandidate(api?.memorySearch, "query")) ??
-      (await callCandidate(api?.context?.memorySearch, "search")) ??
-      (await callCandidate(api?.context?.memorySearch, "query")) ??
-      (await callCandidate(api?.runtime?.memorySearch, "search")) ??
-      (await callCandidate(api?.runtime?.memorySearch, "query"));
+      (await this.callVectorSearchCandidate(api?.memorySearch, "search", query)) ??
+      (await this.callVectorSearchCandidate(api?.memorySearch, "query", query)) ??
+      (await this.callVectorSearchCandidate(api?.context?.memorySearch, "search", query)) ??
+      (await this.callVectorSearchCandidate(api?.context?.memorySearch, "query", query)) ??
+      (await this.callVectorSearchCandidate(api?.runtime?.memorySearch, "search", query)) ??
+      (await this.callVectorSearchCandidate(api?.runtime?.memorySearch, "query", query));
     if (runtimeCandidate) {
       return runtimeCandidate;
     }
 
     return await this.vectorSearchFallback.search(query, config);
+  }
+
+  private async callVectorSearchCandidate(
+    target: HostFunctionContainer | undefined,
+    method: "search" | "query",
+    query: string,
+  ): Promise<{ text: string; source?: string; score?: number } | null> {
+    if (!target) {
+      return null;
+    }
+    const fn = target?.[method];
+    if (typeof fn !== "function") {
+      return null;
+    }
+    const invoke = fn as (...args: unknown[]) => unknown;
+
+    const byObject = await this.tryVectorSearchCall(
+      invoke,
+      target,
+      { query, topK: 3, k: 3 },
+      method,
+    );
+    if (byObject) {
+      return byObject;
+    }
+
+    return await this.tryVectorSearchCall(invoke, target, query, method);
+  }
+
+  private async tryVectorSearchCall(
+    fn: (...args: unknown[]) => unknown,
+    target: HostFunctionContainer,
+    input: unknown,
+    method: "search" | "query",
+  ): Promise<{ text: string; source?: string; score?: number } | null> {
+    try {
+      const value = await Promise.resolve(fn.call(target, input));
+      return this.parseVectorSearchResult(value, method);
+    } catch {
+      // Host-provided vector APIs vary by shape; failures intentionally fall through
+      // to the next candidate form before using the local fallback store.
+      return null;
+    }
+  }
+
+  private parseVectorSearchResult(
+    value: unknown,
+    method: "search" | "query",
+  ): { text: string; source?: string; score?: number } | null {
+    if (!value) {
+      return null;
+    }
+
+    const container = this.isRecord(value) ? value : {};
+    const list = Array.isArray(value)
+      ? value
+      : Array.isArray(container.hits)
+        ? container.hits
+        : Array.isArray(container.items)
+          ? container.items
+          : Array.isArray(container.results)
+            ? container.results
+            : [];
+    const first = list[0] ?? container.hit ?? container.result;
+    if (!first) {
+      return null;
+    }
+    if (typeof first === "string") {
+      return { text: first, source: method };
+    }
+    if (!this.isRecord(first)) {
+      return null;
+    }
+
+    const text =
+      first.content ??
+      first.text ??
+      first.chunk ??
+      first.snippet ??
+      first.document;
+    if (typeof text !== "string" || !text.trim()) {
+      return null;
+    }
+    const source = first.source ?? first.filePath ?? first.path ?? method;
+    return {
+      text: text.trim(),
+      source: typeof source === "string" && source.trim() ? source : method,
+      score: typeof first.score === "number" ? first.score : undefined,
+    };
+  }
+
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
 
   private shouldAutoRecall(decision: RetrievalDecision, context: LifecycleContext): boolean {

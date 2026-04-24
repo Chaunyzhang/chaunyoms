@@ -1,5 +1,6 @@
 import { OpenClawBridge } from "./src/OpenClawBridge";
 import { pluginConfigSchema } from "./src/pluginConfigSchema";
+import { OpenClawApiLike } from "./src/host/OpenClawHostTypes";
 
 const bridge = new OpenClawBridge();
 
@@ -9,7 +10,7 @@ const plugin = {
   description: "Lightweight oms context engine plugin for OpenClaw",
   kind: "context-engine",
   configSchema: pluginConfigSchema,
-  register(api: unknown): void {
+  register(api: OpenClawApiLike): void {
     bridge.register(api);
   },
 };

@@ -2,6 +2,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { BridgeConfig, LlmCallParams, LlmCaller, LoggerLike } from "../types";
+import {
+  HostConfigLike,
+  HostFunctionContainer,
+  HostProviderConfig,
+  OpenClawApiLike,
+} from "./OpenClawHostTypes";
 
 const DEFAULT_SHARED_DATA_DIR = "C:\\openclaw-data";
 const DEFAULT_WORKSPACE_DIR = path.join(
@@ -66,7 +72,7 @@ export class OpenClawLlmCaller implements LlmCaller {
   } | null;
 
   constructor(
-    private readonly api: any,
+    private readonly api?: OpenClawApiLike,
     private readonly logger?: LoggerLike,
   ) {
     this.provider = this.resolveProvider();
@@ -112,7 +118,7 @@ export class OpenClawLlmCaller implements LlmCaller {
   } | null {
     const candidates: Array<{
       name: string;
-      target: any;
+      target?: HostFunctionContainer;
       method: "call" | "complete";
     }> = [
       {
@@ -236,7 +242,7 @@ export class OpenClawLlmCaller implements LlmCaller {
   }
 
   private resolvePreferredConfiguredModelRef(
-    apiConfig: any,
+    apiConfig: HostConfigLike,
     params: LlmCallParams,
   ): string | null {
     const requested = this.resolveRequestedModelRef(params);
@@ -276,14 +282,14 @@ export class OpenClawLlmCaller implements LlmCaller {
     return null;
   }
 
-  private resolveDefaultModelRef(apiConfig: any): string | null {
+  private resolveDefaultModelRef(apiConfig: HostConfigLike): string | null {
     const primary = apiConfig?.agents?.defaults?.model?.primary;
     return typeof primary === "string" && primary.trim().length > 0
       ? primary.trim()
       : null;
   }
 
-  private resolveFallbackModelRefs(apiConfig: any): string[] {
+  private resolveFallbackModelRefs(apiConfig: HostConfigLike): string[] {
     const fallbacks = apiConfig?.agents?.defaults?.model?.fallbacks;
     if (!Array.isArray(fallbacks)) {
       return [];
@@ -294,7 +300,7 @@ export class OpenClawLlmCaller implements LlmCaller {
       .filter(Boolean);
   }
 
-  private collectConfiguredModelRefs(apiConfig: any): string[] {
+  private collectConfiguredModelRefs(apiConfig: HostConfigLike): string[] {
     const declaredRefs = apiConfig?.agents?.defaults?.models;
     const refs = declaredRefs && typeof declaredRefs === "object"
       ? Object.keys(declaredRefs)
@@ -318,7 +324,7 @@ export class OpenClawLlmCaller implements LlmCaller {
     return slashIndex <= 0 ? modelRef.trim() : modelRef.slice(slashIndex + 1).trim();
   }
 
-  private hasConfiguredProvider(apiConfig: any, modelRef: string): boolean {
+  private hasConfiguredProvider(apiConfig: HostConfigLike, modelRef: string): boolean {
     const providerId = this.resolveProviderId(modelRef);
     if (!providerId) {
       return false;
@@ -331,7 +337,7 @@ export class OpenClawLlmCaller implements LlmCaller {
     requested: string | null,
     configuredModelRefs: string[],
     defaultModelRef: string | null,
-    apiConfig: any,
+    apiConfig: HostConfigLike,
   ): string | null {
     if (!requested) {
       return null;
@@ -373,13 +379,13 @@ export class OpenClawLlmCaller implements LlmCaller {
     return null;
   }
 
-  private resolveConfiguredBaseUrl(providerConfig: any): string | null {
+  private resolveConfiguredBaseUrl(providerConfig: HostProviderConfig): string | null {
     return typeof providerConfig?.baseUrl === "string" && providerConfig.baseUrl.trim()
       ? providerConfig.baseUrl.trim()
       : null;
   }
 
-  private resolveConfiguredApiKey(providerConfig: any): string | null {
+  private resolveConfiguredApiKey(providerConfig: HostProviderConfig): string | null {
     const apiKey = providerConfig?.apiKey;
     if (typeof apiKey !== "string" || !apiKey.trim()) {
       return null;

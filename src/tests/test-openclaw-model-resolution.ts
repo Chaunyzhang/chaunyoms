@@ -7,6 +7,12 @@ function assert(condition: unknown, message: string): void {
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
 async function main(): Promise<void> {
   const apiConfig = {
     agents: {
@@ -31,7 +37,7 @@ async function main(): Promise<void> {
     },
   };
 
-  const requests: Array<{ url: string; body: any }> = [];
+  const requests: Array<{ url: string; body: unknown }> = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({
@@ -62,7 +68,7 @@ async function main(): Promise<void> {
     assert(text === "summary ok", "expected configured provider call to resolve response text");
     assert(requests.length === 1, "expected one configured provider request");
     assert(
-      requests[0]?.body?.model === "gpt-5.4",
+      asRecord(requests[0]?.body).model === "gpt-5.4",
       "expected bare model id to resolve against the configured provider ref",
     );
     assert(
