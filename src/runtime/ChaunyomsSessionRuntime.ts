@@ -51,6 +51,7 @@ import {
 import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
 import { SummaryDagIntegrityInspector } from "../resolvers/SummaryDagIntegrityInspector";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
+import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
 
 interface CompactionBudgetState {
   availableBudget: number;
@@ -257,6 +258,7 @@ export class ChaunyomsSessionRuntime {
         activeQuery,
       );
     }
+    await this.sessionData.mirrorRuntimeState();
 
     try {
       const result = await this.assembler.assemble(
@@ -277,6 +279,13 @@ export class ChaunyomsSessionRuntime {
           sessionId: context.sessionId,
         },
       );
+      this.sessionData.recordContextPlan({
+        sessionId: context.sessionId,
+        agentId: this.config.agentId,
+        totalBudget: context.totalBudget,
+        intent: activeQuery ? "assemble_with_active_query" : "assemble",
+        plan: result.plan,
+      });
       return {
         items: result.items,
         estimatedTokens: result.items.reduce((sum, item) => sum + item.tokenCount, 0),
@@ -517,6 +526,12 @@ export class ChaunyomsSessionRuntime {
 
   async getSessionStores(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SessionDataStores> {
     return await this.ensureSession(context.sessionId, context.config);
+  }
+
+  async getRuntimeStore(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SQLiteRuntimeStore> {
+    await this.ensureSession(context.sessionId, context.config);
+    await this.sessionData.mirrorRuntimeState();
+    return this.sessionData.getRuntimeStore();
   }
 
   async inspectDag(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<DagIntegrityReport> {

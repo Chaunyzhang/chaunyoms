@@ -22,6 +22,7 @@ import {
   OpenClawApiLike,
 } from "../host/OpenClawHostTypes";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
+import { OmsExpandResult, OmsGrepHit } from "../data/SQLiteRuntimeStore";
 
 const EMBEDDINGS_API_PROMPT =
   "Current retrieval path needs embeddings search. Ask the user whether to configure an embeddings API now (for example OpenAI or SiliconFlow), or let them skip for now.";
@@ -453,6 +454,126 @@ export class ChaunyomsRetrievalService {
     }, query, context, decision, semanticExpansion);
   }
 
+  async executeOmsGrep(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const query = this.getQuery(args);
+    if (!query) {
+      return this.buildMissingQueryResponse("oms_grep");
+    }
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const limit = this.getNumberArg(args, "limit", 10);
+    const contextTurns = this.getNumberArg(args, "contextTurns", 1);
+    const hits = runtimeStore.grepMessages(query, {
+      sessionId: context.sessionId,
+      limit,
+      contextTurns,
+    });
+    return {
+      content: [{
+        type: "text",
+        text: hits.length > 0
+          ? hits.map((hit, index) => this.formatGrepHit(index + 1, hit)).join("\n\n---\n\n")
+          : `No raw message hit found for query: ${query}`,
+      }],
+      details: {
+        ok: true,
+        query,
+        runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+        dbPath: runtimeStore.getPath(),
+        hitCount: hits.length,
+        retrievalHitType: "raw_exact_search",
+      },
+    };
+  }
+
+  async executeOmsExpand(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const id = this.getStringArg(args, "id");
+    const kind = this.getStringArg(args, "kind") || "auto";
+    if (!id) {
+      return this.buildMissingIdResponse("oms_expand");
+    }
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const result = runtimeStore.expand(kind, id);
+    return {
+      content: [{
+        type: "text",
+        text: this.formatExpandResult(kind, id, result),
+      }],
+      details: {
+        ok: true,
+        id,
+        kind,
+        runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+        dbPath: runtimeStore.getPath(),
+        targetFound: Boolean(result.target),
+        messageCount: result.messages.length,
+        summaryCount: result.summaries.length,
+        edgeCount: result.edges.length,
+        sourceTrace: result.edges,
+      },
+    };
+  }
+
+  async executeOmsTrace(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const id = this.getStringArg(args, "id");
+    const kind = this.getStringArg(args, "kind") || "auto";
+    if (!id) {
+      return this.buildMissingIdResponse("oms_trace");
+    }
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const edges = runtimeStore.trace(kind, id);
+    return {
+      content: [{
+        type: "text",
+        text: edges.length > 0
+          ? edges.map((edge) => `${edge.sourceKind}:${edge.sourceId} --${edge.relation}--> ${edge.targetKind}:${edge.targetId}`).join("\n")
+          : `No source trace edges found for ${kind}:${id}`,
+      }],
+      details: {
+        ok: true,
+        id,
+        kind,
+        runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+        dbPath: runtimeStore.getPath(),
+        edgeCount: edges.length,
+        sourceTrace: edges,
+      },
+    };
+  }
+
+  async executeOmsReplay(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const startTurn = this.getOptionalNumberArg(args, "startTurn");
+    const endTurn = this.getOptionalNumberArg(args, "endTurn");
+    const limit = this.getNumberArg(args, "limit", 200);
+    const messages = runtimeStore.replay({
+      sessionId: context.sessionId,
+      startTurn,
+      endTurn,
+      limit,
+    });
+    return {
+      content: [{
+        type: "text",
+        text: messages.length > 0
+          ? messages.map((message) => `[turn ${message.turnNumber}] ${message.role}: ${message.content}`).join("\n\n")
+          : "No raw messages found for this replay range.",
+      }],
+      details: {
+        ok: true,
+        runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+        dbPath: runtimeStore.getPath(),
+        sessionId: context.sessionId,
+        startTurn: startTurn ?? null,
+        endTurn: endTurn ?? null,
+        messageCount: messages.length,
+      },
+    };
+  }
+
   private attachDiagnostics(
     response: ToolResponse,
     query: string,
@@ -826,6 +947,34 @@ export class ChaunyomsRetrievalService {
     return this.isRecord(args) && typeof args.query === "string"
       ? args.query.trim()
       : "";
+  }
+
+  private getStringArg(args: unknown, key: string): string {
+    if (!this.isRecord(args)) {
+      return "";
+    }
+    const value = args[key];
+    return typeof value === "string" ? value.trim() : "";
+  }
+
+  private getNumberArg(args: unknown, key: string, fallback: number): number {
+    const value = this.getOptionalNumberArg(args, key);
+    return typeof value === "number" ? value : fallback;
+  }
+
+  private getOptionalNumberArg(args: unknown, key: string): number | undefined {
+    if (!this.isRecord(args)) {
+      return undefined;
+    }
+    const value = args[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    return undefined;
   }
 
   private resolveRecallBudget(args: unknown, totalBudget: number): number {
@@ -1267,6 +1416,60 @@ export class ChaunyomsRetrievalService {
       ],
       details: { ok: false, missingParam: "query" },
     };
+  }
+
+  private buildMissingIdResponse(toolName: string): ToolResponse {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${toolName} requires a non-empty \`id\`.`,
+        },
+      ],
+      details: { ok: false, missingParam: "id" },
+    };
+  }
+
+  private formatGrepHit(index: number, hit: OmsGrepHit): string {
+    const before = hit.before.map((message) =>
+      `  before [turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+    );
+    const after = hit.after.map((message) =>
+      `  after [turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+    );
+    return [
+      `${index}. [score ${hit.score}] [turn ${hit.message.turnNumber}] ${hit.message.role} ${hit.message.id}`,
+      hit.message.content,
+      ...before,
+      ...after,
+    ].join("\n");
+  }
+
+  private formatExpandResult(kind: string, id: string, result: OmsExpandResult): string {
+    if (!result.target) {
+      return `No runtime target found for ${kind}:${id}`;
+    }
+    const messages = result.messages.map((message) =>
+      `[turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+    );
+    const summaries = result.summaries.map((summary) =>
+      `[summary ${summary.id}] turns ${summary.startTurn}-${summary.endTurn}: ${summary.summary}`,
+    );
+    const edges = result.edges.map((edge) =>
+      `${edge.sourceKind}:${edge.sourceId} --${edge.relation}--> ${edge.targetKind}:${edge.targetId}`,
+    );
+    return [
+      `Expanded ${kind}:${id}`,
+      "",
+      "Source edges:",
+      edges.length > 0 ? edges.join("\n") : "(none)",
+      "",
+      "Summaries:",
+      summaries.length > 0 ? summaries.join("\n\n") : "(none)",
+      "",
+      "Raw messages:",
+      messages.length > 0 ? messages.join("\n\n") : "(none)",
+    ].join("\n");
   }
 
   private buildEmbeddingsPromptResponse(decision: RetrievalDecision): ToolResponse {

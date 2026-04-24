@@ -8,6 +8,12 @@ import {
   SummaryRepository,
 } from "../types";
 import { estimateTokens } from "../utils/tokenizer";
+import {
+  ContextCandidateSource,
+  ContextPlanner,
+  ContextPlannerCandidate,
+  ContextPlannerResult,
+} from "./ContextPlanner";
 
 interface AssembleOptions {
   includeStablePrefix?: boolean;
@@ -18,6 +24,8 @@ interface AssembleOptions {
 }
 
 export class ContextAssembler {
+  private readonly planner = new ContextPlanner();
+
   constructor(
     private readonly contextViewStore: ContextViewRepository,
     private readonly fixedPrefixProvider: FixedPrefixProvider,
@@ -239,7 +247,7 @@ export class ContextAssembler {
     sharedDataDir: string,
     workspaceDir: string,
     options: AssembleOptions = {},
-  ): Promise<{ budget: ContextBudget; items: ContextItem[] }> {
+  ): Promise<{ budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult }> {
     const budget = this.allocateBudget(totalBudget, systemPromptTokens);
     const stablePrefix = options.includeStablePrefix === false
       ? []
@@ -270,15 +278,34 @@ export class ContextAssembler {
       maxFreshTailTurns,
       options.sessionId,
     );
-    const items = [
-      ...leadingStablePrefix,
-      ...(recallGuidance ? [recallGuidance] : []),
-      ...durableMemory,
-      ...summaries,
-      ...deferredStablePrefix,
-      ...recentTail,
-    ];
+    const candidates = this.buildPlannerCandidates([
+      ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
+      ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
+      ...this.tagCandidateSource(durableMemory, "active_memory"),
+      ...this.tagCandidateSource(summaries, "summary_context"),
+      ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
+      ...this.tagCandidateSource(recentTail, "recent_tail"),
+    ]);
+    const plan = this.planner.plan(candidates, {
+      budget: budget.availableBudget,
+    });
+    const items = plan.selected.map((candidate) => candidate.item);
     this.contextViewStore.setItems(items);
-    return { budget, items };
+    return { budget, items, plan };
+  }
+
+  private tagCandidateSource(
+    items: ContextItem[],
+    source: ContextCandidateSource,
+  ): Array<{ item: ContextItem; source: ContextCandidateSource }> {
+    return items.map((item) => ({ item, source }));
+  }
+
+  private buildPlannerCandidates(
+    entries: Array<{ item: ContextItem; source: ContextCandidateSource }>,
+  ): ContextPlannerCandidate[] {
+    return entries.map((entry, index) =>
+      this.planner.buildCandidate(entry.item, entry.source, index),
+    );
   }
 }

@@ -293,6 +293,71 @@ export class OpenClawBridge {
     );
 
     register(
+      "oms_grep",
+      "Search the SQLite runtime raw-message ledger for exact/source-level evidence and return adjacent context.",
+      {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keyword or phrase to find in raw messages." },
+          limit: { type: "number", description: "Maximum hits to return. Default 10." },
+          contextTurns: { type: "number", description: "Adjacent turns to include around each hit. Default 1." },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsGrep(args),
+    );
+
+    register(
+      "oms_expand",
+      "Expand a message, summary, memory, or asset id through SQLite source_edges back to source evidence.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "message_id, summary_id, memory_id, or asset doc_id." },
+          kind: { type: "string", enum: ["auto", "message", "summary", "memory", "asset"] },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsExpand(args),
+    );
+
+    register(
+      "oms_trace",
+      "Show SQLite source_edges provenance for a message, summary, memory, or asset id.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "message_id, summary_id, memory_id, or asset doc_id." },
+          kind: { type: "string", enum: ["auto", "message", "summary", "memory", "asset"] },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsTrace(args),
+    );
+
+    register(
+      "oms_replay",
+      "Replay raw messages for the current session from the SQLite runtime ledger.",
+      {
+        type: "object",
+        properties: {
+          startTurn: { type: "number", description: "Optional first turn number." },
+          endTurn: { type: "number", description: "Optional last turn number." },
+          limit: { type: "number", description: "Maximum raw messages to return. Default 200." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsReplay(args),
+    );
+
+    register(
       "lcm_describe",
       "Compatibility alias of memory_route for legacy chaunym-claw prompts.",
       {

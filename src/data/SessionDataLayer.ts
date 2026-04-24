@@ -8,6 +8,8 @@ import { ProjectRegistryStore } from "../stores/ProjectRegistryStore";
 import { RawMessageStore } from "../stores/RawMessageStore";
 import { RuntimeStatsLogStore } from "../stores/RuntimeStatsLogStore";
 import { SummaryIndexStore } from "../stores/SummaryIndexStore";
+import { SQLiteRuntimeStore } from "./SQLiteRuntimeStore";
+import { ContextPlannerResult } from "../engines/ContextPlanner";
 import {
   BridgeConfig,
   DurableMemoryEntry,
@@ -57,6 +59,7 @@ export class SessionDataLayer {
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private projectStore: ProjectRegistryStore | null = null;
   private statsLogStore: RuntimeStatsLogStore | null = null;
+  private runtimeStore: SQLiteRuntimeStore | null = null;
   private schemaRegistry: DataSchemaRegistry | null = null;
   private migrationRunner: SessionDataMigrationRunner | null = null;
   private agentVault: AgentVault | null = null;
@@ -79,6 +82,7 @@ export class SessionDataLayer {
       this.knowledgeRawStore &&
       this.knowledgeStore &&
       this.projectStore &&
+      this.runtimeStore &&
       this.agentVault &&
       this.boundAgentId === config.agentId &&
       this.boundSessionId === sessionId &&
@@ -157,6 +161,12 @@ export class SessionDataLayer {
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
     this.statsLogStore = new RuntimeStatsLogStore(config.dataDir);
+    this.runtimeStore = new SQLiteRuntimeStore({
+      dbPath: path.join(agentDataDir, "chaunyoms-runtime.sqlite"),
+      agentId: config.agentId,
+      knowledgeBaseDir: knowledgeDir,
+      logger: this.logger,
+    });
     this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
     await this.summaryStore.init();
@@ -165,6 +175,7 @@ export class SessionDataLayer {
     await this.knowledgeRawStore.init();
     await this.knowledgeStore.init();
     await this.projectStore.init();
+    await this.runtimeStore.init();
     await this.agentVault.ensureLayout();
     this.boundAgentId = config.agentId;
     this.boundSessionId = sessionId;
@@ -175,6 +186,7 @@ export class SessionDataLayer {
       knowledgeBaseDir: config.knowledgeBaseDir,
       memoryVaultDir: config.memoryVaultDir,
     };
+    await this.mirrorRuntimeState();
     return this.getStores();
   }
 
@@ -239,6 +251,37 @@ export class SessionDataLayer {
     return await this.getStores().projectStore.upsert(project);
   }
 
+  getRuntimeStore(): SQLiteRuntimeStore {
+    if (!this.runtimeStore) {
+      throw new Error("SessionDataLayer SQLite runtime store is not initialized");
+    }
+    return this.runtimeStore;
+  }
+
+  async mirrorRuntimeState(): Promise<void> {
+    if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore) {
+      return;
+    }
+    await this.runtimeStore.mirror({
+      messages: this.rawStore.getAll(),
+      summaries: this.summaryStore.getAllSummaries(),
+      memories: this.durableMemoryStore.getAll(),
+    });
+  }
+
+  recordContextPlan(args: {
+    sessionId: string;
+    agentId: string;
+    totalBudget: number;
+    intent: string;
+    plan: ContextPlannerResult;
+  }): void {
+    if (!this.runtimeStore) {
+      return;
+    }
+    this.runtimeStore.recordContextPlan(args);
+  }
+
   inspectSummaryIntegrity(): SummaryIntegrityInspection {
     const { rawStore, summaryStore } = this.getStores();
     const summaries = summaryStore.getAllSummaries();
@@ -288,6 +331,7 @@ export class SessionDataLayer {
     }
 
     if (repairedRanges > 0) {
+      await this.mirrorRuntimeState();
       this.logger.info("summary_compaction_state_repaired", {
         repairedRanges,
       });
