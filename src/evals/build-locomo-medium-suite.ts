@@ -214,7 +214,7 @@ function allCandidateCases(samples: LoCoMoSample[]): Map<number, EvalCaseDefinit
           requireSourceVerified: true,
           minSummaryCount: 4,
           detailEquals: {
-            retrievalHitType: "summary_tree_recall",
+            retrievalHitType: "raw_history_recall",
           },
         },
       };

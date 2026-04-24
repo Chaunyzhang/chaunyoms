@@ -395,7 +395,7 @@ export interface ContextItem {
 }
 
 export interface SourceTrace {
-  route: RetrievalRoute | "compaction" | "knowledge_promotion";
+  route: RetrievalRoute | "compaction" | "knowledge_promotion" | "raw_exact_search";
   summaryId?: string;
   sessionId: string;
   agentId?: string;
@@ -411,6 +411,25 @@ export interface SourceTrace {
   sequenceMin?: number;
   sequenceMax?: number;
   messageIds?: string[];
+}
+
+export interface AnswerCandidate {
+  text: string;
+  type:
+    | "person"
+    | "place"
+    | "date"
+    | "duration"
+    | "relationship"
+    | "title"
+    | "organization"
+    | "object"
+    | "choice"
+    | "unknown";
+  confidence: number;
+  evidenceMessageIds: string[];
+  sourceVerified: boolean;
+  reason: string;
 }
 
 export interface FallbackTrace {
@@ -537,6 +556,9 @@ export interface RecallResult {
   consumedTokens: number;
   sourceTrace: SourceTrace[];
   dagTrace: DagTraversalStep[];
+  answerCandidates?: AnswerCandidate[];
+  strategy?: "raw_first" | "summary_navigation";
+  rawCandidateCount?: number;
 }
 
 export interface DagTraversalStep {

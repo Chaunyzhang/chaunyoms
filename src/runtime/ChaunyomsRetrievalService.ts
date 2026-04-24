@@ -1,6 +1,7 @@
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
 import {
+  AnswerCandidate,
   ContextItem,
   DurableMemoryEntry,
   FixedPrefixProvider,
@@ -214,10 +215,20 @@ export class ChaunyomsRetrievalService {
         );
       }
 
+      const rawFtsHints = this.shouldUseFtsRecallHints(args, context)
+        ? (await this.runtime.getRuntimeStore(context)).grepMessages(query, {
+            sessionId: context.sessionId,
+            limit: 12,
+            contextTurns: 2,
+          })
+        : [];
       const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
-      const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
+      const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget, {
+        sessionId: context.sessionId,
+        rawHintMessageIds: rawFtsHints.map((hit) => hit.message.id),
+      });
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
+        content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace, result.answerCandidates) }],
         details: {
           ok: true,
           route: decision.route,
@@ -225,7 +236,11 @@ export class ChaunyomsRetrievalService {
           query,
           consumedTokens: result.consumedTokens,
           hitCount: result.items.length,
-          retrievalHitType: "summary_tree_recall",
+          retrievalHitType: result.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
+          recallStrategy: result.strategy ?? "summary_navigation",
+          rawCandidateCount: result.rawCandidateCount ?? 0,
+          rawFtsHintCount: rawFtsHints.length,
+          answerCandidates: result.answerCandidates ?? [],
           autoRecall: true,
           autoRecallReason: this.explainAutoRecall(decision, context),
           routePlan: decision.routePlan,
@@ -690,6 +705,16 @@ export class ChaunyomsRetrievalService {
     );
   }
 
+  private shouldUseFtsRecallHints(args: unknown, context: LifecycleContext): boolean {
+    if (context.config.configPreset === "enhanced_recall") {
+      return true;
+    }
+    if (!this.isRecord(args)) {
+      return false;
+    }
+    return args.deepRecall === true || args.rawFts === true || args.qualityMode === true;
+  }
+
   private async resolveRetrievalDecision(
     query: string,
     context: LifecycleContext,
@@ -775,10 +800,26 @@ export class ChaunyomsRetrievalService {
       );
   }
 
-  private formatRecallText(query: string, items: ContextItem[], sourceTrace: Array<{ summaryId?: string; strategy: string; verified: boolean; resolvedMessageCount: number }> = []): string {
+  private formatRecallText(
+    query: string,
+    items: ContextItem[],
+    sourceTrace: Array<{ summaryId?: string; strategy: string; verified: boolean; resolvedMessageCount: number }> = [],
+    answerCandidates: AnswerCandidate[] = [],
+  ): string {
     if (items.length === 0) {
-      return `No matching historical details found for query: ${query}`;
+      if (answerCandidates.length === 0) {
+        return `No matching historical details found for query: ${query}`;
+      }
     }
+    const answers = answerCandidates.length > 0
+      ? [
+          "Answer candidates:",
+          ...answerCandidates.slice(0, 5).map((candidate, index) =>
+            `${index + 1}. ${candidate.text} (${candidate.type}, confidence=${candidate.confidence}, sourceVerified=${candidate.sourceVerified})`,
+          ),
+          "",
+        ].join("\n")
+      : "";
     const messages = items
       .map(
         (item) =>
@@ -797,6 +838,7 @@ export class ChaunyomsRetrievalService {
     return [
       `Historical source hits for: ${query}`,
       "",
+      answers,
       messages,
       traces,
     ].filter(Boolean).join("\n");

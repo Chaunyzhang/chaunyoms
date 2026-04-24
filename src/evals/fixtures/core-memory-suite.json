@@ -38,7 +38,7 @@
         "minSummaryCount": 4,
         "requireBranchSummary": true,
         "detailEquals": {
-          "retrievalHitType": "summary_tree_recall"
+          "retrievalHitType": "raw_history_recall"
         }
       }
     },

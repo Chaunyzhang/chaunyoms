@@ -72,6 +72,7 @@ export interface EvalCaseResult {
   branchCount: number;
   details: Record<string, unknown>;
   failures: string[];
+  failureKind: string;
 }
 
 export interface EvalRateMetric {

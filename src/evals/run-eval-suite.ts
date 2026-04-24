@@ -158,7 +158,46 @@ function evaluateCaseResult(
     branchCount,
     details: response.details,
     failures,
+    failureKind: classifyFailure(caseDef, response, failures, sourceVerified),
   };
+}
+
+function classifyFailure(
+  caseDef: EvalCaseDefinition,
+  response: { content: Array<Record<string, unknown>>; details: Record<string, unknown> },
+  failures: string[],
+  sourceVerified: boolean,
+): string {
+  if (failures.length === 0) {
+    return "passed";
+  }
+  const query = caseDef.query.toLowerCase();
+  const hitType = String(response.details.retrievalHitType ?? "");
+  const hitCount = Number(response.details.hitCount ?? 0);
+  const rawCandidateCount = Number(response.details.rawCandidateCount ?? 0);
+  const answerCandidates = Array.isArray(response.details.answerCandidates)
+    ? response.details.answerCandidates as Array<Record<string, unknown>>
+    : [];
+
+  if (/project_registry/.test(hitType) && /history|what|where|when|which|who|how/.test(query)) {
+    return "route_miss";
+  }
+  if (rawCandidateCount === 0 && hitCount === 0) {
+    return "candidate_pool_miss";
+  }
+  if (/(both|between|how many|how long|likely|same|shared)/i.test(query)) {
+    return "multi_hop_miss";
+  }
+  if (sourceVerified && hitCount > 0 && answerCandidates.length === 0) {
+    return "answer_extraction_miss";
+  }
+  if (sourceVerified && (rawCandidateCount > hitCount || hitCount > 0)) {
+    return "ranking_miss";
+  }
+  if (!sourceVerified && caseDef.expected.requireSourceVerified) {
+    return "source_verification_miss";
+  }
+  return "unknown_miss";
 }
 
 function aggregateMetrics(results: EvalCaseResult[]): EvalAggregateMetrics {
@@ -244,6 +283,7 @@ function reportMarkdown(report: EvalSuiteReport): string {
     lines.push(`- sourceVerified: ${result.sourceVerified}`);
     lines.push(`- summaryCount: ${result.summaryCount}`);
     lines.push(`- branchCount: ${result.branchCount}`);
+    lines.push(`- failureKind: ${result.failureKind}`);
     lines.push(`- failures: ${result.failures.join("; ") || "none"}`);
     lines.push("");
   }

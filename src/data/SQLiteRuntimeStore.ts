@@ -221,14 +221,25 @@ export class SQLiteRuntimeStore {
         return [];
       }
 
-      const rows = this.db?.prepare(`
+      const ftsScored = this.searchMessagesFts(query, terms, options.sessionId, limit * 2);
+      const rows = ftsScored.length >= limit
+        ? []
+        : this.db?.prepare(`
       SELECT * FROM messages
       WHERE (? IS NULL OR session_id = ?)
       ORDER BY sequence ASC, turn_number ASC, created_at ASC
       `).all(options.sessionId ?? null, options.sessionId ?? null) ?? [];
-      const scored = rows
+      const scanScored = rows
         .map((row) => ({ message: this.rowToMessage(row), score: this.scoreText(String(row.content ?? ""), terms) }))
-        .filter((item) => item.score > 0)
+        .filter((item) => item.score > 0);
+      const byId = new Map<string, { message: RawMessage; score: number }>();
+      for (const item of [...ftsScored, ...scanScored]) {
+        const existing = byId.get(item.message.id);
+        if (!existing || item.score > existing.score) {
+          byId.set(item.message.id, item);
+        }
+      }
+      const scored = [...byId.values()]
         .sort((left, right) => right.score - left.score || (left.message.sequence ?? 0) - (right.message.sequence ?? 0))
         .slice(0, limit);
 
@@ -240,6 +251,48 @@ export class SQLiteRuntimeStore {
       }));
     } finally {
       this.closeDatabase();
+    }
+  }
+
+  private searchMessagesFts(
+    query: string,
+    terms: string[],
+    sessionId: string | undefined,
+    limit: number,
+  ): Array<{ message: RawMessage; score: number }> {
+    if (!this.db) {
+      return [];
+    }
+    try {
+      this.ensureFtsSchema();
+      this.populateMessagesFtsIfEmpty();
+      const matchQuery = this.toFtsMatchQuery(query, terms);
+      if (!matchQuery) {
+        return [];
+      }
+      return this.db.prepare(`
+        SELECT m.*, bm25(messages_fts) AS fts_score
+        FROM messages_fts
+        JOIN messages m ON m.id = messages_fts.id
+        WHERE messages_fts MATCH ?
+          AND (? IS NULL OR m.session_id = ?)
+        ORDER BY fts_score ASC, m.sequence ASC, m.turn_number ASC
+        LIMIT ?
+      `).all(matchQuery, sessionId ?? null, sessionId ?? null, limit)
+        .map((row) => {
+          const message = this.rowToMessage(row);
+          const lexical = this.scoreText(message.content, terms);
+          const bm25 = Number(row.fts_score ?? 0);
+          return {
+            message,
+            score: lexical + Math.max(0, Math.round(12 - bm25)),
+          };
+        });
+    } catch (error) {
+      this.options.logger.debug?.("sqlite_runtime_fts_query_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
     }
   }
 
@@ -620,6 +673,46 @@ export class SQLiteRuntimeStore {
     this.createFtsTable("memories_fts", "id UNINDEXED, text");
     this.createFtsTable("assets_fts", "doc_id UNINDEXED, title, summary");
     this.ftsReady = true;
+  }
+
+  private populateMessagesFtsIfEmpty(): void {
+    if (!this.db) {
+      return;
+    }
+    try {
+      const row = this.db.prepare("SELECT COUNT(*) AS count FROM messages_fts").get();
+      if (Number(row?.count ?? 0) > 0) {
+        return;
+      }
+      this.db.prepare("INSERT INTO messages_fts (id, content) SELECT id, content FROM messages").run();
+    } catch (error) {
+      this.options.logger.debug?.("sqlite_runtime_fts_populate_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private toFtsMatchQuery(query: string, terms: string[]): string {
+    const ftsTerms = terms
+      .map((term) => term.toLowerCase().replace(/[^a-z0-9]+/g, ""))
+      .filter((term) => term.length >= 2)
+      .slice(0, 8);
+    if (ftsTerms.length === 0) {
+      return "";
+    }
+    const phrase = query
+      .toLowerCase()
+      .replace(/^history\s+recall\s*:\s*/i, "")
+      .replace(/"/g, " ")
+      .trim()
+      .split(/\s+/)
+      .filter((term) => /^[a-z0-9]+$/.test(term))
+      .slice(0, 6)
+      .join(" ");
+    const disjunction = ftsTerms.map((term) => `${term}*`).join(" OR ");
+    return phrase.length >= 6
+      ? `"${phrase}" OR ${disjunction}`
+      : disjunction;
   }
 
   private upsertSummary(summary: SummaryEntry): void {
