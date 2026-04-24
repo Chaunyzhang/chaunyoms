@@ -13,10 +13,6 @@ const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|some
 const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|what's left|what remains)/i;
 
 export interface RouteContext {
-  memorySearchEnabled: boolean;
-  hasSharedInsightHint?: boolean;
-  hasNavigationHint?: boolean;
-  hasStructuredNavigationState?: boolean;
   hasKnowledgeHits?: boolean;
   hasKnowledgeRawHint?: boolean;
   hasCompactedHistory?: boolean;
@@ -50,7 +46,7 @@ export class MemoryRetrievalRouter {
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(normalized);
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
     const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
-    const stateAvailable = context.hasStructuredNavigationState || context.hasNavigationHint || context.hasProjectRegistry;
+    const explicitProjectState = this.isExplicitProjectStateQuery(normalized);
 
     if (asksDurable && context.hasDurableHits) {
       return this.decision(
@@ -82,7 +78,21 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if ((asksProjectState || referencesCurrentWork) && context.hasProjectRegistry) {
+    if (needsFacts || asksHistory) {
+      return this.decision(
+        "summary_tree",
+        needsFacts ? "fact_question_requires_source_recall" : "historical_recall_query",
+        false,
+        true,
+        false,
+        ["summary_tree", "recent_tail"],
+        "The query needs historical detail, so use the compressed history map only to navigate back to source messages.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
+      );
+    }
+
+    if ((referencesCurrentWork || (asksProjectState && explicitProjectState)) && context.hasProjectRegistry) {
       return this.decision(
         "project_registry",
         context.matchedProjectId ? "matched_project_state_query" : "project_state_query",
@@ -98,50 +108,22 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if (needsFacts || asksHistory) {
+    if ((complexTask || context.recentAssistantUncertainty) && referencesCurrentWork && context.hasProjectRegistry) {
       return this.decision(
-        "summary_tree",
-        needsFacts ? "fact_question_requires_summary_to_raw_recall" : "historical_recall_query",
-        false,
-        true,
-        false,
-        ["summary_tree", "recent_tail"],
-        "The query needs historical detail, so it should traverse summaries first and expand back to raw messages.",
-        context.matchedProjectId,
-        context.matchedProjectTitle,
-      );
-    }
-
-    if ((complexTask || context.recentAssistantUncertainty) && stateAvailable && referencesCurrentWork) {
-      return this.decision(
-        context.hasProjectRegistry ? "project_registry" : "navigation",
+        "project_registry",
         complexTask ? "complex_task_state_upgrade" : "assistant_uncertainty_state_upgrade",
         false,
         false,
         true,
-        context.hasProjectRegistry
-          ? ["project_registry", "navigation", "durable_memory"]
-          : ["navigation", "durable_memory", "recent_tail"],
-        "The query is coordinating current work, so prefer structured project/navigation state before raw history.",
+        ["project_registry", "durable_memory", "recent_tail"],
+        "The query is coordinating current work, so prefer structured project state before raw history.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
     }
 
-    if (mentionsInsights && (fuzzyLookup || !context.hasSharedInsightHint)) {
-      return this.decision(
-        context.memorySearchEnabled ? "vector_search" : "shared_insights",
-        context.memorySearchEnabled ? "shared_insights_fuzzy_lookup_with_embeddings" : "shared_insights_fuzzy_lookup_without_embeddings",
-        !context.memorySearchEnabled,
-        false,
-        context.memorySearchEnabled,
-        context.memorySearchEnabled ? ["vector_search", "shared_insights"] : ["shared_insights"],
-        "The query targets shared insights and needs fuzzy retrieval, so vector search (or shared-insights fallback) is the right path.",
-      );
-    }
-
     if (mentionsInsights) {
-      return this.decision("shared_insights", "shared_insights_route_hit", false, false, true, ["shared_insights"], "The query explicitly asks for shared insights.");
+      return this.decision("recent_tail", "shared_insights_no_longer_primary_route", false, false, true, ["recent_tail"], "Shared insights are no longer a separate primary route in the standard runtime path.");
     }
 
     if (asksRawKnowledge && mentionsKnowledge) {
@@ -168,18 +150,6 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if (mentionsKnowledge && fuzzyLookup && !context.hasKnowledgeHits && context.memorySearchEnabled) {
-      return this.decision(
-        "vector_search",
-        "knowledge_query_fuzzy_vector_fallback",
-        false,
-        false,
-        true,
-        ["knowledge", "vector_search", "summary_tree"],
-        "The query asks for fuzzy knowledge, and the unified knowledge corpus has no direct hit, so vector retrieval is the best next step.",
-      );
-    }
-
     if (mentionsKnowledge && (fuzzyLookup || context.hasKnowledgeRawHint || !context.hasKnowledgeHits)) {
       return this.decision(
         "knowledge",
@@ -187,7 +157,7 @@ export class MemoryRetrievalRouter {
         false,
         false,
         true,
-        ["knowledge", "summary_tree"],
+        ["knowledge", "recent_tail"],
         "The query targets long-term knowledge, so use the unified knowledge corpus and preserve provenance in the returned hits.",
       );
     }
@@ -248,18 +218,16 @@ export class MemoryRetrievalRouter {
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(query);
     const asksHistory = HISTORY_RE.test(query);
     const asksDurable = DURABLE_RE.test(query);
-    const mentionsInsights = SHARED_INSIGHTS_RE.test(query);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(query);
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(query);
-    const fuzzyLookup = FUZZY_SEARCH_RE.test(query);
-    const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
+    const explicitProjectState = this.isExplicitProjectStateQuery(query);
 
     if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
     if (needsFacts && asksCurrentFact) add("durable_memory", 6, "current_fact_terms");
     if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
     if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");
 
-    if (asksProjectState) add("project_registry", 7, "project_state_terms");
+    if (asksProjectState && (referencesCurrentWork || explicitProjectState)) add("project_registry", 7, "project_state_terms");
     if (referencesCurrentWork) add("project_registry", 4, "references_current_work");
     if (context.hasProjectRegistry) add("project_registry", 2, "project_registry_available");
     if (context.matchedProjectId) add("project_registry", 3, "matched_project");
@@ -272,23 +240,6 @@ export class MemoryRetrievalRouter {
     if (asksRawKnowledge) add("knowledge", 3, "raw_knowledge_terms");
     if (context.hasKnowledgeHits) add("knowledge", 4, "knowledge_hits_available");
     if (context.hasKnowledgeRawHint) add("knowledge", 3, "knowledge_raw_hint");
-
-    if (mentionsInsights) add("shared_insights", 7, "shared_insight_terms");
-    if (context.hasSharedInsightHint) add("shared_insights", 4, "shared_insight_hint");
-
-    if (context.hasStructuredNavigationState) add("navigation", 4, "structured_navigation_available");
-    if (context.hasNavigationHint) add("navigation", 4, "navigation_hint");
-    if ((complexTask || context.recentAssistantUncertainty) && referencesCurrentWork) {
-      add("navigation", 3, complexTask ? "complex_current_work_query" : "assistant_uncertainty");
-    }
-
-    if (fuzzyLookup && context.memorySearchEnabled) add("vector_search", 6, "fuzzy_lookup_with_embeddings");
-    if (mentionsKnowledge && fuzzyLookup && !context.hasKnowledgeHits && context.memorySearchEnabled) {
-      add("vector_search", 3, "knowledge_fuzzy_without_direct_hit");
-    }
-    if (mentionsInsights && fuzzyLookup && context.memorySearchEnabled) {
-      add("vector_search", 3, "shared_insights_fuzzy_lookup");
-    }
 
     add("recent_tail", 1, "default_available");
     if (!needsFacts && !asksHistory && !mentionsKnowledge && !asksDurable && !asksProjectState) {
@@ -306,5 +257,9 @@ export class MemoryRetrievalRouter {
         reasons: [...new Set(item.reasons)],
       }))
       .sort((left, right) => right.score - left.score || left.route.localeCompare(right.route));
+  }
+
+  private isExplicitProjectStateQuery(query: string): boolean {
+    return /(project|repo|repository|task|work|branch|build|test|plugin|implementation|release|status of project|项目|仓库|任务|构建|测试|插件|分支|发布)/i.test(query);
   }
 }

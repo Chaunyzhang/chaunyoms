@@ -8,7 +8,6 @@ import { ChaunyomsRetrievalService } from "../runtime/ChaunyomsRetrievalService"
 import { ChaunyomsSessionRuntime } from "../runtime/ChaunyomsSessionRuntime";
 import { createRuntimeLayerDependencies } from "../runtime/createRuntimeLayerDependencies";
 import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
-import { VectorSearchFallbackStore } from "../data/VectorSearchFallbackStore";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
@@ -93,11 +92,8 @@ async function main(): Promise<void> {
   const retrieval = new ChaunyomsRetrievalService(
     runtime,
     payloadAdapter,
-    () => ({ config: {} }),
     {
       fixedPrefixProvider: new StablePrefixAdapter(),
-      navigationRepository: new StablePrefixAdapter(),
-      vectorSearchFallback: new VectorSearchFallbackStore(),
     },
   );
 
@@ -117,8 +113,8 @@ async function main(): Promise<void> {
   );
   assert(
     Array.isArray(result.details.fallbackTrace) &&
-      result.details.fallbackTrace.some((item: { reason?: string }) => item.reason === "semantic_candidate_authority_hit"),
-    "expected semantic candidate authority fallback trace",
+      result.details.fallbackTrace.some((item: { reason?: string }) => item.reason === "reviewed_knowledge_candidate_hit"),
+    "expected reviewed knowledge fallback trace",
   );
 
   await rm(dir, { recursive: true, force: true });

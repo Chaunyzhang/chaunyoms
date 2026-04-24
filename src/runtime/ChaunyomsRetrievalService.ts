@@ -6,26 +6,17 @@ import {
   FixedPrefixProvider,
   KnowledgeDocumentIndexEntry,
   KnowledgeRepository,
-  NavigationRepository,
   ProjectRecord,
   RetrievalDecision,
   SemanticCandidate,
   SummaryEntry,
-  VectorSearchFallbackRepository,
 } from "../types";
 import {
   LifecycleContext,
   OpenClawPayloadAdapter,
 } from "../host/OpenClawPayloadAdapter";
-import {
-  HostFunctionContainer,
-  OpenClawApiLike,
-} from "../host/OpenClawHostTypes";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
 import { OmsExpandResult, OmsGrepHit } from "../data/SQLiteRuntimeStore";
-
-const EMBEDDINGS_API_PROMPT =
-  "Current retrieval path needs embeddings search. Ask the user whether to configure an embeddings API now (for example OpenAI or SiliconFlow), or let them skip for now.";
 
 interface ToolResponse {
   content: Array<Record<string, unknown>>;
@@ -38,38 +29,30 @@ interface SemanticExpansionResult {
   durableHits: DurableMemoryEntry[];
   summaryHits: SummaryEntry[];
   projectHit: ProjectRecord | null;
-  vectorHint: { text: string; source?: string; score?: number } | null;
 }
 
 export interface RetrievalLayerDependencies {
   fixedPrefixProvider: FixedPrefixProvider;
-  navigationRepository: NavigationRepository;
-  vectorSearchFallback: VectorSearchFallbackRepository;
 }
 
 export class ChaunyomsRetrievalService {
   private readonly recallResolver = new RecallResolver();
   private readonly retrievalRouter = new MemoryRetrievalRouter();
   private readonly fixedPrefixProvider: FixedPrefixProvider;
-  private readonly navigationRepository: NavigationRepository;
-  private readonly vectorSearchFallback: VectorSearchFallbackRepository;
 
   constructor(
     private readonly runtime: ChaunyomsSessionRuntime,
     private readonly payloadAdapter: OpenClawPayloadAdapter,
-    private readonly getApi: () => OpenClawApiLike | undefined,
     dependencies: RetrievalLayerDependencies,
   ) {
     this.fixedPrefixProvider = dependencies.fixedPrefixProvider;
-    this.navigationRepository = dependencies.navigationRepository;
-    this.vectorSearchFallback = dependencies.vectorSearchFallback;
   }
 
   async executeMemoryRoute(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const stores = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
-    const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
+    const { decision } = await this.resolveRetrievalDecision(query, context);
     const semanticExpansion = await this.collectSemanticExpansion({
       query,
       context,
@@ -90,7 +73,7 @@ export class ChaunyomsRetrievalService {
       query,
       context,
       decision,
-      promptForApi,
+      false,
       semanticExpansion,
       configGuidance.warnings,
     );
@@ -105,78 +88,6 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  async executeRecallDetail(args: unknown): Promise<ToolResponse> {
-    const context = this.resolveContext(args);
-    const { rawStore, summaryStore, durableMemoryStore, projectStore } = await this.runtime.getSessionStores(context);
-    const query = this.getQuery(args);
-    if (!query) {
-      return this.buildMissingQueryResponse("recall_detail");
-    }
-
-    const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
-    const matchedProject = this.matchProject(
-      query,
-      projectStore.getAll().filter((project) => project.status !== "archived"),
-    );
-    const semanticExpansion = await this.collectSemanticExpansion({
-      query,
-      context,
-      decision,
-      durableEntries: durableMemoryStore.getAll(),
-      knowledgeHits: [],
-      summaryHits: summaryStore.search(query, { sessionId: context.sessionId }),
-      projects: projectStore.getAll().filter((project) => project.status !== "archived"),
-      matchedProject,
-    });
-    if (promptForApi) {
-      return this.attachDiagnostics(
-        this.buildEmbeddingsPromptResponse(decision),
-        query,
-        context,
-        decision,
-        semanticExpansion,
-        true,
-      );
-    }
-
-    if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
-      const durableHits = this.searchDurableHits(
-        durableMemoryStore.getAll(),
-        query,
-        matchedProject?.id,
-        5,
-      );
-      return this.attachDiagnostics(
-        this.buildRecallDisabledResponse(query, durableHits, context, decision),
-        query,
-        context,
-        decision,
-        semanticExpansion,
-      );
-    }
-
-    const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
-    const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
-    return this.attachDiagnostics({
-      content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
-      details: {
-        ok: true,
-        route: decision.route,
-        retrievalLabel: this.describeRetrievalRoute(decision),
-        query,
-        recallBudget,
-        consumedTokens: result.consumedTokens,
-        hitCount: result.items.length,
-        retrievalHitType: this.getRetrievalHitType(decision),
-        routePlan: decision.routePlan,
-        layerScores: decision.layerScores ?? [],
-        explanation: decision.explanation,
-        dagTrace: result.dagTrace,
-        sourceTrace: result.sourceTrace,
-      },
-    }, query, context, decision, semanticExpansion);
-  }
-
   async executeMemoryRetrieve(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
@@ -185,36 +96,18 @@ export class ChaunyomsRetrievalService {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
 
-    const { decision, promptForApi } = await this.resolveRetrievalDecision(query, context);
+    const { decision } = await this.resolveRetrievalDecision(query, context);
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
-    const durableHits = this.searchDurableHits(
-      durableMemoryStore.getAll(),
-      query,
-      matchedProject?.id,
-      3,
-    );
-    const managedKnowledgeHits = knowledgeStore.searchRelatedDocuments(query, 6);
-    const semanticExpansion = await this.collectSemanticExpansion({
-      query,
-      context,
-      decision,
-      durableEntries: durableMemoryStore.getAll(),
-      knowledgeHits: managedKnowledgeHits,
-      summaryHits: summaryStore.search(query, { sessionId: context.sessionId }),
-      projects: activeProjects,
-      matchedProject,
-    });
-    if (promptForApi) {
-      return this.attachDiagnostics(
-        this.buildEmbeddingsPromptResponse(decision),
+    const emptyExpansion = this.emptySemanticExpansion(matchedProject);
+    const durableHits = decision.route === "durable_memory" || decision.requiresSourceRecall
+      ? this.searchDurableHits(
+        durableMemoryStore.getAll(),
         query,
-        context,
-        decision,
-        semanticExpansion,
-        true,
-      );
-    }
+        matchedProject?.id,
+        3,
+      )
+      : [];
 
     if ((decision.requiresSourceRecall || decision.route === "summary_tree") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
       return this.attachDiagnostics(
@@ -222,7 +115,7 @@ export class ChaunyomsRetrievalService {
         query,
         context,
         decision,
-        semanticExpansion,
+        emptyExpansion,
       );
     }
 
@@ -233,7 +126,7 @@ export class ChaunyomsRetrievalService {
         query,
         context,
         decision,
-        semanticExpansion,
+        emptyExpansion,
       );
     }
 
@@ -255,8 +148,25 @@ export class ChaunyomsRetrievalService {
           matchedProjectId: decision.matchedProjectId ?? null,
           matchedProjectTitle: decision.matchedProjectTitle ?? null,
         },
-      }, query, context, decision, semanticExpansion);
+      }, query, context, decision, emptyExpansion);
     }
+
+    const shouldCheckKnowledge = decision.route === "knowledge" || decision.route === "recent_tail";
+    const managedKnowledgeHits = shouldCheckKnowledge
+      ? knowledgeStore.searchRelatedDocuments(query, 6)
+      : [];
+    const knowledgeExpansion = managedKnowledgeHits.length > 0
+      ? await this.collectSemanticExpansion({
+        query,
+        context,
+        decision,
+        durableEntries: [],
+        knowledgeHits: managedKnowledgeHits,
+        summaryHits: [],
+        projects: [],
+        matchedProject,
+      })
+      : emptyExpansion;
 
     if (decision.route === "knowledge" && managedKnowledgeHits.length > 0) {
       return this.attachDiagnostics(
@@ -269,8 +179,28 @@ export class ChaunyomsRetrievalService {
         query,
         context,
         decision,
-        semanticExpansion,
+        knowledgeExpansion,
       );
+    }
+
+    if (decision.route === "recent_tail" && managedKnowledgeHits.length > 0) {
+      const result = await this.buildUnifiedKnowledgeResult(
+        query,
+        knowledgeStore,
+        managedKnowledgeHits,
+        decision,
+      );
+      return this.attachDiagnostics({
+        ...result,
+        details: {
+          ...result.details,
+          fallbackTrace: [{
+            from: decision.route,
+            to: "knowledge",
+            reason: "reviewed_knowledge_candidate_hit",
+          }],
+        },
+      }, query, context, decision, knowledgeExpansion);
     }
 
     if (this.shouldAutoRecall(decision, context)) {
@@ -280,7 +210,7 @@ export class ChaunyomsRetrievalService {
           query,
           context,
           decision,
-          semanticExpansion,
+          emptyExpansion,
         );
       }
 
@@ -304,35 +234,7 @@ export class ChaunyomsRetrievalService {
           dagTrace: result.dagTrace,
           sourceTrace: result.sourceTrace,
         },
-      }, query, context, decision, semanticExpansion);
-    }
-
-    if (decision.route === "navigation") {
-      const hit = await this.navigationRepository.getNavigationStateHit(
-        context.config.workspaceDir,
-        query,
-      );
-      return this.attachDiagnostics(
-        this.buildRouteHitResult(hit, decision, query),
-        query,
-        context,
-        decision,
-        semanticExpansion,
-      );
-    }
-
-    if (decision.route === "shared_insights") {
-      const hit = await this.fixedPrefixProvider.getSharedInsightHit(
-        context.config.sharedDataDir,
-        query,
-      );
-      return this.attachDiagnostics(
-        this.buildRouteHitResult(hit, decision, query),
-        query,
-        context,
-        decision,
-        semanticExpansion,
-      );
+      }, query, context, decision, emptyExpansion);
     }
 
     if (decision.route === "knowledge") {
@@ -346,112 +248,31 @@ export class ChaunyomsRetrievalService {
           query,
           context,
           decision,
-          semanticExpansion,
+          knowledgeExpansion,
         );
       }
     }
 
-    const semanticAuthority = await this.buildSemanticAuthorityResult(
-      query,
-      args,
-      context,
-      decision,
-      semanticExpansion,
-      rawStore,
-      summaryStore,
-      knowledgeStore,
-    );
-    if (semanticAuthority) {
-      return this.attachDiagnostics(
-        semanticAuthority,
-        query,
-        context,
-        decision,
-        semanticExpansion,
-      );
-    }
-
-    if (decision.route === "vector_search" && semanticExpansion.vectorHint) {
-      return this.attachDiagnostics({
-        content: [{
-          type: "text",
-          text: [
-            "Semantic vector hint only. Treat as a candidate, not as source-verified fact.",
-            "",
-            semanticExpansion.vectorHint.text,
-          ].join("\n"),
-        }],
-        details: {
-          ok: true,
-          route: decision.route,
-          retrievalLabel: this.describeRetrievalRoute(decision),
-          query,
-          retrievalHitType: "vector_retrieval",
-          autoRecall: false,
-          autoRecallReason: null,
-          routePlan: decision.routePlan,
-          layerScores: decision.layerScores ?? [],
-          explanation: decision.explanation,
-          source: semanticExpansion.vectorHint.source,
-          score: semanticExpansion.vectorHint.score ?? null,
-          vectorActsAsAuthority: false,
-          fallbackTrace: [{
-            from: decision.route,
-            to: "none",
-            reason: "vector_hint_available_but_no_authoritative_follow_up_hit",
-          }],
-        },
-      }, query, context, decision, semanticExpansion);
-    }
-
-    if (durableHits.length > 0) {
-      return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatDurableMemoryText(query, durableHits) }],
-        details: {
-          ok: true,
-          route: decision.route,
-          retrievalLabel: this.describeRetrievalRoute(decision),
-          query,
-          hitCount: durableHits.length,
-          retrievalHitType: "durable_memory",
-          autoRecall: false,
-          autoRecallReason: null,
-          routePlan: decision.routePlan,
-          layerScores: decision.layerScores ?? [],
-          explanation: decision.explanation,
-          fallbackTrace: [{
-            from: decision.route,
-            to: "durable_memory",
-            reason: "primary_route_empty_but_durable_hits_available",
-          }],
-        },
-      }, query, context, decision, semanticExpansion);
-    }
-
-    const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
-    const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
+    const recentTail = rawStore.getRecentTail(3, { sessionId: context.sessionId });
     return this.attachDiagnostics({
-      content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
+      content: [{ type: "text", text: this.formatRecentTailText(query, recentTail) }],
       details: {
         ok: true,
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
         query,
-        consumedTokens: result.consumedTokens,
-        hitCount: result.items.length,
-        retrievalHitType: this.getRetrievalHitType(decision),
+        hitCount: recentTail.length,
+        retrievalHitType: "recent_tail",
         routePlan: decision.routePlan,
         layerScores: decision.layerScores ?? [],
         explanation: decision.explanation,
         fallbackTrace: [{
           from: decision.route,
-          to: "summary_tree",
-          reason: "primary_route_empty_or_no_direct_hit",
+          to: "recent_tail",
+          reason: "standard_path_no_authoritative_hit",
         }],
-        dagTrace: result.dagTrace,
-        sourceTrace: result.sourceTrace,
       },
-    }, query, context, decision, semanticExpansion);
+    }, query, context, decision, emptyExpansion);
   }
 
   async executeOmsGrep(args: unknown): Promise<ToolResponse> {
@@ -607,7 +428,6 @@ export class ChaunyomsRetrievalService {
     semanticExpansion: SemanticExpansionResult,
     configWarnings: string[],
   ): Record<string, unknown> {
-    const embeddingsReady = this.payloadAdapter.hasEmbeddingsRetrievalReady();
     return {
       ok: true,
       query,
@@ -626,17 +446,17 @@ export class ChaunyomsRetrievalService {
       shouldAutoRecall: this.shouldAutoRecall(decision, context),
       autoRecallReason: this.explainAutoRecall(decision, context),
       promptForApi,
-      apiPrompt: promptForApi ? EMBEDDINGS_API_PROMPT : null,
+      apiPrompt: null,
       autoRecallEnabled: context.config.autoRecallEnabled,
       emergencyBrake: context.config.emergencyBrake,
       configPreset: context.config.configPreset,
       configWarnings,
       semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
       semanticCandidateLimit: context.config.semanticCandidateLimit,
-      embeddingsReady,
+      embeddingsReady: false,
       candidateExpansionMode:
         context.config.semanticCandidateExpansionEnabled
-          ? (embeddingsReady ? "hybrid" : "heuristic_only")
+          ? "heuristic_only"
           : "disabled",
       semanticCandidates: semanticExpansion.candidates.map((candidate) => ({
         kind: candidate.kind,
@@ -653,7 +473,7 @@ export class ChaunyomsRetrievalService {
       semanticAuthorityAvailable: semanticExpansion.candidates.some(
         (candidate) => candidate.authority === "authoritative",
       ),
-      semanticHintAvailable: Boolean(semanticExpansion.vectorHint),
+      semanticHintAvailable: false,
     };
   }
 
@@ -668,14 +488,13 @@ export class ChaunyomsRetrievalService {
     matchedProject: ProjectRecord | null;
   }): Promise<SemanticExpansionResult> {
     const expansionEnabled = args.context.config.semanticCandidateExpansionEnabled;
-    if (!expansionEnabled && args.decision.route !== "vector_search") {
+    if (!expansionEnabled) {
       return {
         candidates: [],
         knowledgeHits: [],
         durableHits: [],
         summaryHits: [],
         projectHit: args.matchedProject,
-        vectorHint: null,
       };
     }
     const terms = this.semanticTerms(args.query);
@@ -800,21 +619,6 @@ export class ChaunyomsRetrievalService {
       }
     }
 
-    const vectorHint = (expansionEnabled || args.decision.route === "vector_search")
-      ? await this.tryVectorRetrieve(args.query, args.context.config)
-      : null;
-    if (vectorHint) {
-      candidates.push({
-        kind: "vector_hint",
-        id: vectorHint.source ?? "vector-hint",
-        title: "Vector semantic hint",
-        score: Number(vectorHint.score ?? 0),
-        reasons: ["vector_candidate_hint"],
-        authority: "hint",
-        sourceRoute: "vector_search",
-      });
-    }
-
     return {
       candidates: [...candidates]
         .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
@@ -823,120 +627,17 @@ export class ChaunyomsRetrievalService {
       durableHits: durableHits.map((item) => item.entry),
       summaryHits: summaryHits.map((item) => item.entry),
       projectHit,
-      vectorHint,
     };
   }
 
-  private async buildSemanticAuthorityResult(
-    query: string,
-    args: unknown,
-    context: LifecycleContext,
-    decision: RetrievalDecision,
-    semanticExpansion: SemanticExpansionResult,
-    rawStore: Parameters<RecallResolver["resolve"]>[2],
-    summaryStore: Parameters<RecallResolver["resolve"]>[1],
-    knowledgeStore: KnowledgeRepository,
-  ): Promise<ToolResponse | null> {
-    const candidate = semanticExpansion.candidates.find(
-      (item) => item.authority === "authoritative",
-    );
-    if (!candidate) {
-      return null;
-    }
-
-    switch (candidate.kind) {
-      case "knowledge":
-        if (semanticExpansion.knowledgeHits.length === 0) {
-          return null;
-        }
-        {
-          const result = await this.buildUnifiedKnowledgeResult(
-          query,
-          knowledgeStore,
-          semanticExpansion.knowledgeHits,
-          decision,
-        );
-          return {
-            ...result,
-            details: {
-              ...result.details,
-              fallbackTrace: [{
-                from: decision.route,
-                to: "knowledge",
-                reason: "semantic_candidate_authority_hit",
-              }],
-            },
-          };
-        }
-      case "durable_memory":
-        if (semanticExpansion.durableHits.length === 0) {
-          return null;
-        }
-        return {
-          content: [{ type: "text", text: this.formatDurableMemoryText(query, semanticExpansion.durableHits) }],
-          details: {
-            ok: true,
-            route: decision.route,
-            retrievalLabel: this.describeRetrievalRoute(decision),
-            query,
-            hitCount: semanticExpansion.durableHits.length,
-            retrievalHitType: "durable_memory",
-            fallbackTrace: [{
-              from: decision.route,
-              to: "durable_memory",
-              reason: "semantic_candidate_authority_hit",
-            }],
-          },
-        };
-      case "project_registry":
-        {
-          const result = this.buildProjectRegistryResult(
-            semanticExpansion.projectHit,
-            decision,
-            query,
-          );
-          return {
-            ...result,
-            details: {
-              ...result.details,
-              fallbackTrace: [{
-                from: decision.route,
-                to: "project_registry",
-                reason: "semantic_candidate_authority_hit",
-              }],
-            },
-          };
-        }
-      case "summary":
-        if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
-          return null;
-        }
-        {
-          const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
-          const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget);
-          return {
-            content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace) }],
-            details: {
-              ok: true,
-              route: decision.route,
-              retrievalLabel: this.describeRetrievalRoute(decision),
-              query,
-              consumedTokens: result.consumedTokens,
-              hitCount: result.items.length,
-              retrievalHitType: "summary_tree_recall",
-              fallbackTrace: [{
-                from: decision.route,
-                to: "summary_tree",
-                reason: "semantic_candidate_authority_hit",
-              }],
-              dagTrace: result.dagTrace,
-              sourceTrace: result.sourceTrace,
-            },
-          };
-        }
-      default:
-        return null;
-    }
+  private emptySemanticExpansion(projectHit: ProjectRecord | null = null): SemanticExpansionResult {
+    return {
+      candidates: [],
+      knowledgeHits: [],
+      durableHits: [],
+      summaryHits: [],
+      projectHit,
+    };
   }
 
   private resolveContext(args: unknown): LifecycleContext {
@@ -992,27 +693,8 @@ export class ChaunyomsRetrievalService {
   private async resolveRetrievalDecision(
     query: string,
     context: LifecycleContext,
-  ): Promise<{ decision: RetrievalDecision; promptForApi: boolean }> {
-    const memorySearchEnabled = this.payloadAdapter.hasEmbeddingsRetrievalReady();
+  ): Promise<{ decision: RetrievalDecision }> {
     const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
-    const [hasKnowledgeRawHint, hasSharedInsightHint, hasNavigationHint, hasStructuredNavigationState] =
-      await Promise.all([
-        this.fixedPrefixProvider.hasKnowledgeBaseTopicHit(
-          context.config.sharedDataDir,
-          query,
-        ),
-        this.fixedPrefixProvider.hasSharedInsightHint(
-          context.config.sharedDataDir,
-          query,
-        ),
-        this.navigationRepository.hasNavigationHint(
-          context.config.workspaceDir,
-          query,
-        ),
-        this.navigationRepository.hasStructuredNavigationState(
-          context.config.workspaceDir,
-        ),
-      ]);
     const projects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, projects);
     const scopedDurableHits = this.searchDurableHits(
@@ -1023,12 +705,8 @@ export class ChaunyomsRetrievalService {
     );
     const hasKnowledgeHits = knowledgeStore.searchRelatedDocuments(query, 1).length > 0;
     const decision = this.retrievalRouter.decide(query, {
-      memorySearchEnabled,
       hasKnowledgeHits,
-      hasKnowledgeRawHint,
-      hasSharedInsightHint,
-      hasNavigationHint,
-      hasStructuredNavigationState,
+      hasKnowledgeRawHint: false,
       hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
       hasProjectRegistry: projects.length > 0,
       hasDurableHits: scopedDurableHits.length > 0,
@@ -1040,7 +718,6 @@ export class ChaunyomsRetrievalService {
     });
     return {
       decision,
-      promptForApi: decision.requiresEmbeddings && !memorySearchEnabled,
     };
   }
 
@@ -1130,6 +807,19 @@ export class ChaunyomsRetrievalService {
       `Durable memory hits for: ${query}`,
       ...items.map((item, index) => `${index + 1}. [${item.kind}] ${item.text}`),
     ].join("\n");
+  }
+
+  private formatRecentTailText(
+    query: string,
+    items: Array<{ turnNumber: number; role: string; content: string }>,
+  ): string {
+    if (items.length === 0) {
+      return `No standard retrieval hit found for query: ${query}`;
+    }
+    return [
+      `Recent context for: ${query}`,
+      ...items.map((item) => `[turn ${item.turnNumber}] ${item.role}: ${item.content}`),
+    ].join("\n\n");
   }
 
   private searchDurableHits(
@@ -1472,28 +1162,6 @@ export class ChaunyomsRetrievalService {
     ].join("\n");
   }
 
-  private buildEmbeddingsPromptResponse(decision: RetrievalDecision): ToolResponse {
-    return {
-      content: [{ type: "text", text: EMBEDDINGS_API_PROMPT }],
-      details: {
-        ok: false,
-        route: decision.route,
-        retrievalLabel: this.describeRetrievalRoute(decision),
-        promptForApi: true,
-        requiresEmbeddings: true,
-        retrievalHitType: this.getRetrievalHitType(decision),
-        routePlan: decision.routePlan,
-        layerScores: decision.layerScores ?? [],
-        explanation: decision.explanation,
-        fallbackTrace: [{
-          from: decision.route,
-          to: "none",
-          reason: "embeddings_configuration_required",
-        }],
-      },
-    };
-  }
-
   private buildRecallDisabledResponse(
     query: string,
     durableHits: DurableMemoryEntry[],
@@ -1525,115 +1193,6 @@ export class ChaunyomsRetrievalService {
           reason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
         }],
       },
-    };
-  }
-
-  private async tryVectorRetrieve(
-    query: string,
-    config: LifecycleContext["config"],
-  ): Promise<{ text: string; source?: string; score?: number } | null> {
-    const api = this.getApi();
-
-    const runtimeCandidate =
-      (await this.callVectorSearchCandidate(api?.memorySearch, "search", query)) ??
-      (await this.callVectorSearchCandidate(api?.memorySearch, "query", query)) ??
-      (await this.callVectorSearchCandidate(api?.context?.memorySearch, "search", query)) ??
-      (await this.callVectorSearchCandidate(api?.context?.memorySearch, "query", query)) ??
-      (await this.callVectorSearchCandidate(api?.runtime?.memorySearch, "search", query)) ??
-      (await this.callVectorSearchCandidate(api?.runtime?.memorySearch, "query", query));
-    if (runtimeCandidate) {
-      return runtimeCandidate;
-    }
-
-    return await this.vectorSearchFallback.search(query, config);
-  }
-
-  private async callVectorSearchCandidate(
-    target: HostFunctionContainer | undefined,
-    method: "search" | "query",
-    query: string,
-  ): Promise<{ text: string; source?: string; score?: number } | null> {
-    if (!target) {
-      return null;
-    }
-    const fn = target?.[method];
-    if (typeof fn !== "function") {
-      return null;
-    }
-    const invoke = fn as (...args: unknown[]) => unknown;
-
-    const byObject = await this.tryVectorSearchCall(
-      invoke,
-      target,
-      { query, topK: 3, k: 3 },
-      method,
-    );
-    if (byObject) {
-      return byObject;
-    }
-
-    return await this.tryVectorSearchCall(invoke, target, query, method);
-  }
-
-  private async tryVectorSearchCall(
-    fn: (...args: unknown[]) => unknown,
-    target: HostFunctionContainer,
-    input: unknown,
-    method: "search" | "query",
-  ): Promise<{ text: string; source?: string; score?: number } | null> {
-    try {
-      const value = await Promise.resolve(fn.call(target, input));
-      return this.parseVectorSearchResult(value, method);
-    } catch {
-      // Host-provided vector APIs vary by shape; failures intentionally fall through
-      // to the next candidate form before using the local fallback store.
-      return null;
-    }
-  }
-
-  private parseVectorSearchResult(
-    value: unknown,
-    method: "search" | "query",
-  ): { text: string; source?: string; score?: number } | null {
-    if (!value) {
-      return null;
-    }
-
-    const container = this.isRecord(value) ? value : {};
-    const list = Array.isArray(value)
-      ? value
-      : Array.isArray(container.hits)
-        ? container.hits
-        : Array.isArray(container.items)
-          ? container.items
-          : Array.isArray(container.results)
-            ? container.results
-            : [];
-    const first = list[0] ?? container.hit ?? container.result;
-    if (!first) {
-      return null;
-    }
-    if (typeof first === "string") {
-      return { text: first, source: method };
-    }
-    if (!this.isRecord(first)) {
-      return null;
-    }
-
-    const text =
-      first.content ??
-      first.text ??
-      first.chunk ??
-      first.snippet ??
-      first.document;
-    if (typeof text !== "string" || !text.trim()) {
-      return null;
-    }
-    const source = first.source ?? first.filePath ?? first.path ?? method;
-    return {
-      text: text.trim(),
-      source: typeof source === "string" && source.trim() ? source : method,
-      score: typeof first.score === "number" ? first.score : undefined,
     };
   }
 
@@ -1669,7 +1228,7 @@ export class ChaunyomsRetrievalService {
 
   private getRetrievalHitType(
     decision: RetrievalDecision,
-  ): "route_hit" | "summary_tree_recall" | "vector_retrieval" | "recent_tail" | "project_registry" | "durable_memory" | "knowledge" {
+  ): "route_hit" | "summary_tree_recall" | "recent_tail" | "project_registry" | "durable_memory" | "knowledge" {
     if (decision.route === "project_registry") {
       return "project_registry";
     }
@@ -1679,17 +1238,8 @@ export class ChaunyomsRetrievalService {
     if (decision.route === "knowledge") {
       return "knowledge";
     }
-    if (
-      decision.route === "navigation" ||
-      decision.route === "shared_insights"
-    ) {
-      return "route_hit";
-    }
     if (decision.route === "summary_tree") {
       return "summary_tree_recall";
-    }
-    if (decision.route === "vector_search") {
-      return "vector_retrieval";
     }
     return "recent_tail";
   }
@@ -1706,12 +1256,6 @@ export class ChaunyomsRetrievalService {
         return "summary tree -> raw recall";
       case "knowledge":
         return "unified knowledge";
-      case "navigation":
-        return "navigation route hit";
-      case "shared_insights":
-        return "shared-insights route hit";
-      case "vector_search":
-        return "vector retrieval";
       default:
         return decision.route;
     }

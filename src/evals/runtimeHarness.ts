@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 
 import { StablePrefixAdapter } from "../data/StablePrefixAdapter";
-import { VectorSearchFallbackStore } from "../data/VectorSearchFallbackStore";
 import { DEFAULT_BRIDGE_CONFIG } from "../host/OpenClawHostServices";
 import { OpenClawPayloadAdapter } from "../host/OpenClawPayloadAdapter";
 import { ChaunyomsRetrievalService } from "../runtime/ChaunyomsRetrievalService";
@@ -159,11 +158,8 @@ export async function buildEvalHarness(caseDef: EvalCaseDefinition): Promise<{
   const retrieval = new ChaunyomsRetrievalService(
     runtime,
     payloadAdapter,
-    () => ({ config: {} }),
     {
       fixedPrefixProvider: new StablePrefixAdapter(),
-      navigationRepository: new StablePrefixAdapter(),
-      vectorSearchFallback: new VectorSearchFallbackStore(),
     },
   );
 

@@ -33,7 +33,7 @@ export const pluginConfigSchema = {
     },
     enableTools: {
       type: "boolean",
-      description: "Register retrieval tools such as memory_route and memory_retrieve.",
+      description: "Register the standard ChaunyOMS tool surface: memory_retrieve plus raw/source trace utilities.",
     },
     contextWindow: {
       type: "number",

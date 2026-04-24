@@ -461,13 +461,6 @@ export interface HostFixedContextProvider {
   estimateWorkspaceBootstrapTokens(workspaceDir: string): Promise<number>;
 }
 
-export interface VectorSearchFallbackRepository {
-  search(
-    query: string,
-    config: Pick<BridgeConfig, "sharedDataDir">,
-  ): Promise<{ text: string; source?: string; score?: number } | null>;
-}
-
 export interface SummaryResult {
   summary: string;
   keywords: string[];
@@ -607,10 +600,7 @@ export type RetrievalRoute =
   | "project_registry"
   | "durable_memory"
   | "summary_tree"
-  | "knowledge"
-  | "navigation"
-  | "shared_insights"
-  | "vector_search";
+  | "knowledge";
 
 export interface RetrievalDecision {
   route: RetrievalRoute;
@@ -635,8 +625,7 @@ export type SemanticCandidateKind =
   | "project_registry"
   | "durable_memory"
   | "summary"
-  | "knowledge"
-  | "vector_hint";
+  | "knowledge";
 
 export interface SemanticCandidate {
   kind: SemanticCandidateKind;

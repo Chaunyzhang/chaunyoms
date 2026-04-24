@@ -11,8 +11,6 @@ import { ChaunyomsSessionRuntime } from "../runtime/ChaunyomsSessionRuntime";
 import { createRuntimeLayerDependencies } from "../runtime/createRuntimeLayerDependencies";
 import {
   FixedPrefixProvider,
-  NavigationRepository,
-  VectorSearchFallbackRepository,
 } from "../types";
 
 function assert(condition: unknown, message: string): void {
@@ -23,7 +21,7 @@ function assert(condition: unknown, message: string): void {
 
 type FailureScenario = {
   id: string;
-  kind: "recall_disabled" | "vector_hint_only" | "prompt_for_api";
+  kind: "recall_disabled" | "standard_no_authority" | "prompt_for_api";
   query: string;
   expectedTextIncludes: string[];
   expectedDetails: Record<string, string | boolean | undefined>;
@@ -37,18 +35,9 @@ const fixedPrefixProvider: FixedPrefixProvider = {
   async hasKnowledgeBaseTopicHit() { return false; },
 };
 
-const navigationRepository: NavigationRepository = {
-  async getNavigationHit() { return null; },
-  async getNavigationStateHit() { return null; },
-  async hasNavigationHint() { return false; },
-  async hasStructuredNavigationState() { return false; },
-  async writeNavigationSnapshot() { return { written: false }; },
-};
-
 async function buildRuntime(
   configOverrides: Partial<typeof DEFAULT_BRIDGE_CONFIG>,
   apiConfig: Record<string, unknown>,
-  vectorSearchFallback?: VectorSearchFallbackRepository,
 ): Promise<{
   runtime: ChaunyomsSessionRuntime;
   retrieval: ChaunyomsRetrievalService;
@@ -89,13 +78,8 @@ async function buildRuntime(
   const retrieval = new ChaunyomsRetrievalService(
     runtime,
     payloadAdapter,
-    () => ({ config: apiConfig }),
     {
       fixedPrefixProvider,
-      navigationRepository,
-      vectorSearchFallback: vectorSearchFallback ?? {
-        async search() { return null; },
-      },
     },
   );
 
@@ -160,28 +144,10 @@ async function main(): Promise<void> {
       continue;
     }
 
-    if (scenario.kind === "vector_hint_only") {
+    if (scenario.kind === "standard_no_authority") {
       const { retrieval, config, dir } = await buildRuntime(
         {},
-        {
-          agents: {
-            defaults: {
-              memorySearch: {
-                enabled: true,
-                provider: "fake-embed",
-              },
-            },
-          },
-        },
-        {
-          async search() {
-            return {
-              text: "Vector hint mentions architecture docs but has no governed source attached.",
-              source: "failure-corpus-vector",
-              score: 2,
-            };
-          },
-        },
+        {},
       );
       try {
         const result = await retrieval.executeMemoryRetrieve({

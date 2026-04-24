@@ -16,7 +16,6 @@ function assert(condition: unknown, message: string): void {
 }
 
 const baseContext: RouteContext = {
-  memorySearchEnabled: true,
   hasCompactedHistory: true,
 };
 
@@ -29,24 +28,24 @@ const fixtures: Array<{
   { name: "empty query", query: "", route: "recent_tail" },
   { name: "exact Chinese source recall", query: "找一下原文参数", route: "summary_tree" },
   { name: "English historical recall", query: "what happened earlier with the gateway?", route: "summary_tree" },
-  { name: "project status", query: "当前状态是什么", context: { hasProjectRegistry: true }, route: "project_registry" },
+  { name: "generic status no longer implies project registry", query: "当前状态是什么", context: { hasProjectRegistry: true }, route: "recent_tail" },
   { name: "current project next step", query: "this project next step", context: { hasProjectRegistry: true }, route: "project_registry" },
   { name: "durable constraint", query: "what constraint config must we remember?", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "durable rule", query: "remember the rule", context: { hasDurableHits: true }, route: "durable_memory" },
   { name: "current exact fact prefers durable", query: "what is the current exact queue_window now", context: { hasDurableHits: true }, route: "durable_memory" },
-  { name: "shared insight fuzzy", query: "search shared insights something related", route: "vector_search" },
-  { name: "shared insight direct", query: "shared insights", context: { hasSharedInsightHint: true }, route: "shared_insights" },
+  { name: "shared insight fuzzy is no longer a primary route", query: "search shared insights something related", route: "recent_tail" },
+  { name: "shared insight direct is no longer a primary route", query: "shared insights", route: "recent_tail" },
   { name: "knowledge hit", query: "knowledge base architecture docs", context: { hasKnowledgeHits: true }, route: "knowledge" },
   { name: "raw knowledge", query: "raw knowledge in knowledge base", route: "knowledge" },
-  { name: "knowledge fuzzy vector", query: "knowledge base something related", context: { hasKnowledgeHits: false }, route: "vector_search" },
-  { name: "knowledge unified miss", query: "知识库里有没有资料", context: { hasKnowledgeHits: false, memorySearchEnabled: false }, route: "knowledge" },
-  { name: "navigation complex current work", query: "current task plan risk", context: { hasStructuredNavigationState: true }, route: "navigation" },
-  { name: "project registry beats navigation", query: "current task plan risk", context: { hasProjectRegistry: true, hasStructuredNavigationState: true }, route: "project_registry" },
+  { name: "knowledge fuzzy stays in unified knowledge", query: "knowledge base something related", context: { hasKnowledgeHits: false }, route: "knowledge" },
+  { name: "knowledge unified miss", query: "知识库里有没有资料", context: { hasKnowledgeHits: false }, route: "knowledge" },
+  { name: "navigation no longer owns current work without project registry", query: "current task plan risk", route: "recent_tail" },
+  { name: "project registry beats navigation", query: "current task plan risk", context: { hasProjectRegistry: true }, route: "project_registry" },
   { name: "durable terms without hits", query: "constraint config", context: { hasDurableHits: false }, route: "summary_tree" },
   { name: "plain recent", query: "hello there", context: { hasCompactedHistory: false }, route: "recent_tail" },
   { name: "generic fuzzy stays tail", query: "find something related", context: { hasCompactedHistory: false }, route: "recent_tail" },
   { name: "knowledge raw hint", query: "knowledge base docs", context: { hasKnowledgeRawHint: true, hasKnowledgeHits: false }, route: "knowledge" },
-  { name: "project state with navigation only", query: "current task plan next action", context: { hasStructuredNavigationState: true }, route: "navigation" },
+  { name: "project state without registry stays recent", query: "current task plan next action", route: "recent_tail" },
 ];
 
 function raw(overrides: Partial<RawMessage> & Pick<RawMessage, "id" | "sessionId" | "content" | "turnNumber">): RawMessage {

@@ -11,28 +11,26 @@
     }
   },
   {
-    "id": "vector-hint-does-not-pretend-authority",
-    "kind": "vector_hint_only",
+    "id": "vector-hint-path-is-not-standard-authority",
+    "kind": "standard_no_authority",
     "query": "something related to architecture docs in the knowledge base",
     "expectedTextIncludes": [
-      "Semantic vector hint only",
-      "candidate, not as source-verified fact"
+      "No standard retrieval hit found"
     ],
     "expectedDetails": {
-      "retrievalHitType": "vector_retrieval",
-      "vectorActsAsAuthority": false
+      "retrievalHitType": "recent_tail"
     }
   },
   {
-    "id": "embeddings-required-prompts-instead-of-faking-results",
+    "id": "shared-insights-no-longer-prompts-for-embeddings",
     "kind": "prompt_for_api",
     "query": "search shared insights something related",
     "expectedTextIncludes": [
-      "configure an embeddings API"
+      "shared_insights_no_longer_primary_route"
     ],
     "expectedDetails": {
-      "promptForApi": true,
-      "requiresEmbeddings": true
+      "promptForApi": false,
+      "requiresEmbeddings": false
     }
   }
 ]

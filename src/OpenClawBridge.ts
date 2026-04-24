@@ -15,7 +15,6 @@ import {
 import { createRuntimeLayerDependencies } from "./runtime/createRuntimeLayerDependencies";
 import { ChaunyomsRetrievalService } from "./runtime/ChaunyomsRetrievalService";
 import { StablePrefixAdapter } from "./data/StablePrefixAdapter";
-import { VectorSearchFallbackStore } from "./data/VectorSearchFallbackStore";
 
 export class OpenClawBridge {
   private api?: OpenClawApiLike;
@@ -26,7 +25,6 @@ export class OpenClawBridge {
   );
   private readonly stablePrefixAdapter = new StablePrefixAdapter();
   private readonly runtimeDependencies = createRuntimeLayerDependencies();
-  private readonly vectorSearchFallback = new VectorSearchFallbackStore();
   private readonly runtime = new ChaunyomsSessionRuntime(
     this.logger,
     null,
@@ -36,14 +34,10 @@ export class OpenClawBridge {
   private readonly retrieval = new ChaunyomsRetrievalService(
     this.runtime,
     this.payloadAdapter,
-    () => this.api,
     {
       fixedPrefixProvider: this.stablePrefixAdapter,
-      navigationRepository: this.stablePrefixAdapter,
-      vectorSearchFallback: this.vectorSearchFallback,
     },
   );
-  private readonly embeddingsPromptedSessions = new Set<string>();
 
   register(api: OpenClawApiLike): void {
     this.api = api;
@@ -68,15 +62,6 @@ export class OpenClawBridge {
       semanticCandidateLimit: resolvedConfig.semanticCandidateLimit,
       warnings: configGuidance.warnings,
     });
-    if (
-      resolvedConfig.semanticCandidateExpansionEnabled &&
-      !this.payloadAdapter.hasEmbeddingsRetrievalReady()
-    ) {
-      this.logger.info("semantic_candidate_degraded_to_heuristic_mode", {
-        preset: configGuidance.preset,
-        reason: "embeddings_unavailable",
-      });
-    }
     for (const warning of configGuidance.warnings) {
       this.logger.warn("config_guidance_warning", { warning });
     }
@@ -110,7 +95,6 @@ export class OpenClawBridge {
     bootstrapped: boolean;
     importedMessages?: number;
     reason?: string;
-    embeddingsSetupRequired?: boolean;
   }> {
     const context = this.payloadAdapter.resolveLifecycleContext(
       payload,
@@ -120,7 +104,6 @@ export class OpenClawBridge {
     return {
       bootstrapped: true,
       importedMessages: result.importedMessages,
-      embeddingsSetupRequired: this.needsEmbeddingsSetupPrompt(context.sessionId),
     };
   }
 
@@ -141,9 +124,6 @@ export class OpenClawBridge {
       payload,
       this.runtime.getConfig(),
     );
-    const embeddingsPrompt = this.consumeEmbeddingsSetupPrompt(context.sessionId)
-      ? "ChaunyOMS detected that memorySearch embeddings are not configured yet. Proactively ask the user whether they want to configure memorySearch embeddings for OpenClaw now, and only guide setup if they agree."
-      : undefined;
     if (context.runtimeMessages.length > 0) {
       const estimatedRuntimeTokens = context.runtimeMessages.reduce(
         (sum, message) => sum + Math.max(Math.ceil(message.text.length / 4), 1),
@@ -159,7 +139,6 @@ export class OpenClawBridge {
       return {
         messages: this.toAgentMessages(runtimeResult.items),
         estimatedTokens: runtimeResult.estimatedTokens,
-        systemPromptAddition: embeddingsPrompt,
       };
     }
 
@@ -167,7 +146,6 @@ export class OpenClawBridge {
     return {
       messages: this.toAgentMessages(result.items),
       estimatedTokens: result.estimatedTokens,
-      systemPromptAddition: embeddingsPrompt,
     };
   }
 
@@ -214,48 +192,8 @@ export class OpenClawBridge {
     };
 
     register(
-      "memory_route",
-      "Explain which memory layer should handle a query, whether embeddings are required, and whether the system should ask the user to configure an embeddings API.",
-      {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "The user query or retrieval intent to classify.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeMemoryRoute(args),
-    );
-
-    register(
-      "recall_detail",
-      "Recall original conversation details from the compressed memory system by searching summaries and expanding matching source messages.",
-      {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "The detail or topic to recall from earlier in the conversation.",
-          },
-          budget: {
-            type: "number",
-            description: "Optional token budget for recalled raw messages.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeRecallDetail(args),
-    );
-
-    register(
       "memory_retrieve",
-      "Run the memory routing decision and return the first practical retrieval result from agent assets, unified knowledge, DAG recall, or an embeddings API prompt.",
+      "Primary ChaunyOMS retrieval entrypoint. Returns the best standard result from active memory, reviewed knowledge, or source-backed historical recall.",
       {
         type: "object",
         properties: {
@@ -356,74 +294,6 @@ export class OpenClawBridge {
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsReplay(args),
     );
-
-    register(
-      "lcm_describe",
-      "Compatibility alias of memory_route for legacy chaunym-claw prompts.",
-      {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "User query to classify." },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeMemoryRoute(args),
-    );
-
-    register(
-      "lcm_grep",
-      "Compatibility alias of recall_detail for source-level historical recall.",
-      {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Recall query." },
-          budget: {
-            type: "number",
-            description: "Optional token budget for recall.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeRecallDetail(args),
-    );
-
-    register(
-      "lcm_expand_query",
-      "Compatibility alias of memory_retrieve for integrated route-hit/DAG/vector retrieval.",
-      {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Retrieval query." },
-          budget: {
-            type: "number",
-            description: "Optional token budget when source recall is needed.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeMemoryRetrieve(args),
-    );
-  }
-
-  private needsEmbeddingsSetupPrompt(sessionId: string): boolean {
-    return (
-      !this.payloadAdapter.hasEmbeddingsRetrievalReady() &&
-      !this.embeddingsPromptedSessions.has(sessionId)
-    );
-  }
-
-  private consumeEmbeddingsSetupPrompt(sessionId: string): boolean {
-    if (!this.needsEmbeddingsSetupPrompt(sessionId)) {
-      return false;
-    }
-    this.embeddingsPromptedSessions.add(sessionId);
-    return true;
   }
 
   private toAgentMessages(items: ContextItem[]): Array<Record<string, unknown>> {

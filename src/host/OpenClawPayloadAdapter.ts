@@ -153,34 +153,6 @@ export class OpenClawPayloadAdapter {
     };
   }
 
-  hasEmbeddingsRetrievalReady(): boolean {
-    const api = this.getApi();
-    if (
-      typeof api?.memorySearch?.search === "function" ||
-      typeof api?.memorySearch?.query === "function" ||
-      typeof api?.context?.memorySearch?.search === "function" ||
-      typeof api?.context?.memorySearch?.query === "function" ||
-      typeof api?.runtime?.memorySearch?.search === "function" ||
-      typeof api?.runtime?.memorySearch?.query === "function"
-    ) {
-      return true;
-    }
-
-    const memorySearch = api?.config?.agents?.defaults?.memorySearch;
-    if (!memorySearch || memorySearch.enabled !== true) {
-      return false;
-    }
-
-    return Boolean(
-      memorySearch.provider ??
-        memorySearch.profile ??
-        memorySearch.model ??
-        memorySearch.embedModel ??
-        memorySearch.baseUrl ??
-        memorySearch.endpoint,
-    );
-  }
-
   extractTextFromContent(content: unknown): string {
     if (typeof content === "string") {
       return content;

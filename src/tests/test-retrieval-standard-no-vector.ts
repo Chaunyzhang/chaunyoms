@@ -7,7 +7,7 @@ import { OpenClawPayloadAdapter } from "../host/OpenClawPayloadAdapter";
 import { ChaunyomsRetrievalService } from "../runtime/ChaunyomsRetrievalService";
 import { ChaunyomsSessionRuntime } from "../runtime/ChaunyomsSessionRuntime";
 import { createRuntimeLayerDependencies } from "../runtime/createRuntimeLayerDependencies";
-import { FixedPrefixProvider, NavigationRepository, VectorSearchFallbackRepository } from "../types";
+import { FixedPrefixProvider } from "../types";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
@@ -65,31 +65,11 @@ async function main(): Promise<void> {
     async hasSharedInsightHint() { return false; },
     async hasKnowledgeBaseTopicHit() { return false; },
   };
-  const navigationRepository: NavigationRepository = {
-    async getNavigationHit() { return null; },
-    async getNavigationStateHit() { return null; },
-    async hasNavigationHint() { return false; },
-    async hasStructuredNavigationState() { return false; },
-    async writeNavigationSnapshot() { return { written: false }; },
-  };
-  const vectorSearchFallback: VectorSearchFallbackRepository = {
-    async search() {
-      return {
-        text: "Vector fallback result for architecture docs.",
-        source: "adapter-test",
-        score: 3,
-      };
-    },
-  };
-
   const retrieval = new ChaunyomsRetrievalService(
     runtime,
     payloadAdapter,
-    () => ({ config: {} }),
     {
       fixedPrefixProvider,
-      navigationRepository,
-      vectorSearchFallback,
     },
   );
 
@@ -99,15 +79,15 @@ async function main(): Promise<void> {
     query: "something related to architecture docs in the knowledge base",
   });
 
-  assert(result.details.route === "vector_search", "expected router to choose vector search");
-  assert(result.details.source === "adapter-test", "expected retrieval to use the injected vector fallback adapter");
+  assert(result.details.route === "knowledge", "expected knowledge queries to stay in the unified knowledge route");
+  assert(result.details.retrievalHitType === "recent_tail", "expected no vector hit in the standard runtime path");
   assert(
-    String(result.content[0]?.text ?? "").includes("Vector fallback result"),
-    "expected vector fallback text to be returned",
+    String(result.content[0]?.text ?? "").includes("No standard retrieval hit found"),
+    "expected standard fallback text when no reviewed knowledge exists",
   );
 
   await rm(dir, { recursive: true, force: true });
-  console.log("test-retrieval-vector-fallback-adapter passed");
+  console.log("test-retrieval-standard-no-vector passed");
 }
 
 void main();

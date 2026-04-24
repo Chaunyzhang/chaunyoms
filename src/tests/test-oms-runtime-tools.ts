@@ -63,6 +63,10 @@ async function main(): Promise<void> {
 
     assert(tools.has("oms_expand"), "oms_expand should be registered");
     assert(tools.has("oms_trace"), "oms_trace should be registered");
+    assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
+    assert(!tools.has("memory_route"), "memory_route should not be registered on the standard tool surface");
+    assert(!tools.has("recall_detail"), "recall_detail should not be registered on the standard tool surface");
+    assert(!tools.has("lcm_grep"), "legacy lcm aliases should not be registered on the standard tool surface");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -126,17 +126,18 @@
       }
     },
     {
-      "id": "shared-insights-needs-embeddings",
-      "title": "Shared Insights Prompt For Embeddings",
-      "description": "When fuzzy shared-insights retrieval requires embeddings, the system should prompt instead of inventing results.",
-      "tags": ["abstention", "degraded_mode", "route_accuracy"],
+      "id": "shared-insights-collapses-to-standard-path",
+      "title": "Shared Insights Collapses To Standard Path",
+      "description": "Shared-insights fuzzy search is no longer a default primary route; the standard runtime should avoid prompting for embeddings and fall back to recent tail.",
+      "tags": ["degraded_mode", "route_accuracy"],
       "mode": "route",
       "query": "search shared insights something related",
       "expected": {
-        "mustInclude": ["configure an embeddings API"],
+        "mustInclude": ["Shared insights are no longer a separate primary route"],
         "detailEquals": {
-          "promptForApi": true,
-          "requiresEmbeddings": true
+          "promptForApi": false,
+          "requiresEmbeddings": false,
+          "retrievalHitType": "recent_tail"
         }
       }
     }

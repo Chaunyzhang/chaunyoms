@@ -220,7 +220,7 @@ export class ContextAssembler {
     const content = [
       "[lcm_recall_guidance]",
       "Compacted summaries exist in chaunyoms.",
-      "Use `memory_retrieve` for route-aware recall and `recall_detail` for source-level details.",
+      "Use `memory_retrieve` as the primary recall entrypoint; use `oms_expand`/`oms_trace` only when source inspection is explicitly needed.",
       "Treat navigation/index hits as hints, not final facts.",
       "For exact constraints/parameters/quotes, continue recall to source messages.",
     ].join("\n");
