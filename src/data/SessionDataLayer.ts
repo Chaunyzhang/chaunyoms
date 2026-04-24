@@ -68,6 +68,8 @@ export class SessionDataLayer {
   private boundSessionId: string | null = null;
   private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"> | null = null;
   private readonly sourceMessageResolver = new SourceMessageResolver();
+  private runtimeMirrorSignature: string | null = null;
+  private runtimeMirrorDirty = false;
 
   constructor(private readonly logger: LoggerLike) {}
 
@@ -175,7 +177,6 @@ export class SessionDataLayer {
     await this.knowledgeRawStore.init();
     await this.knowledgeStore.init();
     await this.projectStore.init();
-    await this.runtimeStore.init();
     await this.agentVault.ensureLayout();
     this.boundAgentId = config.agentId;
     this.boundSessionId = sessionId;
@@ -186,7 +187,8 @@ export class SessionDataLayer {
       knowledgeBaseDir: config.knowledgeBaseDir,
       memoryVaultDir: config.memoryVaultDir,
     };
-    await this.mirrorRuntimeState();
+    this.runtimeMirrorSignature = null;
+    this.runtimeMirrorDirty = false;
     return this.getStores();
   }
 
@@ -207,6 +209,7 @@ export class SessionDataLayer {
 
   async appendRawMessage(message: RawMessage): Promise<void> {
     await this.getStores().rawStore.append(message);
+    this.runtimeMirrorDirty = true;
   }
 
   async appendObservation(entry: ObservationEntry): Promise<void> {
@@ -214,7 +217,11 @@ export class SessionDataLayer {
   }
 
   async addDurableEntries(entries: DurableMemoryEntry[]): Promise<number> {
-    return await this.getStores().durableMemoryStore.addEntries(entries);
+    const added = await this.getStores().durableMemoryStore.addEntries(entries);
+    if (added > 0) {
+      this.runtimeMirrorDirty = true;
+    }
+    return added;
   }
 
   async writeNavigationSnapshot(snapshot: string): Promise<string | null> {
@@ -262,11 +269,20 @@ export class SessionDataLayer {
     if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore) {
       return;
     }
+    const messages = this.rawStore.getAll();
+    const summaries = this.summaryStore.getAllSummaries();
+    const memories = this.durableMemoryStore.getAll();
+    const signature = this.buildRuntimeMirrorSignature(messages, summaries, memories);
+    if (!this.runtimeMirrorDirty && this.runtimeMirrorSignature === signature) {
+      return;
+    }
     await this.runtimeStore.mirror({
-      messages: this.rawStore.getAll(),
-      summaries: this.summaryStore.getAllSummaries(),
-      memories: this.durableMemoryStore.getAll(),
+      messages,
+      summaries,
+      memories,
     });
+    this.runtimeMirrorSignature = signature;
+    this.runtimeMirrorDirty = false;
   }
 
   recordContextPlan(args: {
@@ -331,11 +347,37 @@ export class SessionDataLayer {
     }
 
     if (repairedRanges > 0) {
+      this.runtimeMirrorDirty = true;
       await this.mirrorRuntimeState();
       this.logger.info("summary_compaction_state_repaired", {
         repairedRanges,
       });
     }
+  }
+
+  private buildRuntimeMirrorSignature(
+    messages: RawMessage[],
+    summaries: SummaryEntry[],
+    memories: DurableMemoryEntry[],
+  ): string {
+    const lastMessage = messages[messages.length - 1];
+    const lastSummary = summaries[summaries.length - 1];
+    const lastMemory = memories[memories.length - 1];
+    const compactedMessages = messages.reduce((count, message) => count + (message.compacted ? 1 : 0), 0);
+    const activeMemories = memories.reduce((count, memory) => count + (memory.recordStatus === "active" ? 1 : 0), 0);
+    return [
+      messages.length,
+      compactedMessages,
+      lastMessage?.id ?? "",
+      lastMessage?.sequence ?? "",
+      summaries.length,
+      lastSummary?.id ?? "",
+      lastSummary?.createdAt ?? "",
+      memories.length,
+      activeMemories,
+      lastMemory?.id ?? "",
+      lastMemory?.createdAt ?? "",
+    ].join("|");
   }
 
   private resolveAgentDataDir(config: BridgeConfig): string {

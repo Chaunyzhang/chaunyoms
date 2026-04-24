@@ -81,6 +81,8 @@ export class SQLiteRuntimeStore {
   private db: SQLiteDatabaseLike | null = null;
   private initPromise: Promise<void> | null = null;
   private enabled = false;
+  private schemaReady = false;
+  private ftsReady = false;
 
   constructor(private readonly options: RuntimeStoreOptions) {}
 
@@ -377,6 +379,7 @@ export class SQLiteRuntimeStore {
     this.enabled = true;
     this.configureDatabase();
     this.createSchema();
+    this.schemaReady = true;
     this.closeDatabase();
   }
 
@@ -391,6 +394,10 @@ export class SQLiteRuntimeStore {
     this.db = new DatabaseSync(this.options.dbPath);
     this.enabled = true;
     this.configureDatabase();
+    if (!this.schemaReady) {
+      this.createSchema();
+      this.schemaReady = true;
+    }
     return true;
   }
 
@@ -556,9 +563,9 @@ export class SQLiteRuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_candidates_run ON retrieval_candidates(context_run_id, status);
     `);
 
-    this.createFtsTable("messages_fts", "id UNINDEXED, content");
-    this.createFtsTable("memories_fts", "id UNINDEXED, text");
-    this.createFtsTable("assets_fts", "doc_id UNINDEXED, title, summary");
+    // FTS is deliberately lazy. Exact/LIKE search remains canonical today, so
+    // boot and normal mirroring should not pay virtual-table setup or refresh
+    // costs until a future semantic/FTS path explicitly enables it.
   }
 
   private createFtsTable(tableName: string, columns: string): void {
@@ -603,6 +610,16 @@ export class SQLiteRuntimeStore {
       this.stringify(message.metadata ?? {}),
     );
     this.refreshFts("messages_fts", "id", message.id, [message.content]);
+  }
+
+  private ensureFtsSchema(): void {
+    if (this.ftsReady) {
+      return;
+    }
+    this.createFtsTable("messages_fts", "id UNINDEXED, content");
+    this.createFtsTable("memories_fts", "id UNINDEXED, text");
+    this.createFtsTable("assets_fts", "doc_id UNINDEXED, title, summary");
+    this.ftsReady = true;
   }
 
   private upsertSummary(summary: SummaryEntry): void {
@@ -852,7 +869,11 @@ export class SQLiteRuntimeStore {
   }
 
   private refreshFts(tableName: string, idColumn: string, id: string, fields: string[]): void {
+    if (!this.ftsReady) {
+      return;
+    }
     try {
+      this.ensureFtsSchema();
       this.db?.prepare(`DELETE FROM ${tableName} WHERE ${idColumn} = ?`).run(id);
       if (tableName === "assets_fts") {
         this.db?.prepare("INSERT INTO assets_fts (doc_id, title, summary) VALUES (?, ?, ?)")
