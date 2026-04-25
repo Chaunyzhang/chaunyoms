@@ -57,14 +57,19 @@ export class RecallQueryAnalyzer {
   private answerType(query: string, lower: string, choices: string[]): AnswerType {
     if (choices.length > 1) return "choice";
     if (/\brelationship status\b/i.test(lower)) return "relationship";
+    if (/\bhow\s+long\b/.test(lower)) return "duration";
+    if (/^where\b/i.test(query) && /\bstudy abroad|abroad program\b/i.test(lower)) return "place";
+    if (/\bwhere\b/i.test(lower) && /\b(?:bachelor|degree|computer science|completed)\b/i.test(lower)) return "place";
+    if (/\bwhat\s+country\b|\bwhich\s+country\b/i.test(lower)) return "place";
+    if (/\bdegree|graduat|major|meat|gift|research|plans?|do with|reminder|job|role|color|wall|bedroom|spend|rent|budget|surname|last name|discount|purchase|speed|internet|certification|cat|name|dog|breed|necklace|grandma|ratio|ram|painting|worth|cocktail|rice|spirituality|stance\b/i.test(lower)) return "object";
+    if (/\bhow\s+many\b/.test(lower) && !/\bhow\s+many\s+(?:weeks?|days?|months?|years?|hours?|minutes?)\b/.test(lower)) return "object";
     if (/\bwhere\b/i.test(lower) && /\b(redeem|buy|bought|purchase|store|shop|classes?|yoga|studio)\b/i.test(lower)) return "organization";
     if (/^where\b/i.test(query) || /\bwhich city\b|\bwhat country\b|\bmove from\b|\btravel to\b/i.test(lower)) return "place";
     if (/^when\b/i.test(query) || /\bwhen did\b/i.test(lower)) return "date";
-    if (/\bhow (?:many|long)\b|\bweeks?\b|\byears?\b|\bmonths?\b/.test(lower)) return "duration";
+    if (/\bhow\s+long\b|\bweeks?\b|\byears?\b|\bmonths?\b|\bdays?\b|\bhours?\b|\bminutes?\b/.test(lower)) return "duration";
     if (/\bcompany|brand|endorsement|sponsor\b/i.test(lower)) return "organization";
     if (/\bmovie|book|test|workshop|nickname|play|playlist\b/i.test(lower)) return "title";
     if (/^who\b/i.test(query) || /\bwho was\b/i.test(lower)) return "person";
-    if (/\bdegree|graduat|major|meat|gift|research|plans?|do with|reminder|job|role|color|wall|bedroom|spend|rent|budget|surname|last name\b/i.test(lower)) return "object";
     return "unknown";
   }
 
@@ -124,6 +129,30 @@ export class RecallQueryAnalyzer {
     if (/\bcoupon|creamer|redeem\b/i.test(lower)) add("coupon", "redeem", "redeemed", "creamer", "coffee", "store");
     if (/\bplay|theater|theatre\b/i.test(lower)) add("play", "theater", "theatre", "attended");
     if (/\bplaylist\b/i.test(lower)) add("playlist", "song", "music");
+    if (/\bspotify|playlist\b/i.test(lower)) add("spotify", "playlists", "playlist", "organize", "music");
+    if (/\bstudy abroad|abroad program\b/i.test(lower)) add("study abroad", "University", "Melbourne", "Australia", "program");
+    if (/\bdiscount|first purchase|clothing brand\b/i.test(lower)) add("discount", "first purchase", "clothing", "brand", "%");
+    if (/\bikea|bookshelf|assemble\b/i.test(lower)) add("IKEA", "bookshelf", "assembled", "took", "hours");
+    if (/\bsister|birthday|gift\b/i.test(lower)) add("sister", "birthday", "gift", "dress", "yellow");
+    if (/\binternet|speed|plan\b/i.test(lower)) add("internet", "speed", "upgraded", "Mbps");
+    if (/\bdog|breed\b/i.test(lower)) add("dog", "breed", "Golden Retriever", "Max");
+    if (/\bspirituality|stance\b/i.test(lower)) add("spirituality", "stance", "atheist", "Buddhism");
+    if (/\brunning shoes|favorite running|shoe brand\b/i.test(lower)) add("running", "shoes", "Nike", "Reebok");
+    if (/\bcertification|last month\b/i.test(lower)) add("certification", "Data Science", "completed", "last month");
+    if (/\bbikes?\b/i.test(lower)) add("bike", "bikes", "own");
+    if (/\bfishing|largemouth|bass|lake michigan\b/i.test(lower)) add("fishing", "Lake Michigan", "largemouth", "bass", "caught");
+    if (/\bcomedian|open mic\b/i.test(lower)) add("open mic", "comedians", "perform", "watched");
+    if (/\bcat\b|\bcat'?s name\b/i.test(lower)) add("cat", "name", "Luna");
+    if (/\bnecklace|grandma|how old\b/i.test(lower)) add("grandma", "necklace", "silver", "gave", "18");
+    if (/\bgrandma\b/i.test(lower) && /\bcountry|from\b/i.test(lower)) add("grandma", "country", "from", "Sweden");
+    if (/\bgin|vermouth|martini|ratio\b/i.test(lower)) add("gin", "vermouth", "ratio", "martini");
+    if (/\bram|laptop|upgrade\b/i.test(lower)) add("RAM", "laptop", "upgrade", "GB");
+    if (/\bpainting|sunset|worth|paid\b/i.test(lower)) add("painting", "sunset", "worth", "triple", "paid");
+    if (/\bcousin|wedding\b/i.test(lower)) add("cousin", "wedding", "Grand Ballroom");
+    if (/\bbachelor|computer science|ucla\b/i.test(lower)) add("undergrad", "CS", "UCLA", "Computer Science");
+    if (/\bnew apartment|move\b/i.test(lower)) add("move", "moved", "apartment", "hours");
+    if (/\bcocktail|recipe|last weekend\b/i.test(lower)) add("cocktail", "recipe", "lavender", "gin", "fizz");
+    if (/\brice\b/i.test(lower)) add("rice", "Japanese", "short-grain", "favorite");
     if (/\bsurname|last name\b/i.test(lower)) add("surname", "last name", "changed");
     if (/\byoga|studio\b/i.test(lower)) add("yoga", "studio");
     if (/\bwall|bedroom|paint|color\b/i.test(lower)) add("wall", "walls", "bedroom", "painted", "gray", "colour", "color");

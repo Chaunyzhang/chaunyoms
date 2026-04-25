@@ -973,7 +973,16 @@ export class ChaunyomsRetrievalService {
     plan: ReturnType<ContextPlanner["plan"]>;
   } {
     const source = result.strategy === "raw_first" ? "raw_exact_search" : "summary_context";
-    const candidates = result.items.map((item, index) => this.contextPlanner.buildCandidate(item, source, index));
+    const answerEvidenceIds = new Set((result.answerCandidates ?? []).flatMap((candidate) => candidate.evidenceMessageIds));
+    const candidates = result.items.map((item, index) => {
+      const candidate = this.contextPlanner.buildCandidate(item, source, index);
+      const messageId = typeof item.metadata?.messageId === "string" ? item.metadata.messageId : null;
+      if (messageId && answerEvidenceIds.has(messageId)) {
+        candidate.score += 120;
+        candidate.reasons.push("answer_evidence");
+      }
+      return candidate;
+    });
     const plan = this.contextPlanner.plan(candidates, { budget: recallBudget });
     return {
       items: plan.selected.map((candidate) => candidate.item),
@@ -995,13 +1004,13 @@ export class ChaunyomsRetrievalService {
   }
 
   private resolveRawFtsHintLimit(args: unknown): number {
-    if (this.isRecord(args) && args.qualityMode === true) {
-      return 50;
+    const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
+    const floor = deepRecall ? 96 : 48;
+    const explicit = this.getOptionalNumberArg(args, "rawFtsLimit");
+    if (typeof explicit === "number") {
+      return Math.max(floor, Math.min(200, Math.floor(explicit)));
     }
-    if (this.isRecord(args) && args.deepRecall === true) {
-      return 50;
-    }
-    return 48;
+    return floor;
   }
 
   private getScopeArg(args: unknown): "session" | "agent" {
