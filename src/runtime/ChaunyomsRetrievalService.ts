@@ -101,7 +101,9 @@ export class ChaunyomsRetrievalService {
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
     const emptyExpansion = this.emptySemanticExpansion(matchedProject);
-    const durableHits = decision.route === "durable_memory" || decision.requiresSourceRecall
+    const durableHits = decision.route === "durable_memory" ||
+      ((decision.requiresSourceRecall || decision.route === "summary_tree") &&
+        (!context.config.autoRecallEnabled || context.config.emergencyBrake))
       ? this.searchDurableHits(
         durableMemoryStore.getAll(),
         query,
@@ -152,7 +154,8 @@ export class ChaunyomsRetrievalService {
       }, query, context, decision, emptyExpansion);
     }
 
-    const shouldCheckKnowledge = decision.route === "knowledge" || decision.route === "recent_tail";
+    const shouldCheckKnowledge = decision.route === "knowledge" ||
+      (decision.route === "recent_tail" && this.shouldProbeKnowledgeFallback(query, context));
     const managedKnowledgeHits = shouldCheckKnowledge
       ? knowledgeStore.searchRelatedDocuments(query, 6)
       : [];
@@ -408,6 +411,98 @@ export class ChaunyomsRetrievalService {
         messageCount: messages.length,
       },
     };
+  }
+
+  async executeOmsStatus(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const status = await this.runtime.getStatus(context);
+    return this.jsonToolResponse("oms_status", status, status.ok);
+  }
+
+  async executeOmsVerify(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const report = await this.runtime.verify(context);
+    return this.jsonToolResponse("oms_verify", report, report.ok);
+  }
+
+  async executeOmsDoctor(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const status = await this.runtime.getStatus(context);
+    const verify = await this.runtime.verify(context);
+    const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
+    const warnings = [
+      ...configGuidance.warnings,
+      ...verify.warnings,
+      ...(context.config.emergencyBrake ? ["emergencyBrake is enabled: automatic compaction/promotion paths are intentionally conservative."] : []),
+      ...(status.runtimeStore.enabled ? [] : ["SQLite runtime is disabled; source recall tools will fall back to no-op results."]),
+      ...(context.config.knowledgePromotionEnabled ? [] : ["knowledgePromotionEnabled is false; Markdown asset promotion is opt-in/disabled."]),
+    ];
+    const errors = [...verify.errors];
+    const doctor = {
+      ok: errors.length === 0,
+      engineId: "chaunyoms",
+      activeRuntime: "sqlite-first runtime, markdown-first assets",
+      status,
+      verify,
+      configGuidance,
+      warnings,
+      errors,
+      nextActions: errors.length > 0
+        ? ["Run oms_verify for details, then restore from backup or repair source bindings before trusting recalled evidence."]
+        : ["Runtime is healthy. Use oms_inspect_context/oms_why_recalled when you need explainability."],
+    };
+    return this.jsonToolResponse("oms_doctor", doctor, doctor.ok);
+  }
+
+  async executeOmsBackup(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const label = this.getStringArg(args, "label");
+    const result = await this.runtime.backup(context, label);
+    return this.jsonToolResponse("oms_backup", result, result.ok);
+  }
+
+  async executeOmsRestore(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const backupDir = this.getStringArg(args, "backupDir");
+    if (!backupDir) {
+      return {
+        content: [{ type: "text", text: "oms_restore requires backupDir." }],
+        details: { ok: false, tool: "oms_restore", reason: "missing_backupDir" },
+      };
+    }
+    const apply = this.getBooleanArg(args, "apply", false);
+    const result = await this.runtime.restore(context, backupDir, apply);
+    return this.jsonToolResponse("oms_restore", result, result.ok);
+  }
+
+  async executeOmsInspectContext(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const runId = this.getStringArg(args, "runId") || undefined;
+    const inspection = runtimeStore.inspectContextRun(runId);
+    return this.jsonToolResponse("oms_inspect_context", {
+      ok: Boolean(inspection.run),
+      runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+      dbPath: runtimeStore.getPath(),
+      ...inspection,
+    }, Boolean(inspection.run));
+  }
+
+  async executeOmsWhyRecalled(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const report = runtimeStore.whyRecalled({
+      targetId: this.getStringArg(args, "id") || this.getStringArg(args, "targetId") || undefined,
+      query: this.getStringArg(args, "query") || undefined,
+      runId: this.getStringArg(args, "runId") || undefined,
+      limit: this.getNumberArg(args, "limit", 10),
+    });
+    return this.jsonToolResponse("oms_why_recalled", {
+      ok: report.matches.length > 0,
+      runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
+      dbPath: runtimeStore.getPath(),
+      ...report,
+    }, report.matches.length > 0);
   }
 
   private attachDiagnostics(
@@ -678,6 +773,26 @@ export class ChaunyomsRetrievalService {
     return typeof value === "number" ? value : fallback;
   }
 
+  private getBooleanArg(args: unknown, key: string, fallback: boolean): boolean {
+    if (!this.isRecord(args)) {
+      return fallback;
+    }
+    const value = args[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+        return true;
+      }
+      if (["0", "false", "no", "n", "off"].includes(normalized)) {
+        return false;
+      }
+    }
+    return fallback;
+  }
+
   private getOptionalNumberArg(args: unknown, key: string): number | undefined {
     if (!this.isRecord(args)) {
       return undefined;
@@ -715,6 +830,21 @@ export class ChaunyomsRetrievalService {
     return args.deepRecall === true || args.rawFts === true || args.qualityMode === true;
   }
 
+  private jsonToolResponse(tool: string, details: object, ok = true): ToolResponse {
+    const payload = details as Record<string, unknown>;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ tool, ...payload }, null, 2),
+      }],
+      details: {
+        tool,
+        ok,
+        ...payload,
+      },
+    };
+  }
+
   private async resolveRetrievalDecision(
     query: string,
     context: LifecycleContext,
@@ -722,13 +852,17 @@ export class ChaunyomsRetrievalService {
     const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
     const projects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, projects);
-    const scopedDurableHits = this.searchDurableHits(
-      durableMemoryStore.getAll(),
-      query,
-      matchedProject?.id,
-      3,
-    );
-    const hasKnowledgeHits = knowledgeStore.searchRelatedDocuments(query, 1).length > 0;
+    const scopedDurableHits = this.shouldProbeDurableMemory(query)
+      ? this.searchDurableHits(
+        durableMemoryStore.getAll(),
+        query,
+        matchedProject?.id,
+        3,
+      )
+      : [];
+    const hasKnowledgeHits = this.shouldProbeKnowledgeDecision(query, context)
+      ? knowledgeStore.searchRelatedDocuments(query, 1).length > 0
+      : false;
     const decision = this.retrievalRouter.decide(query, {
       hasKnowledgeHits,
       hasKnowledgeRawHint: false,
@@ -842,6 +976,62 @@ export class ChaunyomsRetrievalService {
       messages,
       traces,
     ].filter(Boolean).join("\n");
+  }
+
+  private shouldProbeDurableMemory(query: string): boolean {
+    return /(current|latest|now|currently|updated|correction|after correction|exact|parameter|constraint|decision|rule|setting|config|remember|must|当前|最新|修正后|参数|约束|决策|规则|配置|记住)/i.test(query);
+  }
+
+  private shouldProbeKnowledgeDecision(query: string, context: LifecycleContext): boolean {
+    if (!context.config.semanticCandidateExpansionEnabled) {
+      return this.hasKnowledgeRouteTerms(query);
+    }
+    return this.hasKnowledgeRouteTerms(query);
+  }
+
+  private shouldProbeKnowledgeFallback(query: string, context: LifecycleContext): boolean {
+    if (!context.config.semanticCandidateExpansionEnabled) {
+      return false;
+    }
+    return this.hasKnowledgeRouteTerms(query);
+  }
+
+  private hasKnowledgeRouteTerms(query: string): boolean {
+    const terms = [
+      "knowledge[- ]?base",
+      "\\u77e5\\u8bc6\\u5e93",
+      "\\u6587\\u6863",
+      "\\u8d44\\u6599",
+      "topic-index",
+      "architecture docs?",
+      "\\u60f3\\u60f3",
+      "\\u53d1\\u6563",
+      "\\u7075\\u611f",
+      "\\u521b\\u9020\\u529b",
+      "\\u521b\\u610f",
+      "\\u77e5\\u8bc6\\u5e7f\\u5ea6",
+      "\\u7ecf\\u9a8c",
+      "\\u5b66\\u4e60",
+      "\\u501f\\u9274",
+      "\\u53c2\\u8003",
+      "\\u6700\\u4f73\\u5b9e\\u8df5",
+      "\\u6848\\u4f8b",
+      "\\u6a21\\u5f0f",
+      "lesson",
+      "learn",
+      "learning",
+      "experience",
+      "inspiration",
+      "creative",
+      "creativity",
+      "brainstorm",
+      "broaden",
+      "best practice",
+      "pattern",
+      "example",
+      "case study",
+    ];
+    return new RegExp(terms.join("|"), "i").test(query);
   }
 
   private formatDurableMemoryText(query: string, items: DurableMemoryEntry[]): string {

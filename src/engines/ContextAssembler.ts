@@ -119,6 +119,9 @@ export class ContextAssembler {
   }
 
   assembleSummaries(summaryStore: SummaryRepository, budget: number, sessionId?: string): ContextItem[] {
+    if (budget <= 0) {
+      return [];
+    }
     const rootSummaries = summaryStore.getRootSummaries({ sessionId });
     const sourceSummaries = rootSummaries.length > 0
       ? rootSummaries
@@ -130,7 +133,7 @@ export class ContextAssembler {
     let consumed = 0;
 
     for (const summary of summaries) {
-      if (consumed + summary.tokenCount > budget && selected.length > 0) {
+      if (consumed + summary.tokenCount > budget) {
         break;
       }
 
@@ -177,6 +180,9 @@ export class ContextAssembler {
   }
 
   assembleDurableMemory(durableMemoryStore: DurableMemoryRepository, budget: number): ContextItem[] {
+    if (budget <= 0) {
+      return [];
+    }
     const memories = [...durableMemoryStore.getAll()]
       .filter((entry) => entry.recordStatus === "active")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
@@ -187,7 +193,7 @@ export class ContextAssembler {
     for (const memory of memories) {
       const content = `[durable_memory:${memory.kind}] ${memory.text}`;
       const tokenCount = estimateTokens(content);
-      if (consumed + tokenCount > budget && selected.length > 0) {
+      if (consumed + tokenCount > budget) {
         break;
       }
 
@@ -263,13 +269,27 @@ export class ContextAssembler {
     const recallGuidance = options.includeSummaries === false
       ? null
       : this.buildRecallGuidance(summaryStore, options.sessionId);
-    const summaries = options.includeSummaries === false
-      ? []
-      : this.assembleSummaries(summaryStore, budget.summaryBudget, options.sessionId);
     const durableMemory = options.includeDurableMemory === false
       ? []
       : this.assembleDurableMemory(durableMemoryStore, budget.recallBudget);
-    const effectiveTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
+    const fixedPluginTokens = this.sumTokens(stablePrefix) +
+      (recallGuidance?.tokenCount ?? 0) +
+      this.sumTokens(durableMemory);
+    const protectedTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
+    const dynamicSummaryBudget = Math.max(
+      budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
+      0,
+    );
+    const summaries = options.includeSummaries === false
+      ? []
+      : this.assembleSummaries(summaryStore, dynamicSummaryBudget, options.sessionId);
+    const effectiveTailBudget = Math.min(
+      freshTailTokens,
+      Math.max(
+        budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
+        0,
+      ),
+    );
     const recentTail = this.assembleRecentTail(
       rawStore,
       effectiveTailBudget,
@@ -306,5 +326,9 @@ export class ContextAssembler {
     return entries.map((entry, index) =>
       this.planner.buildCandidate(entry.item, entry.source, index),
     );
+  }
+
+  private sumTokens(items: ContextItem[]): number {
+    return items.reduce((sum, item) => sum + Math.max(item.tokenCount, 0), 0);
   }
 }

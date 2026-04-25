@@ -45,6 +45,7 @@ async function main(): Promise<void> {
       content: "Remember TRACE_PORT=15432 for the runtime tool test.",
       turnNumber: 1,
     });
+    await bridge.assemble({ sessionId: config.sessionId, config });
 
     const grep = await tools.get("oms_grep")?.execute("tool-1", {
       sessionId: config.sessionId,
@@ -61,8 +62,62 @@ async function main(): Promise<void> {
     }) as { details?: Record<string, unknown> } | undefined;
     assert(replay?.details?.messageCount === 1, "oms_replay should replay the ingested turn");
 
+    const status = await tools.get("oms_status")?.execute("tool-3", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    const statusCounts = status?.details?.counts as Record<string, unknown> | undefined;
+    assert(statusCounts?.rawMessages === 1, "oms_status should report raw message count");
+
+    const verify = await tools.get("oms_verify")?.execute("tool-4", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(typeof verify?.details?.ok === "boolean", "oms_verify should return an ok flag");
+
+    const doctor = await tools.get("oms_doctor")?.execute("tool-5", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(doctor?.details?.engineId === "chaunyoms", "oms_doctor should identify the engine");
+
+    const inspect = await tools.get("oms_inspect_context")?.execute("tool-6", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(Boolean(inspect?.details?.run), "oms_inspect_context should expose the latest context run");
+
+    const why = await tools.get("oms_why_recalled")?.execute("tool-7", {
+      sessionId: config.sessionId,
+      config,
+      query: "TRACE_PORT",
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(Array.isArray(why?.details?.matches), "oms_why_recalled should return candidate matches");
+
+    const backup = await tools.get("oms_backup")?.execute("tool-8", {
+      sessionId: config.sessionId,
+      config,
+      label: "unit",
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(typeof backup?.details?.backupDir === "string", "oms_backup should create a backup directory");
+
+    const restore = await tools.get("oms_restore")?.execute("tool-9", {
+      sessionId: config.sessionId,
+      config,
+      backupDir: backup?.details?.backupDir,
+      apply: false,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(restore?.details?.apply === false, "oms_restore should default safely to dry-run validation");
+
     assert(tools.has("oms_expand"), "oms_expand should be registered");
     assert(tools.has("oms_trace"), "oms_trace should be registered");
+    assert(tools.has("oms_status"), "oms_status should be registered");
+    assert(tools.has("oms_doctor"), "oms_doctor should be registered");
+    assert(tools.has("oms_verify"), "oms_verify should be registered");
+    assert(tools.has("oms_backup"), "oms_backup should be registered");
+    assert(tools.has("oms_restore"), "oms_restore should be registered");
+    assert(tools.has("oms_inspect_context"), "oms_inspect_context should be registered");
+    assert(tools.has("oms_why_recalled"), "oms_why_recalled should be registered");
     assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
     assert(!tools.has("memory_route"), "memory_route should not be registered on the standard tool surface");
     assert(!tools.has("recall_detail"), "recall_detail should not be registered on the standard tool surface");

@@ -71,6 +71,7 @@ async function main(): Promise<void> {
       { sessionId },
     );
     assert(moveResult.strategy === "raw_first", "expected history QA to use raw-first recall");
+    assert(moveResult.dagTrace.length === 0, "expected raw-first success not to invoke DAG traversal");
     assert(
       moveResult.answerCandidates?.some((candidate) => candidate.text === "Sweden" && candidate.sourceVerified),
       "expected source-verified Sweden answer candidate",

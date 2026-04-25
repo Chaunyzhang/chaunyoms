@@ -100,22 +100,28 @@ async function main(): Promise<void> {
   const result = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
     config,
-    query: "How should queue workers back off after failures?",
+    query: "Check the knowledge base: how should queue workers back off after failures?",
   });
 
   const text = String(result.content[0]?.text ?? "");
-  assert(/capped exponential backoff/i.test(text), "expected semantic candidate fallback to reach authoritative knowledge");
-  assert(result.details.route === "recent_tail", "expected original router to stay on recent_tail for generic phrasing");
-  assert(result.details.retrievalHitType === "knowledge", "expected semantic fallback to return governed knowledge");
+  assert(/capped exponential backoff/i.test(text), "expected explicit knowledge-base query to reach governed knowledge");
+  assert(result.details.route === "knowledge", "expected explicit knowledge-base query to route directly");
+  assert(result.details.retrievalHitType === "knowledge", "expected explicit knowledge-base query to return governed knowledge");
   assert(
     Array.isArray(result.details.semanticCandidates) && result.details.semanticCandidates.length > 0,
     "expected semantic candidates diagnostics",
   );
-  assert(
-    Array.isArray(result.details.fallbackTrace) &&
-      result.details.fallbackTrace.some((item: { reason?: string }) => item.reason === "reviewed_knowledge_candidate_hit"),
-    "expected reviewed knowledge fallback trace",
-  );
+  assert(!Array.isArray(result.details.fallbackTrace), "expected no fallback trace when knowledge is selected directly");
+
+  const advisoryResult = await retrieval.executeMemoryRetrieve({
+    sessionId: config.sessionId,
+    config,
+    query: "From prior experience, think broadly about queue worker retry backoff.",
+  });
+  const advisoryText = String(advisoryResult.content[0]?.text ?? "");
+  assert(/capped exponential backoff/i.test(advisoryText), "expected experience/advisory query to reach governed knowledge");
+  assert(advisoryResult.details.route === "knowledge", "expected experience/advisory query to route to knowledge");
+  assert(advisoryResult.details.reason === "knowledge_advisory_query", "expected advisory knowledge route reason");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-semantic-candidate-expansion passed");

@@ -14,6 +14,18 @@ import { ContextPlannerResult } from "../engines/ContextPlanner";
 
 const nodeRequire = createRequire(__filename);
 
+const SQLITE_RUNTIME_STOP_WORDS = new Set([
+  "a", "about", "again", "an", "and", "answer", "any", "are", "as", "at",
+  "before", "between", "both", "by", "can", "could", "current", "did", "do",
+  "does", "earlier", "exact", "for", "from", "had", "has", "have", "he",
+  "her", "hers", "him", "his", "history", "how", "i", "in", "is", "it",
+  "latest", "many", "me", "memory", "my", "near", "of", "on", "or",
+  "previous", "question", "recall", "recent", "recently", "she", "source",
+  "status", "that", "the", "their", "them", "there", "these", "they", "this",
+  "to", "was", "were", "what", "when", "where", "which", "who", "whom",
+  "whose", "why", "with", "would", "you", "your",
+]);
+
 type SQLiteValue = string | number | bigint | null;
 
 interface SQLiteStatementLike {
@@ -48,6 +60,62 @@ export interface RuntimeContextRunRecord {
   selectedCount: number;
   rejectedCount: number;
   metadata?: Record<string, unknown>;
+}
+
+export interface RuntimeTableCounts {
+  messages: number;
+  summaries: number;
+  memories: number;
+  assets: number;
+  sourceEdges: number;
+  contextRuns: number;
+  retrievalCandidates: number;
+}
+
+export interface RuntimeStoreStatus {
+  enabled: boolean;
+  dbPath: string;
+  ftsReady: boolean;
+  counts: RuntimeTableCounts;
+}
+
+export interface RuntimeIntegrityReport extends RuntimeStoreStatus {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  orphanEdges: number;
+  summariesWithoutSource: number;
+  selectedCandidatesWithoutTarget: number;
+}
+
+export interface RuntimeCandidateRecord {
+  id: string;
+  contextRunId: string;
+  source: string;
+  authority: string;
+  targetKind: string;
+  targetId: string | null;
+  status: "selected" | "rejected";
+  score: number;
+  tokenCount: number;
+  reasons: string[];
+  rejectedReason: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface RuntimeContextRunInspection {
+  run: RuntimeContextRunRecord | null;
+  selected: RuntimeCandidateRecord[];
+  rejected: RuntimeCandidateRecord[];
+}
+
+export interface RuntimeWhyRecalledReport {
+  query: string | null;
+  targetId: string | null;
+  inspectedRunId: string | null;
+  matches: RuntimeCandidateRecord[];
+  latestRun: RuntimeContextRunRecord | null;
+  explanation: string;
 }
 
 export interface OmsGrepHit {
@@ -111,7 +179,10 @@ export class SQLiteRuntimeStore {
     if (!this.openDatabase()) {
       return;
     }
+    let transactionStarted = false;
     try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
       for (const message of args.messages) {
         this.upsertMessage(message);
       }
@@ -123,6 +194,17 @@ export class SQLiteRuntimeStore {
       }
       await this.mirrorAssetsFromMarkdownIndex();
       this.rebuildSourceEdges(args.summaries, args.memories);
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original mirror failure.
+        }
+      }
+      throw error;
     } finally {
       this.closeDatabase();
     }
@@ -266,11 +348,11 @@ export class SQLiteRuntimeStore {
     try {
       this.ensureFtsSchema();
       this.populateMessagesFtsIfEmpty();
-      const matchQuery = this.toFtsMatchQuery(query, terms);
-      if (!matchQuery) {
+      const matchQueries = this.toFtsMatchQueries(query, terms);
+      if (matchQueries.length === 0) {
         return [];
       }
-      return this.db.prepare(`
+      const statement = this.db.prepare(`
         SELECT m.*, bm25(messages_fts) AS fts_score
         FROM messages_fts
         JOIN messages m ON m.id = messages_fts.id
@@ -278,16 +360,30 @@ export class SQLiteRuntimeStore {
           AND (? IS NULL OR m.session_id = ?)
         ORDER BY fts_score ASC, m.sequence ASC, m.turn_number ASC
         LIMIT ?
-      `).all(matchQuery, sessionId ?? null, sessionId ?? null, limit)
-        .map((row) => {
+      `);
+      const byId = new Map<string, { message: RawMessage; score: number }>();
+      for (const matchQuery of matchQueries) {
+        const rows = statement.all(matchQuery, sessionId ?? null, sessionId ?? null, limit);
+        for (const row of rows) {
           const message = this.rowToMessage(row);
           const lexical = this.scoreText(message.content, terms);
           const bm25 = Number(row.fts_score ?? 0);
-          return {
+          const scored = {
             message,
             score: lexical + Math.max(0, Math.round(12 - bm25)),
           };
-        });
+          const existing = byId.get(message.id);
+          if (!existing || scored.score > existing.score) {
+            byId.set(message.id, scored);
+          }
+        }
+        if (byId.size >= limit) {
+          break;
+        }
+      }
+      return [...byId.values()]
+        .sort((left, right) => right.score - left.score || (left.message.sequence ?? 0) - (right.message.sequence ?? 0))
+        .slice(0, limit);
     } catch (error) {
       this.options.logger.debug?.("sqlite_runtime_fts_query_failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -413,6 +509,188 @@ export class SQLiteRuntimeStore {
         rejectedCount: Number(row.rejected_count ?? 0),
         metadata: this.parseObject(row.metadata_json),
       })) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  getStatus(): RuntimeStoreStatus {
+    if (!this.openDatabase()) {
+      return {
+        enabled: false,
+        dbPath: this.options.dbPath,
+        ftsReady: false,
+        counts: this.emptyCounts(),
+      };
+    }
+    try {
+      return {
+        enabled: this.enabled,
+        dbPath: this.options.dbPath,
+        ftsReady: this.ftsReady,
+        counts: this.collectCounts(),
+      };
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  verifyIntegrity(): RuntimeIntegrityReport {
+    if (!this.openDatabase()) {
+      return {
+        enabled: false,
+        dbPath: this.options.dbPath,
+        ftsReady: false,
+        counts: this.emptyCounts(),
+        ok: false,
+        errors: ["SQLite runtime is unavailable in this Node runtime."],
+        warnings: [],
+        orphanEdges: 0,
+        summariesWithoutSource: 0,
+        selectedCandidatesWithoutTarget: 0,
+      };
+    }
+    try {
+      const counts = this.collectCounts();
+      const orphanEdges = Number(this.db?.prepare(`
+        SELECT COUNT(*) AS count
+        FROM source_edges edge
+        WHERE edge.target_kind NOT IN ('source_ref', 'observation')
+          AND NOT EXISTS (
+            SELECT 1 FROM messages m
+            WHERE edge.target_kind = 'message' AND m.id = edge.target_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM summaries s
+            WHERE edge.target_kind = 'summary' AND s.id = edge.target_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM memories mem
+            WHERE edge.target_kind = 'memory' AND mem.id = edge.target_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM assets a
+            WHERE edge.target_kind = 'asset' AND a.doc_id = edge.target_id
+          )
+      `).get()?.count ?? 0);
+      const summariesWithoutSource = Number(this.db?.prepare(`
+        SELECT COUNT(*) AS count
+        FROM summaries s
+        WHERE COALESCE(s.source_message_count, 0) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM source_edges edge
+            WHERE edge.source_kind = 'summary'
+              AND edge.source_id = s.id
+              AND edge.relation = 'derived_from'
+          )
+      `).get()?.count ?? 0);
+      const selectedCandidatesWithoutTarget = Number(this.db?.prepare(`
+        SELECT COUNT(*) AS count
+        FROM retrieval_candidates
+        WHERE status = 'selected'
+          AND (target_id IS NULL OR target_id = '')
+      `).get()?.count ?? 0);
+      const warnings = [
+        ...(summariesWithoutSource > 0
+          ? [`${summariesWithoutSource} summaries have no explicit source edge/source count.`]
+          : []),
+        ...(selectedCandidatesWithoutTarget > 0
+          ? [`${selectedCandidatesWithoutTarget} selected context candidates have no target id for why/trace.`]
+          : []),
+      ];
+      const errors = orphanEdges > 0
+        ? [`${orphanEdges} source_edges point to missing runtime records.`]
+        : [];
+      return {
+        enabled: this.enabled,
+        dbPath: this.options.dbPath,
+        ftsReady: this.ftsReady,
+        counts,
+        ok: errors.length === 0,
+        errors,
+        warnings,
+        orphanEdges,
+        summariesWithoutSource,
+        selectedCandidatesWithoutTarget,
+      };
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  inspectContextRun(runId?: string): RuntimeContextRunInspection {
+    if (!this.openDatabase()) {
+      return { run: null, selected: [], rejected: [] };
+    }
+    try {
+      const runRow = runId
+        ? this.db?.prepare("SELECT * FROM context_runs WHERE id = ?").get(runId)
+        : this.db?.prepare("SELECT * FROM context_runs ORDER BY created_at DESC LIMIT 1").get();
+      if (!runRow) {
+        return { run: null, selected: [], rejected: [] };
+      }
+      const run = this.rowToContextRun(runRow);
+      const candidates = this.getCandidatesForRun(run.id);
+      return {
+        run,
+        selected: candidates.filter((candidate) => candidate.status === "selected"),
+        rejected: candidates.filter((candidate) => candidate.status === "rejected"),
+      };
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  whyRecalled(args: { targetId?: string; query?: string; runId?: string; limit?: number } = {}): RuntimeWhyRecalledReport {
+    if (!this.openDatabase()) {
+      return {
+        query: args.query ?? null,
+        targetId: args.targetId ?? null,
+        inspectedRunId: args.runId ?? null,
+        matches: [],
+        latestRun: null,
+        explanation: "SQLite runtime is unavailable, so no context run audit trail can be inspected.",
+      };
+    }
+    try {
+      const latestRunRow = args.runId
+        ? this.db?.prepare("SELECT * FROM context_runs WHERE id = ?").get(args.runId)
+        : this.db?.prepare("SELECT * FROM context_runs ORDER BY created_at DESC LIMIT 1").get();
+      const latestRun = latestRunRow ? this.rowToContextRun(latestRunRow) : null;
+      const limit = Math.max(Math.min(args.limit ?? 10, 50), 1);
+      const query = args.query?.trim().toLowerCase();
+      const targetId = args.targetId?.trim();
+      const rows = this.db?.prepare(`
+        SELECT c.*
+        FROM retrieval_candidates c
+        JOIN context_runs r ON r.id = c.context_run_id
+        WHERE (? IS NULL OR c.target_id = ? OR c.id = ?)
+          AND (? IS NULL OR lower(c.payload_json) LIKE ? OR lower(c.reasons_json) LIKE ?)
+          AND (? IS NULL OR c.context_run_id = ?)
+        ORDER BY r.created_at DESC, c.status DESC, c.score DESC
+        LIMIT ?
+      `).all(
+        targetId ?? null,
+        targetId ?? null,
+        targetId ?? null,
+        query ?? null,
+        query ? `%${query}%` : null,
+        query ? `%${query}%` : null,
+        args.runId ?? null,
+        args.runId ?? null,
+        limit,
+      ) ?? [];
+      const matches = rows.map((row) => this.rowToCandidate(row));
+      return {
+        query: args.query ?? null,
+        targetId: targetId ?? null,
+        inspectedRunId: args.runId ?? latestRun?.id ?? null,
+        matches,
+        latestRun,
+        explanation: matches.length > 0
+          ? "These rows are the ContextPlanner audit trail: source/authority/score show why the item was selected or rejected."
+          : "No matching retrieval candidate was recorded. Run assemble/memory_retrieve first, or inspect the latest context run.",
+      };
     } finally {
       this.closeDatabase();
     }
@@ -692,27 +970,38 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  private toFtsMatchQuery(query: string, terms: string[]): string {
-    const ftsTerms = terms
-      .map((term) => term.toLowerCase().replace(/[^a-z0-9]+/g, ""))
-      .filter((term) => term.length >= 2)
-      .slice(0, 8);
+  private toFtsMatchQueries(query: string, terms: string[]): string[] {
+    const ftsTerms = this.distinctiveFtsTerms(terms).slice(0, 5);
     if (ftsTerms.length === 0) {
-      return "";
+      return [];
     }
-    const phrase = query
+    const quotedPhrases = [...query.matchAll(/"([^"]{3,80})"/g)]
+      .map((match) => match[1])
+      .map((phrase) => phrase.toLowerCase().replace(/[^a-z0-9\s-]+/g, " ").trim().replace(/\s+/g, " "))
+      .filter((phrase) => phrase.length >= 3)
+      .slice(0, 2)
+      .map((phrase) => `"${phrase}"`);
+    const cleanedPhrase = query
       .toLowerCase()
       .replace(/^history\s+recall\s*:\s*/i, "")
       .replace(/"/g, " ")
       .trim()
       .split(/\s+/)
       .filter((term) => /^[a-z0-9]+$/.test(term))
-      .slice(0, 6)
+      .filter((term) => !SQLITE_RUNTIME_STOP_WORDS.has(term))
+      .slice(0, 4)
       .join(" ");
-    const disjunction = ftsTerms.map((term) => `${term}*`).join(" OR ");
-    return phrase.length >= 6
-      ? `"${phrase}" OR ${disjunction}`
-      : disjunction;
+    const focusedAnd = ftsTerms.map((term) => `${term}*`).join(" ");
+    const queries = [
+      ...quotedPhrases,
+      cleanedPhrase.length >= 6 ? `"${cleanedPhrase}"` : "",
+      focusedAnd,
+      ftsTerms.length > 2 ? ftsTerms.slice(0, 2).map((term) => `${term}*`).join(" ") : "",
+      // Last-resort relaxed query keeps recall from going to zero, but only after
+      // lossless-style implicit-AND queries have failed to produce enough anchors.
+      ftsTerms.length > 1 ? ftsTerms.map((term) => `${term}*`).join(" OR ") : "",
+    ].filter(Boolean);
+    return [...new Set(queries)];
   }
 
   private upsertSummary(summary: SummaryEntry): void {
@@ -1016,6 +1305,92 @@ export class SQLiteRuntimeStore {
       .filter((summary) => wanted.has(summary.id));
   }
 
+  private collectCounts(): RuntimeTableCounts {
+    return {
+      messages: this.countTable("messages"),
+      summaries: this.countTable("summaries"),
+      memories: this.countTable("memories"),
+      assets: this.countTable("assets"),
+      sourceEdges: this.countTable("source_edges"),
+      contextRuns: this.countTable("context_runs"),
+      retrievalCandidates: this.countTable("retrieval_candidates"),
+    };
+  }
+
+  private emptyCounts(): RuntimeTableCounts {
+    return {
+      messages: 0,
+      summaries: 0,
+      memories: 0,
+      assets: 0,
+      sourceEdges: 0,
+      contextRuns: 0,
+      retrievalCandidates: 0,
+    };
+  }
+
+  private countTable(tableName: string): number {
+    try {
+      return Number(this.db?.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get()?.count ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  private getCandidatesForRun(runId: string): RuntimeCandidateRecord[] {
+    return this.db?.prepare(`
+      SELECT * FROM retrieval_candidates
+      WHERE context_run_id = ?
+      ORDER BY status DESC, score DESC, token_count ASC
+    `).all(runId).map((row) => this.rowToCandidate(row)) ?? [];
+  }
+
+  private rowToContextRun(row: Record<string, unknown>): RuntimeContextRunRecord {
+    return {
+      id: String(row.id ?? ""),
+      sessionId: String(row.session_id ?? ""),
+      agentId: String(row.agent_id ?? ""),
+      createdAt: String(row.created_at ?? ""),
+      intent: String(row.intent ?? ""),
+      totalBudget: Number(row.total_budget ?? 0),
+      selectedTokens: Number(row.selected_tokens ?? 0),
+      selectedCount: Number(row.selected_count ?? 0),
+      rejectedCount: Number(row.rejected_count ?? 0),
+      metadata: this.parseObject(row.metadata_json),
+    };
+  }
+
+  private rowToCandidate(row: Record<string, unknown>): RuntimeCandidateRecord {
+    return {
+      id: String(row.id ?? ""),
+      contextRunId: String(row.context_run_id ?? ""),
+      source: String(row.source ?? ""),
+      authority: String(row.authority ?? ""),
+      targetKind: String(row.target_kind ?? ""),
+      targetId: typeof row.target_id === "string" ? row.target_id : null,
+      status: row.status === "selected" ? "selected" : "rejected",
+      score: Number(row.score ?? 0),
+      tokenCount: Number(row.token_count ?? 0),
+      reasons: this.parseStringArray(row.reasons_json),
+      rejectedReason: typeof row.rejected_reason === "string" ? row.rejected_reason : null,
+      payload: this.parseObject(row.payload_json),
+    };
+  }
+
+  private parseStringArray(value: unknown): string[] {
+    if (typeof value !== "string" || !value.trim()) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((item): item is string => typeof item === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
   private lookupTarget(kind: string, id: string): Record<string, unknown> | null {
     if (!this.db) {
       return null;
@@ -1124,11 +1499,20 @@ export class SQLiteRuntimeStore {
   }
 
   private queryTerms(query: string): string[] {
+    const seen = new Set<string>();
     return query
       .toLowerCase()
+      .replace(/^history\s+recall\s*:\s*/i, "")
       .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
       .map((term) => term.trim())
-      .filter((term) => term.length >= 2);
+      .map((term) => this.normalizeRuntimeQueryTerm(term))
+      .filter((term) => {
+        if (term.length < 2 || SQLITE_RUNTIME_STOP_WORDS.has(term) || seen.has(term)) {
+          return false;
+        }
+        seen.add(term);
+        return true;
+      });
   }
 
   private scoreText(text: string, terms: string[]): number {
@@ -1143,6 +1527,28 @@ export class SQLiteRuntimeStore {
       score += 4;
     }
     return score;
+  }
+
+  private distinctiveFtsTerms(terms: string[]): string[] {
+    const seen = new Set<string>();
+    return terms
+      .map((term) => this.normalizeRuntimeQueryTerm(term).replace(/[^a-z0-9]+/g, ""))
+      .filter((term) => {
+        if (term.length < 2 || SQLITE_RUNTIME_STOP_WORDS.has(term) || seen.has(term)) {
+          return false;
+        }
+        seen.add(term);
+        return true;
+      })
+      .sort((left, right) => right.length - left.length);
+  }
+
+  private normalizeRuntimeQueryTerm(term: string): string {
+    const lower = term.toLowerCase().trim();
+    if (lower.length <= 4) {
+      return lower;
+    }
+    return lower.replace(/(?:ingly|edly|ing|ed|es|s)$/i, "");
   }
 
   private stringify(value: unknown): string {

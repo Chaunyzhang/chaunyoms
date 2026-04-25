@@ -17,6 +17,16 @@
 
 ---
 
+## Current architecture in one sentence
+
+**ChaunyOMS is a SQLite-driven long-context runtime with Markdown as the long-term knowledge asset layer.**
+
+SQLite owns runtime truth: raw messages, summaries, source_edges, memories, asset index, context_runs, and retrieval_candidates. Markdown owns human-readable assets. For factual history, this agent's raw ledger has priority; reviewed knowledge is advisory; ContextPlanner is the only gate that decides what enters context.
+
+Primary path: `memory_retrieve`. Evidence/ops path: `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_inspect_context`, `oms_why_recalled`.
+
+---
+
 ## 目录
 
 - [核心想法](#核心想法)

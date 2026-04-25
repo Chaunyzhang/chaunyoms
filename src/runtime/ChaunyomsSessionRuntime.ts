@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
@@ -106,6 +108,77 @@ export interface AfterTurnResult {
   stats: Record<string, unknown>;
   importedMessages: number;
   compactedThisTurn: boolean;
+}
+
+export interface OmsRuntimeStatus {
+  ok: boolean;
+  sessionId: string;
+  agentId: string;
+  dataDir: string;
+  workspaceDir: string;
+  knowledgeBaseDir: string;
+  memoryVaultDir: string;
+  counts: {
+    rawMessages: number;
+    uncompactedRawMessages: number;
+    uncompactedTokens: number;
+    summaries: number;
+    summaryTokens: number;
+    observations: number;
+    durableMemories: number;
+    activeDurableMemories: number;
+    knowledgeRawItems: number;
+    pendingKnowledgeRawItems: number;
+    projects: number;
+    contextItems: number;
+  };
+  config: Pick<BridgeConfig,
+    | "configPreset"
+    | "contextWindow"
+    | "contextThreshold"
+    | "freshTailTokens"
+    | "maxFreshTailTurns"
+    | "strictCompaction"
+    | "compactionBarrierEnabled"
+    | "runtimeCaptureEnabled"
+    | "durableMemoryEnabled"
+    | "autoRecallEnabled"
+    | "knowledgePromotionEnabled"
+    | "semanticCandidateExpansionEnabled"
+    | "semanticCandidateLimit"
+    | "emergencyBrake"
+  >;
+  runtimeStore: ReturnType<SQLiteRuntimeStore["getStatus"]>;
+  lastCompactionDiagnostics: CompactionDiagnostics | null;
+}
+
+export interface OmsVerifyReport {
+  ok: boolean;
+  sessionId: string;
+  agentId: string;
+  summaryDag: DagIntegrityReport;
+  summaryIntegrity: SummaryIntegrityInspection;
+  runtimeStore: ReturnType<SQLiteRuntimeStore["verifyIntegrity"]>;
+  warnings: string[];
+  errors: string[];
+}
+
+export interface OmsBackupResult {
+  ok: boolean;
+  backupDir: string;
+  manifestPath: string;
+  copied: string[];
+  skipped: string[];
+}
+
+export interface OmsRestoreResult {
+  ok: boolean;
+  backupDir: string;
+  apply: boolean;
+  manifest: Record<string, unknown> | null;
+  copied: string[];
+  skipped: string[];
+  reason?: string;
 }
 
 export interface RuntimeLayerDependencies {
@@ -541,12 +614,206 @@ export class ChaunyomsSessionRuntime {
     });
   }
 
+  async getStatus(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<OmsRuntimeStatus> {
+    const stores = await this.ensureSession(context.sessionId, context.config);
+    await this.sessionData.mirrorRuntimeState();
+    const rawMessages = stores.rawStore.getAll({ sessionId: context.sessionId });
+    const summaries = stores.summaryStore.getAllSummaries({ sessionId: context.sessionId });
+    const durableMemories = stores.durableMemoryStore.getAll();
+    const knowledgeRawItems = stores.knowledgeRawStore.getAll();
+    return {
+      ok: true,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      dataDir: context.config.dataDir,
+      workspaceDir: context.config.workspaceDir,
+      knowledgeBaseDir: stores.knowledgeStore.getBaseDir(),
+      memoryVaultDir: context.config.memoryVaultDir,
+      counts: {
+        rawMessages: rawMessages.length,
+        uncompactedRawMessages: rawMessages.filter((message) => !message.compacted).length,
+        uncompactedTokens: stores.rawStore.totalUncompactedTokens({ sessionId: context.sessionId }),
+        summaries: summaries.length,
+        summaryTokens: stores.summaryStore.getTotalTokens({ sessionId: context.sessionId }),
+        observations: stores.observationStore.count(),
+        durableMemories: durableMemories.length,
+        activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
+        knowledgeRawItems: knowledgeRawItems.length,
+        pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "pending" || entry.status === "processing").length,
+        projects: stores.projectStore.getAll().filter((project) => project.status !== "archived").length,
+        contextItems: this.contextViewStore.getItems().length,
+      },
+      config: {
+        configPreset: context.config.configPreset,
+        contextWindow: context.config.contextWindow,
+        contextThreshold: context.config.contextThreshold,
+        freshTailTokens: context.config.freshTailTokens,
+        maxFreshTailTurns: context.config.maxFreshTailTurns,
+        strictCompaction: context.config.strictCompaction,
+        compactionBarrierEnabled: context.config.compactionBarrierEnabled,
+        runtimeCaptureEnabled: context.config.runtimeCaptureEnabled,
+        durableMemoryEnabled: context.config.durableMemoryEnabled,
+        autoRecallEnabled: context.config.autoRecallEnabled,
+        knowledgePromotionEnabled: context.config.knowledgePromotionEnabled,
+        semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
+        semanticCandidateLimit: context.config.semanticCandidateLimit,
+        emergencyBrake: context.config.emergencyBrake,
+      },
+      runtimeStore: this.sessionData.getRuntimeStore().getStatus(),
+      lastCompactionDiagnostics: this.lastCompactionDiagnostics,
+    };
+  }
+
+  async verify(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<OmsVerifyReport> {
+    await this.ensureSession(context.sessionId, context.config);
+    await this.sessionData.mirrorRuntimeState();
+    const summaryDag = await this.inspectDag(context);
+    const summaryIntegrity = this.sessionData.inspectSummaryIntegrity();
+    const runtimeStore = this.sessionData.getRuntimeStore().verifyIntegrity();
+    const errors = [
+      ...(summaryDag.ok ? [] : summaryDag.issues.filter((issue) => issue.severity === "error").map((issue) => `${issue.code}: ${issue.message}`)),
+      ...(summaryIntegrity.mismatched > 0 ? [`${summaryIntegrity.mismatched} summaries failed source hash verification.`] : []),
+      ...runtimeStore.errors,
+    ];
+    const warnings = [
+      ...summaryDag.issues.filter((issue) => issue.severity === "warning").map((issue) => `${issue.code}: ${issue.message}`),
+      ...(summaryIntegrity.unchecked > 0 ? [`${summaryIntegrity.unchecked} summaries have no source hash to verify.`] : []),
+      ...runtimeStore.warnings,
+    ];
+    return {
+      ok: summaryDag.ok && summaryIntegrity.mismatched === 0 && runtimeStore.ok && errors.length === 0,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      summaryDag,
+      summaryIntegrity,
+      runtimeStore,
+      warnings,
+      errors,
+    };
+  }
+
+  async backup(context: Pick<LifecycleContext, "sessionId" | "config">, label = ""): Promise<OmsBackupResult> {
+    await this.ensureSession(context.sessionId, context.config);
+    await this.sessionData.mirrorRuntimeState();
+    const safeLabel = label.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupDir = path.join(context.config.dataDir, "backups", `chaunyoms-${stamp}${safeLabel ? `-${safeLabel}` : ""}`);
+    const copied: string[] = [];
+    const skipped: string[] = [];
+    await mkdir(backupDir, { recursive: true });
+    const sources = [
+      { label: "agent_data", source: path.join(context.config.dataDir, "agents", context.config.agentId), target: path.join(backupDir, "agent_data") },
+      { label: "knowledge", source: context.config.knowledgeBaseDir, target: path.join(backupDir, "knowledge") },
+      { label: "agent_vault", source: path.join(context.config.memoryVaultDir, "agents", context.config.agentId), target: path.join(backupDir, "agent_vault") },
+      { label: "workspace_memory", source: path.join(context.config.workspaceDir, "memory"), target: path.join(backupDir, "workspace_memory") },
+    ];
+    for (const source of sources) {
+      if (await this.copyIfPresent(source.source, source.target)) {
+        copied.push(source.label);
+      } else {
+        skipped.push(source.label);
+      }
+    }
+    const manifest = {
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      paths: sources,
+      config: {
+        dataDir: context.config.dataDir,
+        workspaceDir: context.config.workspaceDir,
+        knowledgeBaseDir: context.config.knowledgeBaseDir,
+        memoryVaultDir: context.config.memoryVaultDir,
+      },
+    };
+    const manifestPath = path.join(backupDir, "manifest.json");
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    return { ok: true, backupDir, manifestPath, copied, skipped };
+  }
+
+  async restore(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    backupDirInput: string,
+    apply = false,
+  ): Promise<OmsRestoreResult> {
+    await this.ensureSession(context.sessionId, context.config);
+    const backupsRoot = path.resolve(context.config.dataDir, "backups");
+    const backupDir = path.resolve(backupDirInput);
+    if (!backupDir.startsWith(backupsRoot)) {
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest: null,
+        copied: [],
+        skipped: [],
+        reason: "backupDir must be inside the ChaunyOMS dataDir/backups directory",
+      };
+    }
+    const manifestPath = path.join(backupDir, "manifest.json");
+    let manifest: Record<string, unknown> | null = null;
+    try {
+      manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    } catch (error) {
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest: null,
+        copied: [],
+        skipped: [],
+        reason: `manifest.json is missing or invalid: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (!apply) {
+      return {
+        ok: true,
+        backupDir,
+        apply,
+        manifest,
+        copied: [],
+        skipped: ["dry_run_only"],
+        reason: "Restore manifest validated. Re-run with apply=true to overlay files.",
+      };
+    }
+    const copies = [
+      { label: "agent_data", source: path.join(backupDir, "agent_data"), target: path.join(context.config.dataDir, "agents", context.config.agentId) },
+      { label: "knowledge", source: path.join(backupDir, "knowledge"), target: context.config.knowledgeBaseDir },
+      { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(context.config.memoryVaultDir, "agents", context.config.agentId) },
+      { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(context.config.workspaceDir, "memory") },
+    ];
+    const copied: string[] = [];
+    const skipped: string[] = [];
+    for (const item of copies) {
+      if (await this.copyIfPresent(item.source, item.target)) {
+        copied.push(item.label);
+      } else {
+        skipped.push(item.label);
+      }
+    }
+    return { ok: true, backupDir, apply, manifest, copied, skipped };
+  }
+
   private async ensureSession(
     sessionId: string,
     config: BridgeConfig,
   ): Promise<SessionDataStores> {
     this.config = config;
     return await this.sessionData.ensure(sessionId, config);
+  }
+
+  private async copyIfPresent(source: string, target: string): Promise<boolean> {
+    try {
+      await cp(source, target, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException;
+      if (nodeError.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
   }
   private async syncRuntimeMessages(
     sessionId: string,
@@ -878,9 +1145,29 @@ export class ChaunyomsSessionRuntime {
     while (budgetState.compressibleHistoryTokens > budgetState.compressibleHistoryBudget) {
       passes += 1;
       if (passes > maxPasses) {
-        throw new Error(
-          `Compaction barrier exceeded max passes before structural recovery (session=${context.sessionId})`,
-        );
+        this.logger.warn("compaction_barrier_soft_failed", {
+          sessionId: context.sessionId,
+          reason: "max_passes_exceeded",
+          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+          passes,
+        });
+        this.lastCompactionDiagnostics = {
+          sessionId: context.sessionId,
+          mode: "barrier",
+          triggerExceeded: true,
+          triggerThreshold: budgetState.triggerBudget,
+          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+          hostFixedTokens: budgetState.hostFixedTokens,
+          hostFixedTokenSource: budgetState.hostFixedTokenSource,
+          pluginFixedTokens: budgetState.pluginFixedTokens,
+          freshTailTokens: budgetState.freshTailTokens,
+          passes,
+          status: "failed",
+          reason: "max_passes_exceeded",
+        };
+        return;
       }
 
       const compaction = await this.runSerializedCompaction(
@@ -890,9 +1177,30 @@ export class ChaunyomsSessionRuntime {
         true,
       );
       if (compaction.status !== "compacted" && compaction.status !== "deduped") {
-        throw new Error(
-          `Compaction barrier could not recover compressible history budget (session=${context.sessionId}, reason=${compaction.reason}, compressibleTokens=${budgetState.compressibleHistoryTokens}, budget=${budgetState.compressibleHistoryBudget})`,
-        );
+        const reason = compaction.reason ?? compaction.status;
+        this.logger.warn("compaction_barrier_soft_failed", {
+          sessionId: context.sessionId,
+          reason,
+          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+          passes,
+        });
+        this.lastCompactionDiagnostics = {
+          sessionId: context.sessionId,
+          mode: "barrier",
+          triggerExceeded: true,
+          triggerThreshold: budgetState.triggerBudget,
+          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
+          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+          hostFixedTokens: budgetState.hostFixedTokens,
+          hostFixedTokenSource: budgetState.hostFixedTokenSource,
+          pluginFixedTokens: budgetState.pluginFixedTokens,
+          freshTailTokens: budgetState.freshTailTokens,
+          passes,
+          status: "failed",
+          reason,
+        };
+        return;
       }
       const entry = compaction.summary;
 
