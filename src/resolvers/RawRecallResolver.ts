@@ -452,7 +452,7 @@ export class RawRecallResolver {
       reason: string,
     ) => {
       const normalized = this.cleanAnswerText(text);
-      if (!normalized || normalized.length < 2 || QUERY_STOP_WORDS.has(normalized.toLowerCase())) {
+      if (!normalized || (normalized.length < 2 && reason !== "count_phrase") || QUERY_STOP_WORDS.has(normalized.toLowerCase())) {
         return;
       }
       const adjustedConfidence = this.adjustCandidateConfidence(normalized, type, confidence, reason, understanding);
