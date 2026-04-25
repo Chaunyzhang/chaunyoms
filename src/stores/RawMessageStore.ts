@@ -62,6 +62,19 @@ export class RawMessageStore {
     await this.flush();
   }
 
+  async removeSession(sessionId: string): Promise<number> {
+    const before = this.messages.length;
+    const kept = this.messages.filter((message) => message.sessionId !== sessionId);
+    const removed = before - kept.length;
+    if (removed <= 0) {
+      return 0;
+    }
+    this.messages.length = 0;
+    this.messages.push(...kept);
+    await this.flush();
+    return removed;
+  }
+
   getAll(options: RawMessageQuery = {}): RawMessage[] {
     return this.filterBySession(this.messages, options);
   }

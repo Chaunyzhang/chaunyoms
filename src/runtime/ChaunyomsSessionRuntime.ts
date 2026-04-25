@@ -1,6 +1,4 @@
-import { createHash } from "node:crypto";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+﻿import { createHash } from "node:crypto";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
 import { ContextPlannerResult } from "../engines/ContextPlanner";
@@ -19,7 +17,6 @@ import {
 import { SharedDataBootstrap } from "../system/SharedDataBootstrap";
 import {
   BridgeConfig,
-  CompactionRunResult,
   ContextItem,
   DagIntegrityReport,
   ContextViewRepository,
@@ -57,20 +54,12 @@ import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
 import { SummaryDagIntegrityInspector } from "../resolvers/SummaryDagIntegrityInspector";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
 import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
+import { OmsAdminService } from "./OmsAdminService";
+import { KnowledgeMaintenanceService } from "./KnowledgeMaintenanceService";
+import { RuntimeIngressService } from "./RuntimeIngressService";
+import { CompactionCoordinator } from "./CompactionCoordinator";
 
-interface CompactionBudgetState {
-  availableBudget: number;
-  hostFixedTokens: number;
-  hostFixedTokenSource: "systemPromptTokens" | "workspaceBootstrapEstimate";
-  pluginFixedTokens: number;
-  triggerBudget: number;
-  freshTailTokens: number;
-  compressibleHistoryTokens: number;
-  compressibleHistoryBudget: number;
-  triggerExceeded: boolean;
-}
-
-interface CompactionDiagnostics {
+export interface CompactionDiagnostics {
   sessionId: string;
   mode: "manual" | "barrier" | "after_turn";
   triggerExceeded: boolean;
@@ -115,6 +104,7 @@ export interface AfterTurnResult {
 
 export interface OmsRuntimeStatus {
   ok: boolean;
+  scope: "session" | "agent";
   sessionId: string;
   agentId: string;
   dataDir: string;
@@ -159,6 +149,7 @@ export interface OmsRuntimeStatus {
 
 export interface OmsVerifyReport {
   ok: boolean;
+  scope: "session" | "agent";
   sessionId: string;
   agentId: string;
   summaryDag: DagIntegrityReport;
@@ -233,6 +224,19 @@ export interface OmsKnowledgeReviewResult {
   reason?: string;
 }
 
+export interface OmsWipeResult {
+  ok: boolean;
+  scope: "session" | "agent";
+  apply: boolean;
+  sessionId?: string;
+  agentId?: string;
+  removed: string[];
+  skipped: string[];
+  warnings: string[];
+  backupDir?: string;
+  reason?: string;
+}
+
 export interface RuntimeLayerDependencies {
   contextViewStore: ContextViewRepository;
   fixedPrefixProvider: FixedPrefixProvider;
@@ -260,18 +264,13 @@ export class ChaunyomsSessionRuntime {
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
   private llmCaller: LlmCaller | null;
-  private compactionInFlight: Promise<CompactionRunResult> | null = null;
-  private knowledgeMaintenanceInFlight: Promise<void> | null = null;
   private lastCompactionDiagnostics: CompactionDiagnostics | null = null;
-  private readonly pendingKnowledgeMaintenance = new Map<string, {
-    sessionId: string;
-    config: BridgeConfig;
-    summaryModel?: string;
-  }>();
   private navigationSnapshotPending = false;
   private readonly runtimeIngress = new RuntimeMessageIngress();
-  private static readonly DEFAULT_KNOWLEDGE_OVERRIDE_RE =
-    /(帮我记一下|记住这个|记一下这个|放进知识库|扔进知识库|加入知识库|写进知识库|加入wiki|写进wiki|沉淀进知识库|remember this|remember this for later|save this to knowledge|put this in (?:the )?knowledge base|add this to wiki|store this in (?:the )?knowledge base)/i;
+  private omsAdmin!: OmsAdminService;
+  private knowledgeMaintenance!: KnowledgeMaintenanceService;
+  private runtimeIngressService!: RuntimeIngressService;
+  private compactionCoordinator!: CompactionCoordinator;
 
   constructor(
     logger: LoggerLike,
@@ -293,6 +292,7 @@ export class ChaunyomsSessionRuntime {
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
     this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
+    this.initializeServices();
   }
 
   updateHost(logger: LoggerLike, llmCaller: LlmCaller | null): void {
@@ -303,10 +303,64 @@ export class ChaunyomsSessionRuntime {
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
     this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
+    this.initializeServices();
   }
 
   getConfig(): BridgeConfig {
     return this.config;
+  }
+
+  private initializeServices(): void {
+    this.omsAdmin = new OmsAdminService({
+      sessionData: this.sessionData,
+      contextViewStore: this.contextViewStore,
+      knowledgeCandidateScorer: this.knowledgeCandidateScorer,
+      ensureSession: this.ensureSession.bind(this),
+      inspectDag: this.inspectDag.bind(this),
+      inspectAgentDag: () => this.dagIntegrityInspector.inspect(
+        this.sessionData.getStores().summaryStore,
+        this.sessionData.getStores().rawStore,
+        {},
+      ),
+      getLastCompactionDiagnostics: () => this.lastCompactionDiagnostics,
+    });
+    this.knowledgeMaintenance = new KnowledgeMaintenanceService({
+      logger: this.logger,
+      sourceMessageResolver: this.sourceMessageResolver,
+      knowledgePromotionEngine: this.knowledgePromotionEngine,
+      knowledgeIntakeGate: this.knowledgeIntakeGate,
+      knowledgeCandidateScorer: this.knowledgeCandidateScorer,
+      ensureSession: this.ensureSession.bind(this),
+    });
+    this.runtimeIngressService = new RuntimeIngressService({
+      runtimeIngress: this.runtimeIngress,
+      extractionEngine: this.extractionEngine,
+      ensureSession: this.ensureSession.bind(this),
+      appendRawMessages: this.sessionData.appendRawMessages.bind(this.sessionData),
+      appendObservation: this.sessionData.appendObservation.bind(this.sessionData),
+      persistDurableMemories: this.persistDurableMemories.bind(this),
+      writeDurableMemoryArtifacts: this.sessionData.writeDurableMemoryArtifacts.bind(this.sessionData),
+    });
+    this.compactionCoordinator = new CompactionCoordinator({
+      logger: this.logger,
+      assembler: this.assembler,
+      fixedPrefixProvider: this.fixedPrefixProvider,
+      hostFixedContextProvider: this.hostFixedContextProvider,
+      compactionEngine: this.compactionEngine,
+      getConfig: () => this.config,
+      getDurableMemoryStore: () => this.getActiveStores().durableMemoryStore,
+      setNavigationSnapshotPending: () => {
+        this.navigationSnapshotPending = true;
+      },
+      getDiagnostics: () => this.lastCompactionDiagnostics,
+      setDiagnostics: (value) => {
+        this.lastCompactionDiagnostics = value;
+      },
+      onBarrierCompacted: async (entry, context, summaryStore) => {
+        await this.knowledgeMaintenance.enqueueSummaryForKnowledge(entry, context);
+        await this.rollUpSummaryTree(summaryStore, context);
+      },
+    });
   }
 
   async bootstrap(context: LifecycleContext): Promise<{
@@ -327,14 +381,12 @@ export class ChaunyomsSessionRuntime {
     if (integrity.mismatched > 0) {
       this.logger.warn("summary_integrity_mismatch_detected", integrity);
     }
-    this.scheduleKnowledgeMaintenance(context);
+    this.knowledgeMaintenance.schedule(context);
     return { importedMessages: 0, integrity };
   }
 
   async waitForBackgroundWork(): Promise<void> {
-    while (this.knowledgeMaintenanceInFlight) {
-      await this.knowledgeMaintenanceInFlight;
-    }
+    await this.knowledgeMaintenance.waitForBackgroundWork();
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
@@ -377,7 +429,7 @@ export class ChaunyomsSessionRuntime {
     );
 
     if (!this.config.emergencyBrake && this.config.compactionBarrierEnabled) {
-      await this.runCompactionBarrier(
+      await this.compactionCoordinator.runCompactionBarrier(
         context,
         rawStore,
         summaryStore,
@@ -459,7 +511,7 @@ export class ChaunyomsSessionRuntime {
       context.runtimeMessages,
     );
     const tokensBefore = rawStore.totalUncompactedTokens({ sessionId: context.sessionId });
-    const budgetState = await this.measureCompactionBudgetState(
+    const budgetState = await this.compactionCoordinator.measureCompactionBudgetState(
       context,
       rawStore,
       summaryStore,
@@ -488,7 +540,7 @@ export class ChaunyomsSessionRuntime {
       candidateMessageCount: candidate?.messages.length,
       status: "pending",
     };
-    const compaction = await this.runSerializedCompaction(
+    const compaction = await this.compactionCoordinator.runSerializedCompaction(
       rawStore,
       summaryStore,
       context,
@@ -519,7 +571,7 @@ export class ChaunyomsSessionRuntime {
     }
     const entry = compaction.summary;
 
-    await this.enqueueSummaryForKnowledge(entry, context);
+    await this.knowledgeMaintenance.enqueueSummaryForKnowledge(entry, context);
     await this.rollUpSummaryTree(summaryStore, context);
     await this.writeNavigationArtifactsIfPending(
       context,
@@ -589,10 +641,10 @@ export class ChaunyomsSessionRuntime {
 
     const compactionResult = this.config.emergencyBrake
       ? { compacted: false, entry: null as SummaryEntry | null }
-      : await this.runBestEffortCompaction(context, rawStore, summaryStore);
+      : await this.compactionCoordinator.runBestEffortCompaction(context, rawStore, summaryStore);
 
     if (compactionResult.entry) {
-      await this.enqueueSummaryForKnowledge(compactionResult.entry, context);
+      await this.knowledgeMaintenance.enqueueSummaryForKnowledge(compactionResult.entry, context);
       await this.sessionData.appendSummaryArtifact(compactionResult.entry);
       await this.rollUpSummaryTree(summaryStore, context);
     }
@@ -685,124 +737,22 @@ export class ChaunyomsSessionRuntime {
     });
   }
 
-  async getStatus(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<OmsRuntimeStatus> {
-    const stores = await this.ensureSession(context.sessionId, context.config);
-    await this.sessionData.mirrorRuntimeState();
-    const rawMessages = stores.rawStore.getAll({ sessionId: context.sessionId });
-    const summaries = stores.summaryStore.getAllSummaries({ sessionId: context.sessionId });
-    const durableMemories = stores.durableMemoryStore.getAll();
-    const knowledgeRawItems = stores.knowledgeRawStore.getAll();
-    return {
-      ok: true,
-      sessionId: context.sessionId,
-      agentId: context.config.agentId,
-      dataDir: context.config.dataDir,
-      workspaceDir: context.config.workspaceDir,
-      knowledgeBaseDir: stores.knowledgeStore.getBaseDir(),
-      memoryVaultDir: context.config.memoryVaultDir,
-      counts: {
-        rawMessages: rawMessages.length,
-        uncompactedRawMessages: rawMessages.filter((message) => !message.compacted).length,
-        uncompactedTokens: stores.rawStore.totalUncompactedTokens({ sessionId: context.sessionId }),
-        summaries: summaries.length,
-        summaryTokens: stores.summaryStore.getTotalTokens({ sessionId: context.sessionId }),
-        observations: stores.observationStore.count(),
-        durableMemories: durableMemories.length,
-        activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
-        knowledgeRawItems: knowledgeRawItems.length,
-        pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "review_pending" || entry.status === "pending" || entry.status === "processing").length,
-        projects: stores.projectStore.getAll().filter((project) => project.status !== "archived").length,
-        contextItems: this.contextViewStore.getItems().length,
-      },
-      config: {
-        configPreset: context.config.configPreset,
-        contextWindow: context.config.contextWindow,
-        contextThreshold: context.config.contextThreshold,
-        freshTailTokens: context.config.freshTailTokens,
-        maxFreshTailTurns: context.config.maxFreshTailTurns,
-        strictCompaction: context.config.strictCompaction,
-        compactionBarrierEnabled: context.config.compactionBarrierEnabled,
-        runtimeCaptureEnabled: context.config.runtimeCaptureEnabled,
-        durableMemoryEnabled: context.config.durableMemoryEnabled,
-        autoRecallEnabled: context.config.autoRecallEnabled,
-        knowledgePromotionEnabled: context.config.knowledgePromotionEnabled,
-        knowledgePromotionManualReviewEnabled: context.config.knowledgePromotionManualReviewEnabled,
-        semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
-        semanticCandidateLimit: context.config.semanticCandidateLimit,
-        emergencyBrake: context.config.emergencyBrake,
-        sqliteJournalMode: context.config.sqliteJournalMode,
-      },
-      runtimeStore: this.sessionData.getRuntimeStore().getStatus(),
-      lastCompactionDiagnostics: this.lastCompactionDiagnostics,
-    };
+  async getStatus(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { scope?: "session" | "agent" } = {},
+  ): Promise<OmsRuntimeStatus> {
+    return await this.omsAdmin.getStatus(context, options);
   }
 
-  async verify(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<OmsVerifyReport> {
-    await this.ensureSession(context.sessionId, context.config);
-    await this.sessionData.mirrorRuntimeState();
-    const summaryDag = await this.inspectDag(context);
-    const summaryIntegrity = this.sessionData.inspectSummaryIntegrity();
-    const runtimeStore = this.sessionData.getRuntimeStore().verifyIntegrity();
-    const errors = [
-      ...(summaryDag.ok ? [] : summaryDag.issues.filter((issue) => issue.severity === "error").map((issue) => `${issue.code}: ${issue.message}`)),
-      ...(summaryIntegrity.mismatched > 0 ? [`${summaryIntegrity.mismatched} summaries failed source hash verification.`] : []),
-      ...runtimeStore.errors,
-    ];
-    const warnings = [
-      ...summaryDag.issues.filter((issue) => issue.severity === "warning").map((issue) => `${issue.code}: ${issue.message}`),
-      ...(summaryIntegrity.unchecked > 0 ? [`${summaryIntegrity.unchecked} summaries have no source hash to verify.`] : []),
-      ...runtimeStore.warnings,
-    ];
-    return {
-      ok: summaryDag.ok && summaryIntegrity.mismatched === 0 && runtimeStore.ok && errors.length === 0,
-      sessionId: context.sessionId,
-      agentId: context.config.agentId,
-      summaryDag,
-      summaryIntegrity,
-      runtimeStore,
-      warnings,
-      errors,
-    };
+  async verify(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { scope?: "session" | "agent" } = {},
+  ): Promise<OmsVerifyReport> {
+    return await this.omsAdmin.verify(context, options);
   }
 
   async backup(context: Pick<LifecycleContext, "sessionId" | "config">, label = ""): Promise<OmsBackupResult> {
-    await this.ensureSession(context.sessionId, context.config);
-    await this.sessionData.mirrorRuntimeState();
-    const safeLabel = label.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 60);
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupDir = path.join(context.config.dataDir, "backups", `chaunyoms-${stamp}${safeLabel ? `-${safeLabel}` : ""}`);
-    const copied: string[] = [];
-    const skipped: string[] = [];
-    await mkdir(backupDir, { recursive: true });
-    const sources = [
-      { label: "agent_data", source: path.join(context.config.dataDir, "agents", context.config.agentId), target: path.join(backupDir, "agent_data") },
-      { label: "knowledge", source: context.config.knowledgeBaseDir, target: path.join(backupDir, "knowledge") },
-      { label: "agent_vault", source: path.join(context.config.memoryVaultDir, "agents", context.config.agentId), target: path.join(backupDir, "agent_vault") },
-      { label: "workspace_memory", source: path.join(context.config.workspaceDir, "memory"), target: path.join(backupDir, "workspace_memory") },
-    ];
-    for (const source of sources) {
-      if (await this.copyIfPresent(source.source, source.target)) {
-        copied.push(source.label);
-      } else {
-        skipped.push(source.label);
-      }
-    }
-    const manifest = {
-      schemaVersion: 1,
-      createdAt: new Date().toISOString(),
-      sessionId: context.sessionId,
-      agentId: context.config.agentId,
-      paths: sources,
-      config: {
-        dataDir: context.config.dataDir,
-        workspaceDir: context.config.workspaceDir,
-        knowledgeBaseDir: context.config.knowledgeBaseDir,
-        memoryVaultDir: context.config.memoryVaultDir,
-      },
-    };
-    const manifestPath = path.join(backupDir, "manifest.json");
-    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
-    return { ok: true, backupDir, manifestPath, copied, skipped };
+    return await this.omsAdmin.backup(context, label);
   }
 
   async restore(
@@ -810,178 +760,34 @@ export class ChaunyomsSessionRuntime {
     backupDirInput: string,
     apply = false,
   ): Promise<OmsRestoreResult> {
-    await this.ensureSession(context.sessionId, context.config);
-    const backupsRoot = path.resolve(context.config.dataDir, "backups");
-    const backupDir = path.resolve(backupDirInput);
-    if (!backupDir.startsWith(backupsRoot)) {
-      return {
-        ok: false,
-        backupDir,
-        apply,
-        manifest: null,
-        copied: [],
-        skipped: [],
-        reason: "backupDir must be inside the ChaunyOMS dataDir/backups directory",
-      };
-    }
-    const manifestPath = path.join(backupDir, "manifest.json");
-    let manifest: Record<string, unknown> | null = null;
-    try {
-      manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
-    } catch (error) {
-      return {
-        ok: false,
-        backupDir,
-        apply,
-        manifest: null,
-        copied: [],
-        skipped: [],
-        reason: `manifest.json is missing or invalid: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-    if (!apply) {
-      return {
-        ok: true,
-        backupDir,
-        apply,
-        manifest,
-        copied: [],
-        skipped: ["dry_run_only"],
-        reason: "Restore manifest validated. Re-run with apply=true to overlay files.",
-      };
-    }
-    const rollbackBackup = await this.backup(context, "pre-restore");
-    const copies = this.restoreCopyPlan(context.config, backupDir);
-    try {
-      const copied: string[] = [];
-      const skipped: string[] = [];
-      for (const item of copies) {
-        if (await this.copyIfPresent(item.source, item.target)) {
-          copied.push(item.label);
-        } else {
-          skipped.push(item.label);
-        }
-      }
-      return {
-        ok: true,
-        backupDir,
-        apply,
-        manifest,
-        rollbackBackupDir: rollbackBackup.backupDir,
-        copied,
-        skipped,
-      };
-    } catch (error) {
-      const rollback = this.restoreCopyPlan(context.config, rollbackBackup.backupDir);
-      let rollbackApplied = false;
-      try {
-        for (const item of rollback) {
-          await this.copyIfPresent(item.source, item.target);
-        }
-        rollbackApplied = true;
-      } catch {
-        rollbackApplied = false;
-      }
-      return {
-        ok: false,
-        backupDir,
-        apply,
-        manifest,
-        rollbackBackupDir: rollbackBackup.backupDir,
-        rollbackApplied,
-        copied: [],
-        skipped: [],
-        reason: `restore failed${rollbackApplied ? " and rollback was applied" : " and rollback failed"}: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
+    return await this.omsAdmin.restore(context, backupDirInput, apply);
   }
 
   async curateKnowledge(
     context: Pick<LifecycleContext, "sessionId" | "config">,
     apply = false,
   ): Promise<OmsKnowledgeGovernanceResult> {
-    await this.ensureSession(context.sessionId, context.config);
-    await this.sessionData.mirrorRuntimeState();
-    const runtimeStore = this.sessionData.getRuntimeStore();
-    const report = runtimeStore.inspectKnowledgeGovernance();
-    const actions: string[] = [];
-    if (report.duplicateCanonicalKeys.length > 0) {
-      actions.push("Review duplicate canonical keys and mark stale assets superseded after human confirmation.");
-    }
-    if (report.assetsWithoutProvenance.length > 0) {
-      actions.push("Attach source_refs or linked_summary_ids before treating these assets as reviewed knowledge.");
-    }
-    if (apply) {
-      actions.push("No automatic destructive curation was applied; ChaunyOMS keeps knowledge cleanup advisory unless a specific supersede/link action is requested.");
-    }
-    return {
-      ok: report.warnings.length === 0,
-      apply,
-      report,
-      actions,
-      warnings: report.warnings,
-    };
+    return await this.omsAdmin.curateKnowledge(context, apply);
   }
 
   async syncKnowledgeAssets(
     context: Pick<LifecycleContext, "sessionId" | "config">,
     mode: "sync" | "reindex" = "sync",
   ): Promise<OmsAssetSyncResult> {
-    const { knowledgeStore } = await this.ensureSession(context.sessionId, context.config);
-    const markdown = await knowledgeStore.syncAssetIndex(mode);
-    const runtime = await this.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex(mode);
-    return {
-      ok: markdown.ok && runtime.ok,
-      mode,
-      markdown,
-      runtime,
-    };
+    return await this.omsAdmin.syncKnowledgeAssets(context, mode);
   }
 
   async verifyKnowledgeAssets(
     context: Pick<LifecycleContext, "sessionId" | "config">,
   ): Promise<OmsAssetVerifyResult> {
-    const { knowledgeStore } = await this.ensureSession(context.sessionId, context.config);
-    const markdown = await knowledgeStore.verifyAssetIndex();
-    await this.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex("sync");
-    const runtime = this.sessionData.getRuntimeStore().inspectKnowledgeGovernance();
-    const warnings = [...markdown.warnings, ...runtime.warnings];
-    return {
-      ok: markdown.ok && runtime.warnings.length === 0,
-      markdown,
-      runtime,
-      warnings,
-    };
+    return await this.omsAdmin.verifyKnowledgeAssets(context);
   }
 
   async listKnowledgeCandidates(
     context: Pick<LifecycleContext, "sessionId" | "config">,
     options: { status?: string; limit?: number } = {},
   ): Promise<OmsKnowledgeCandidateListResult> {
-    const { knowledgeRawStore } = await this.ensureSession(context.sessionId, context.config);
-    const limit = Math.max(Math.min(options.limit ?? 20, 100), 1);
-    const candidates = knowledgeRawStore.getAll()
-      .filter((entry) => !options.status || entry.status === options.status)
-      .sort((left, right) =>
-        (right.score?.total ?? 0) - (left.score?.total ?? 0) ||
-        right.createdAt.localeCompare(left.createdAt))
-      .slice(0, limit)
-      .map((entry) => ({
-        id: entry.id,
-        oneLineSummary: entry.oneLineSummary ?? this.knowledgeCandidateScorer.summarize(entry.sourceSummary),
-        score: entry.score?.total ?? null,
-        recommendation: entry.score?.recommendation ?? null,
-        status: entry.status,
-        reviewState: entry.review?.state ?? null,
-        sourceSummaryId: entry.sourceSummaryId,
-        intakeReason: entry.intakeReason,
-        createdAt: entry.createdAt,
-      }));
-    return {
-      ok: true,
-      total: candidates.length,
-      candidates,
-    };
+    return await this.omsAdmin.listKnowledgeCandidates(context, options);
   }
 
   async reviewKnowledgeCandidate(
@@ -993,33 +799,33 @@ export class ChaunyomsSessionRuntime {
       note?: string;
     },
   ): Promise<OmsKnowledgeReviewResult> {
-    const { knowledgeRawStore } = await this.ensureSession(context.sessionId, context.config);
-    const candidate = await knowledgeRawStore.markReview(args);
-    if (!candidate) {
-      return {
-        ok: false,
-        action: args.action,
-        candidate: null,
-        reason: "knowledge_candidate_not_found",
-      };
-    }
-    if (args.action === "approve") {
-      this.scheduleKnowledgeMaintenance(context);
-    }
-    return {
-      ok: true,
-      action: args.action,
-      candidate,
-    };
+    return await this.omsAdmin.reviewKnowledgeCandidate(context, {
+      ...args,
+      onApprove: () => this.knowledgeMaintenance.schedule(context),
+    });
   }
 
-  private restoreCopyPlan(config: BridgeConfig, backupDir: string): Array<{ label: string; source: string; target: string }> {
-    return [
-      { label: "agent_data", source: path.join(backupDir, "agent_data"), target: path.join(config.dataDir, "agents", config.agentId) },
-      { label: "knowledge", source: path.join(backupDir, "knowledge"), target: config.knowledgeBaseDir },
-      { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(config.memoryVaultDir, "agents", config.agentId) },
-      { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(config.workspaceDir, "memory") },
-    ];
+  async wipeSession(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: {
+      apply?: boolean;
+      backupBeforeApply?: boolean;
+    } = {},
+  ): Promise<OmsWipeResult> {
+    return await this.omsAdmin.wipeSession(context, options);
+  }
+
+  async wipeAgent(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: {
+      apply?: boolean;
+      backupBeforeApply?: boolean;
+      wipeKnowledgeBase?: boolean;
+      wipeWorkspaceMemory?: boolean;
+      wipeBackups?: boolean;
+    } = {},
+  ): Promise<OmsWipeResult> {
+    return await this.omsAdmin.wipeAgent(context, options);
   }
 
   private async ensureSession(
@@ -1028,19 +834,6 @@ export class ChaunyomsSessionRuntime {
   ): Promise<SessionDataStores> {
     this.config = config;
     return await this.sessionData.ensure(sessionId, config);
-  }
-
-  private async copyIfPresent(source: string, target: string): Promise<boolean> {
-    try {
-      await cp(source, target, { recursive: true, force: true });
-      return true;
-    } catch (error) {
-      const nodeError = error as NodeJS.ErrnoException;
-      if (nodeError.code === "ENOENT") {
-        return false;
-      }
-      throw error;
-    }
   }
   private async syncRuntimeMessages(
     sessionId: string,
@@ -1057,8 +850,6 @@ export class ChaunyomsSessionRuntime {
       }
       return { importedMessages: 0 };
     }
-
-    const { rawStore, observationStore, durableMemoryStore } = await this.ensureSession(sessionId, config);
     const inspectedMessages = runtimeMessages.map((message) => ({
       message,
       decision: this.runtimeIngress.inspect(message),
@@ -1073,141 +864,13 @@ export class ChaunyomsSessionRuntime {
         (skippedCounts.get(decision.classification) ?? 0) + 1,
       );
     }
-
     if (skippedCounts.size > 0) {
       this.logger.info("runtime_message_ingress_filtered", {
         sessionId,
         skipped: Object.fromEntries(skippedCounts),
       });
     }
-
-    const normalizedMessages = inspectedMessages
-      .filter(({ decision }) => decision.persist)
-      .map(({ message, decision }) => ({
-        ...message,
-        text: decision.normalizedText,
-        storageTarget: decision.storageTarget,
-        metadata: {
-          ...(message.metadata ?? {}),
-          runtimeClassification: decision.classification,
-          runtimePersistenceReason: decision.reason,
-        },
-      }));
-
-    if (normalizedMessages.length === 0) {
-      return { importedMessages: 0 };
-    }
-
-    const rawCandidates = normalizedMessages.filter((message) => message.storageTarget === "raw_message");
-    const observationCandidates = normalizedMessages.filter((message) => message.storageTarget === "observation");
-
-    const existingMessages = rawStore
-      .getAll()
-      .filter(
-        (message) =>
-          message.role === "user" ||
-          message.role === "assistant" ||
-          message.role === "tool",
-      );
-    const existingSourceKeys = new Set(
-      existingMessages
-        .map((message) => {
-          const sourceKey = message.metadata?.importedSourceKey;
-          return typeof sourceKey === "string" ? sourceKey : null;
-        })
-        .filter((value): value is string => Boolean(value)),
-    );
-
-    const existingObservationSourceKeys = new Set(
-      observationStore
-        .getAll()
-        .map((item) => item.sourceKey),
-    );
-
-    const overlap = this.findRuntimeOverlap(existingMessages, rawCandidates);
-    const pendingRawMessages = rawCandidates
-      .slice(overlap)
-      .filter((message) => !existingSourceKeys.has(message.sourceKey));
-    const pendingObservationMessages = observationCandidates.filter(
-      (message) => !existingObservationSourceKeys.has(message.sourceKey),
-    );
-
-    let importedMessages = 0;
-    let currentTurn = existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
-    const rawMessagesToImport: RawMessage[] = [];
-    const durableMemoryEntriesToImport: DurableMemoryEntry[] = [];
-
-    for (let index = 0; index < pendingRawMessages.length; index += 1) {
-      const message = pendingRawMessages[index];
-      currentTurn = this.resolveRuntimeTurnNumber(currentTurn, message.role);
-      const rawMessage: RawMessage = {
-        id:
-          message.id ??
-          this.buildRuntimeMessageId(
-            sessionId,
-            message.role,
-            message.text,
-            currentTurn,
-            overlap + index,
-        ),
-        sessionId,
-        agentId: config.agentId,
-        role: message.role,
-        content: message.text,
-        turnNumber: currentTurn,
-        createdAt: this.resolveRuntimeTimestamp(message.timestamp),
-        tokenCount: estimateTokens(message.text),
-        compacted: false,
-        metadata: {
-          ...(message.metadata ?? {}),
-          importedFromRuntimeMessages: true,
-          importedSourceKey: message.sourceKey,
-          runtimeIndex: overlap + index,
-        },
-      };
-      rawMessagesToImport.push(rawMessage);
-      durableMemoryEntriesToImport.push(...this.extractionEngine.extractFromRawMessage(rawMessage));
-      existingSourceKeys.add(message.sourceKey);
-      importedMessages += 1;
-    }
-    await this.sessionData.appendRawMessages(rawMessagesToImport);
-    await this.persistDurableMemories(durableMemoryStore, durableMemoryEntriesToImport);
-
-    for (let index = 0; index < pendingObservationMessages.length; index += 1) {
-      const message = pendingObservationMessages[index];
-      const observation: ObservationEntry = {
-        id:
-          message.id ??
-          `observation-${this.buildRuntimeMessageId(sessionId, message.role, message.text, 0, index)}`,
-        sessionId,
-        agentId: config.agentId,
-        role: message.role,
-        classification:
-          typeof message.metadata?.runtimeClassification === "string"
-            ? String(message.metadata.runtimeClassification)
-            : "tool_output",
-        content: message.text,
-        sourceKey: message.sourceKey,
-        createdAt: this.resolveRuntimeTimestamp(message.timestamp),
-        tokenCount: estimateTokens(message.text),
-        metadata: {
-          ...(message.metadata ?? {}),
-          importedFromRuntimeMessages: true,
-          importedSourceKey: message.sourceKey,
-          runtimeIndex: index,
-        },
-      };
-      await this.sessionData.appendObservation(observation);
-      await this.persistDurableMemories(
-        durableMemoryStore,
-        this.extractionEngine.extractFromObservation(observation),
-      );
-      await this.sessionData.writeDurableMemoryArtifacts();
-      existingObservationSourceKeys.add(message.sourceKey);
-      importedMessages += 1;
-    }
-
-    return { importedMessages };
+    return await this.runtimeIngressService.syncRuntimeMessages(sessionId, config, runtimeMessages);
   }
 
   private async persistDurableMemories(
@@ -1220,16 +883,6 @@ export class ChaunyomsSessionRuntime {
     await this.sessionData.addDurableEntries(entries);
   }
 
-  private resolveRuntimeTurnNumber(
-    currentTurn: number,
-    role: RawMessage["role"],
-  ): number {
-    if (role === "user") {
-      return Math.max(currentTurn + 1, 1);
-    }
-    return currentTurn > 0 ? currentTurn : 1;
-  }
-
   private resolveNextTurnNumber(
     rawStore: RawMessageRepository,
     role: RawMessage["role"],
@@ -1239,633 +892,24 @@ export class ChaunyomsSessionRuntime {
     return role === "user" ? lastTurn + 1 : Math.max(lastTurn, 1);
   }
 
-  private findRuntimeOverlap(
-    existingMessages: RawMessage[],
-    runtimeMessages: Array<RuntimeMessageSnapshot & { storageTarget?: string }>,
-  ): number {
-    const maxOverlap = Math.min(existingMessages.length, runtimeMessages.length);
-    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
-      let matched = true;
-      for (let index = 0; index < overlap; index += 1) {
-        const existing = existingMessages[existingMessages.length - overlap + index];
-        const runtime = runtimeMessages[index];
-        if (
-          existing.role !== runtime.role ||
-          this.normalizeMessageText(existing.content) !== this.normalizeMessageText(runtime.text)
-        ) {
-          matched = false;
-          break;
-        }
-      }
-      if (matched) {
-        return overlap;
-      }
-    }
-    return 0;
-  }
-
   private resolveActiveUserQuery(
     rawStore: RawMessageRepository,
     runtimeMessages: RuntimeMessageSnapshot[],
   ): string | undefined {
-    for (let index = runtimeMessages.length - 1; index >= 0; index -= 1) {
-      const message = runtimeMessages[index];
-      if (message.role === "user" && message.text.trim().length > 0) {
-        return message.text.trim();
-      }
-    }
-
-    const messages = rawStore.getAll();
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role === "user" && message.content.trim().length > 0) {
-        return message.content.trim();
-      }
-    }
-
-    return undefined;
+    return this.runtimeIngressService.resolveActiveUserQuery(rawStore, runtimeMessages);
   }
 
   private buildRuntimeMessageTailFallback(
     context: LifecycleContext,
     availableBudget: number,
   ): ContextItem[] {
-    const selected: ContextItem[] = [];
-    let consumed = 0;
-    let turns = 0;
-    for (let index = context.runtimeMessages.length - 1; index >= 0; index -= 1) {
-      const message = context.runtimeMessages[index];
-      if (!message.text.trim()) {
-        continue;
-      }
-      const tokenCount = Math.max(estimateTokens(message.text), 1);
-      if (selected.length > 0 && consumed + tokenCount > Math.min(availableBudget, this.config.freshTailTokens)) {
-        break;
-      }
-      selected.unshift({
-        kind: "message",
-        tokenCount,
-        role: message.role,
-        content: message.text,
-        metadata: {
-          ...(message.metadata ?? {}),
-          source: "runtime_tail_fallback",
-          sourceKey: message.sourceKey,
-        },
-      });
-      consumed += tokenCount;
-      if (message.role === "user") {
-        turns += 1;
-      }
-      if (turns >= this.config.maxFreshTailTurns) {
-        break;
-      }
-    }
-    return selected;
-  }
-
-  private normalizeMessageText(content: string): string {
-    return content.replace(/\s+/g, " ").trim();
-  }
-
-  private buildRuntimeMessageId(
-    sessionId: string,
-    role: RawMessage["role"],
-    content: string,
-    turnNumber: number,
-    runtimeIndex: number,
-  ): string {
-    const digest = createHash("sha256")
-      .update(
-        `${sessionId}|${role}|${turnNumber}|${runtimeIndex}|${this.normalizeMessageText(content)}`,
-        "utf8",
-      )
-      .digest("hex")
-      .slice(0, 24);
-    return `runtime-${digest}`;
-  }
-
-  private resolveRuntimeTimestamp(timestamp?: number | string): string {
-    if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
-      return new Date(timestamp).toISOString();
-    }
-    if (typeof timestamp === "string" && timestamp.trim().length > 0) {
-      const parsed = new Date(timestamp);
-      if (!Number.isNaN(parsed.getTime())) {
-        return parsed.toISOString();
-      }
-    }
-    return new Date().toISOString();
-  }
-
-  private async runBestEffortCompaction(
-    context: LifecycleContext,
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-  ): Promise<{ compacted: boolean; entry: SummaryEntry | null }> {
-    const compaction = await this.runSerializedCompaction(
-      rawStore,
-      summaryStore,
+    return this.runtimeIngressService.buildRuntimeMessageTailFallback(
       context,
-    );
-    const entry = compaction.status === "compacted" || compaction.status === "deduped"
-      ? compaction.summary
-      : null;
-    return { compacted: Boolean(entry), entry };
-  }
-
-  private async runCompactionBarrier(
-    context: LifecycleContext,
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-    activeQuery?: string,
-  ): Promise<void> {
-    let budgetState = await this.measureCompactionBudgetState(
-      context,
-      rawStore,
-      summaryStore,
-      activeQuery,
-    );
-    if (!budgetState.triggerExceeded) {
-      this.lastCompactionDiagnostics = {
-        sessionId: context.sessionId,
-        mode: "barrier",
-        triggerExceeded: false,
-        triggerThreshold: budgetState.triggerBudget,
-        compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-        compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-        hostFixedTokens: budgetState.hostFixedTokens,
-        hostFixedTokenSource: budgetState.hostFixedTokenSource,
-        pluginFixedTokens: budgetState.pluginFixedTokens,
-        freshTailTokens: budgetState.freshTailTokens,
-        status: "skipped",
-        reason: "barrier_not_required",
-      };
-      return;
-    }
-
-    const tokensBefore = budgetState.compressibleHistoryTokens;
-    const maxPasses = 12;
-    let passes = 0;
-
-    while (budgetState.compressibleHistoryTokens > budgetState.compressibleHistoryBudget) {
-      passes += 1;
-      if (passes > maxPasses) {
-        this.logger.warn("compaction_barrier_soft_failed", {
-          sessionId: context.sessionId,
-          reason: "max_passes_exceeded",
-          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-          passes,
-        });
-        this.lastCompactionDiagnostics = {
-          sessionId: context.sessionId,
-          mode: "barrier",
-          triggerExceeded: true,
-          triggerThreshold: budgetState.triggerBudget,
-          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-          hostFixedTokens: budgetState.hostFixedTokens,
-          hostFixedTokenSource: budgetState.hostFixedTokenSource,
-          pluginFixedTokens: budgetState.pluginFixedTokens,
-          freshTailTokens: budgetState.freshTailTokens,
-          passes,
-          status: "failed",
-          reason: "max_passes_exceeded",
-        };
-        return;
-      }
-
-      const compaction = await this.runSerializedCompaction(
-        rawStore,
-        summaryStore,
-        context,
-        true,
-      );
-      if (compaction.status !== "compacted" && compaction.status !== "deduped") {
-        const reason = compaction.reason ?? compaction.status;
-        this.logger.warn("compaction_barrier_soft_failed", {
-          sessionId: context.sessionId,
-          reason,
-          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-          passes,
-        });
-        this.lastCompactionDiagnostics = {
-          sessionId: context.sessionId,
-          mode: "barrier",
-          triggerExceeded: true,
-          triggerThreshold: budgetState.triggerBudget,
-          compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-          compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-          hostFixedTokens: budgetState.hostFixedTokens,
-          hostFixedTokenSource: budgetState.hostFixedTokenSource,
-          pluginFixedTokens: budgetState.pluginFixedTokens,
-          freshTailTokens: budgetState.freshTailTokens,
-          passes,
-          status: "failed",
-          reason,
-        };
-        return;
-      }
-      const entry = compaction.summary;
-
-      await this.enqueueSummaryForKnowledge(entry, context);
-      await this.rollUpSummaryTree(summaryStore, context);
-      budgetState = await this.measureCompactionBudgetState(
-        context,
-        rawStore,
-        summaryStore,
-        activeQuery,
-      );
-    }
-
-    if (budgetState.hostFixedTokens + budgetState.pluginFixedTokens + budgetState.freshTailTokens > context.totalBudget) {
-      this.logger.warn("compaction_fixed_and_fresh_over_trigger_budget", {
-        sessionId: context.sessionId,
-        hostFixedTokens: budgetState.hostFixedTokens,
-        hostFixedTokenSource: budgetState.hostFixedTokenSource,
-        pluginFixedTokens: budgetState.pluginFixedTokens,
-        freshTailTokens: budgetState.freshTailTokens,
-        triggerBudget: budgetState.triggerBudget,
-        totalBudget: context.totalBudget,
-      });
-    }
-
-    this.logger.info("compaction_barrier_recovered_context", {
-      sessionId: context.sessionId,
-      tokensBefore,
-      tokensAfter: budgetState.compressibleHistoryTokens,
-      triggerThreshold: this.config.contextThreshold,
-      hostFixedTokens: budgetState.hostFixedTokens,
-      hostFixedTokenSource: budgetState.hostFixedTokenSource,
-      pluginFixedTokens: budgetState.pluginFixedTokens,
-      freshTailTokens: budgetState.freshTailTokens,
-      compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-      passes,
-      strictCompaction: this.config.strictCompaction,
-    });
-    this.lastCompactionDiagnostics = {
-      sessionId: context.sessionId,
-      mode: "barrier",
-      triggerExceeded: true,
-      triggerThreshold: budgetState.triggerBudget,
-      compressibleHistoryTokens: budgetState.compressibleHistoryTokens,
-      compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
-      hostFixedTokens: budgetState.hostFixedTokens,
-      hostFixedTokenSource: budgetState.hostFixedTokenSource,
-      pluginFixedTokens: budgetState.pluginFixedTokens,
-      freshTailTokens: budgetState.freshTailTokens,
-      passes,
-      status: "compacted",
-      reason: "barrier_recovered_context_budget",
-    };
-  }
-
-  private async measureCompactionBudgetState(
-    context: LifecycleContext,
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-    activeQuery?: string,
-  ): Promise<CompactionBudgetState> {
-    const { durableMemoryStore } = this.getActiveStores();
-    const budget = this.assembler.allocateBudget(
-      context.totalBudget,
-      context.systemPromptTokens,
-    );
-    const stablePrefix = await this.fixedPrefixProvider.load(
-      this.config.sharedDataDir,
-      this.config.workspaceDir,
-      budget.stablePrefixBudget,
-      {
-        activeQuery,
-      },
-    );
-    const recallGuidance = this.assembler.buildRecallGuidance(summaryStore, context.sessionId);
-    const durableMemory = this.assembler.assembleDurableMemory(
-      durableMemoryStore,
-      budget.recallBudget,
-    );
-    const pluginFixedTokens = [
-      ...stablePrefix,
-      ...(recallGuidance ? [recallGuidance] : []),
-      ...durableMemory,
-    ].reduce((sum, item) => sum + item.tokenCount, 0);
-
-    const effectiveTailBudget = Math.min(
-      budget.recentTailBudget,
-      this.config.freshTailTokens,
-    );
-    const freshTail = this.assembler.assembleRecentTail(
-      rawStore,
-      effectiveTailBudget,
+      availableBudget,
       this.config.freshTailTokens,
       this.config.maxFreshTailTurns,
-      context.sessionId,
     );
-    const freshTailTokens = freshTail.reduce(
-      (sum, item) => sum + item.tokenCount,
-      0,
-    );
-
-    const compressibleHistoryTokens =
-      this.compactionEngine.measureCompressibleHistoryTokens(
-        rawStore,
-        summaryStore,
-        this.config.freshTailTokens,
-        this.config.maxFreshTailTurns,
-        context.sessionId,
-      );
-    const hostFixedResolved =
-      context.systemPromptTokens > 0
-        ? {
-            tokens: context.systemPromptTokens,
-            source: "systemPromptTokens" as const,
-          }
-        : {
-            tokens: await this.hostFixedContextProvider.estimateWorkspaceBootstrapTokens(
-              this.config.workspaceDir,
-            ),
-            source: "workspaceBootstrapEstimate" as const,
-          };
-    const hostFixedTokens = hostFixedResolved.tokens;
-    const availableBudget = Math.max(
-      context.totalBudget - hostFixedTokens,
-      0,
-    );
-    const triggerBudget = Math.floor(availableBudget * this.config.contextThreshold);
-    const compressibleHistoryBudget = Math.max(
-      triggerBudget - pluginFixedTokens - freshTailTokens,
-      0,
-    );
-
-    return {
-      availableBudget,
-      hostFixedTokens,
-      hostFixedTokenSource: hostFixedResolved.source,
-      pluginFixedTokens,
-      triggerBudget,
-      freshTailTokens,
-      compressibleHistoryTokens,
-      compressibleHistoryBudget,
-      triggerExceeded:
-        pluginFixedTokens + freshTailTokens + compressibleHistoryTokens > triggerBudget,
-    };
   }
-
-  private async enqueueSummaryForKnowledge(
-    entry: SummaryEntry,
-    context: LifecycleContext,
-  ): Promise<void> {
-    if (!this.config.knowledgePromotionEnabled || this.config.emergencyBrake) {
-      return;
-    }
-
-    const { rawStore } = await this.ensureSession(
-      context.sessionId,
-      context.config,
-    );
-    const sourceResolution = this.sourceMessageResolver.resolve(rawStore, entry);
-    if (sourceResolution.messages.length === 0) {
-      this.logger.warn("knowledge_raw_intake_missing_source_messages", {
-        summaryId: entry.id,
-        sessionId: entry.sessionId,
-        reason: sourceResolution.reason,
-      });
-      return;
-    }
-
-    const userOverride = this.resolveKnowledgeUserOverride(
-      sourceResolution.messages,
-      context.config,
-    );
-    const decision = userOverride
-      ? {
-          accepted: true,
-          reason: userOverride,
-        }
-      : this.knowledgeIntakeGate.decide(entry, context.config);
-    if (!decision.accepted) {
-      this.logger.info("knowledge_raw_intake_rejected", {
-        summaryId: entry.id,
-        reason: decision.reason,
-        summaryLevel: entry.summaryLevel ?? 1,
-        nodeKind: entry.nodeKind ?? "leaf",
-        memoryType: entry.memoryType ?? "general",
-        promotionIntent: entry.promotionIntent ?? "candidate",
-      });
-      return;
-    }
-
-    const { knowledgeRawStore } = await this.ensureSession(
-      context.sessionId,
-      context.config,
-    );
-    const now = new Date().toISOString();
-    const score = this.knowledgeCandidateScorer.score(entry, sourceResolution.messages);
-    const manualReview = context.config.knowledgePromotionManualReviewEnabled;
-    const enqueued = await knowledgeRawStore.enqueue({
-      id: `knowledge-raw-${entry.id}`,
-      sessionId: entry.sessionId,
-      agentId: entry.agentId,
-      sourceSummaryId: entry.id,
-      sourceSummary: entry,
-      sourceBinding: sourceResolution.binding,
-      oneLineSummary: this.knowledgeCandidateScorer.summarize(entry),
-      score,
-      review: {
-        mode: manualReview ? "manual" : "auto",
-        state: manualReview ? "awaiting_review" : "auto_accepted",
-      },
-      intakeReason: decision.reason,
-      status: manualReview ? "review_pending" : "pending",
-      createdAt: now,
-      updatedAt: now,
-    });
-    if (!enqueued) {
-      this.logger.info("knowledge_raw_intake_deduped", {
-        summaryId: entry.id,
-      });
-      return;
-    }
-
-    this.logger.info("knowledge_raw_intake_enqueued", {
-      summaryId: entry.id,
-      reason: decision.reason,
-      oneLineSummary: this.knowledgeCandidateScorer.summarize(entry),
-      score: score.total,
-      recommendation: score.recommendation,
-      reviewMode: manualReview ? "manual" : "auto",
-    });
-    if (!manualReview) {
-      this.scheduleKnowledgeMaintenance(context);
-    }
-  }
-
-  private scheduleKnowledgeMaintenance(context: Pick<LifecycleContext, "sessionId" | "config" | "summaryModel">): void {
-    if (!context.config.knowledgePromotionEnabled || context.config.emergencyBrake) {
-      return;
-    }
-
-    const key = `${context.config.agentId}|${context.sessionId}|${context.config.dataDir}`;
-    this.pendingKnowledgeMaintenance.set(key, {
-      sessionId: context.sessionId,
-      config: context.config,
-      summaryModel: context.summaryModel,
-    });
-    this.startKnowledgeMaintenanceLoop();
-  }
-
-  private startKnowledgeMaintenanceLoop(): void {
-    if (this.knowledgeMaintenanceInFlight) {
-      return;
-    }
-
-    this.knowledgeMaintenanceInFlight = (async () => {
-      while (this.pendingKnowledgeMaintenance.size > 0) {
-        const contexts = [...this.pendingKnowledgeMaintenance.values()];
-        this.pendingKnowledgeMaintenance.clear();
-        for (const context of contexts) {
-          await this.processKnowledgeRawQueue(context);
-        }
-      }
-    })()
-      .catch((error) => {
-        this.logger.warn("knowledge_raw_worker_failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      })
-      .finally(() => {
-        this.knowledgeMaintenanceInFlight = null;
-        if (this.pendingKnowledgeMaintenance.size > 0) {
-          this.startKnowledgeMaintenanceLoop();
-        }
-      });
-  }
-
-  private async processKnowledgeRawQueue(context: {
-    sessionId: string;
-    config: BridgeConfig;
-    summaryModel?: string;
-  }): Promise<void> {
-    const { rawStore, knowledgeRawStore, knowledgeStore } = await this.ensureSession(
-      context.sessionId,
-      context.config,
-    );
-
-    while (true) {
-      const candidates = await knowledgeRawStore.claimPending(8);
-      if (candidates.length === 0) {
-        return;
-      }
-
-      for (const candidate of candidates) {
-        try {
-          const sourceResolution = this.sourceMessageResolver.resolve(
-            rawStore,
-            candidate.sourceBinding ?? candidate.sourceSummary,
-          );
-          if (sourceResolution.messages.length === 0) {
-            await knowledgeRawStore.markSettled({
-              id: candidate.id,
-              status: "failed",
-              reason: "missing_source_messages_for_knowledge_candidate",
-            });
-            continue;
-          }
-          if (!sourceResolution.verified) {
-            await knowledgeRawStore.markSettled({
-              id: candidate.id,
-              status: "failed",
-              reason: sourceResolution.reason,
-            });
-            continue;
-          }
-
-          const result = await this.knowledgePromotionEngine.promote({
-            summaryEntry: candidate.sourceSummary,
-            messages: sourceResolution.messages,
-            sessionId: context.sessionId,
-            summaryModel: context.summaryModel,
-            knowledgePromotionModel: context.config.knowledgePromotionModel,
-            knowledgeStore,
-          });
-          await knowledgeRawStore.markSettled({
-            id: candidate.id,
-            status: result.status,
-            reason: result.reason,
-            docId: result.docId,
-            slug: result.slug,
-            version: result.version,
-            filePath: result.filePath,
-          });
-          const trustModel = knowledgeStore.describeTrustModel();
-          this.logger.info("knowledge_raw_candidate_processed", {
-            candidateId: candidate.id,
-            summaryId: candidate.sourceSummaryId,
-            status: result.status,
-            reason: result.reason,
-            slug: result.slug,
-            version: result.version,
-            bucket: result.draft?.bucket,
-            canonicalKey: result.draft?.canonicalKey,
-            sourceVerified: sourceResolution.verified,
-            sourceMessageCount: sourceResolution.messages.length,
-            trustLayer: trustModel.layer,
-            requiresProvenance: trustModel.requiresProvenance,
-          });
-        } catch (error) {
-          await knowledgeRawStore.markSettled({
-            id: candidate.id,
-            status: "failed",
-            reason: error instanceof Error ? error.message : String(error),
-          });
-          this.logger.warn("knowledge_raw_candidate_processing_failed", {
-            candidateId: candidate.id,
-            summaryId: candidate.sourceSummaryId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    }
-  }
-
-  private resolveKnowledgeUserOverride(
-    messages: RawMessage[],
-    config: Pick<
-      BridgeConfig,
-      "knowledgeIntakeUserOverrideEnabled" | "knowledgeIntakeUserOverridePatterns"
-    >,
-  ): string | null {
-    if (!config.knowledgeIntakeUserOverrideEnabled) {
-      return null;
-    }
-
-    const customPatterns = (config.knowledgeIntakeUserOverridePatterns ?? [])
-      .map((item) => item.trim().toLowerCase())
-      .filter(Boolean);
-
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role !== "user") {
-        continue;
-      }
-      const normalized = message.content.trim();
-      if (!normalized) {
-        continue;
-      }
-      if (ChaunyomsSessionRuntime.DEFAULT_KNOWLEDGE_OVERRIDE_RE.test(normalized)) {
-        return "explicit_user_knowledge_override";
-      }
-      const lower = normalized.toLowerCase();
-      if (customPatterns.some((pattern) => lower.includes(pattern))) {
-        return "custom_user_knowledge_override";
-      }
-    }
-
-    return null;
-  }
-
   private inspectSummaryIntegrity(): SummaryIntegrityInspection {
     return this.sessionData.inspectSummaryIntegrity();
   }
@@ -1906,46 +950,6 @@ export class ChaunyomsSessionRuntime {
     verifiedEntries: Array<{ sessionId: string; startTurn: number; endTurn: number }>,
   ): Promise<void> {
     await this.sessionData.repairCompactedFlagsFromSummaries(verifiedEntries);
-  }
-
-  private async runSerializedCompaction(
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-    context: LifecycleContext,
-    bypassThreshold = false,
-  ): Promise<CompactionRunResult> {
-    if (this.compactionInFlight) {
-      return await this.compactionInFlight;
-    }
-
-    const run = this.compactionEngine.runCompaction(
-      rawStore,
-      summaryStore,
-      context.totalBudget,
-      this.config.contextThreshold,
-      this.config.strictCompaction,
-      this.config.freshTailTokens,
-      this.config.maxFreshTailTurns,
-      context.summaryModel,
-      this.config.summaryMaxOutputTokens,
-      context.sessionId,
-      this.config.agentId,
-      this.config.compactionBatchTurns,
-      bypassThreshold,
-    );
-    this.compactionInFlight = run;
-
-    try {
-      const result = await run;
-      if (result.status === "compacted" || result.status === "deduped") {
-        this.navigationSnapshotPending = true;
-      }
-      return result;
-    } finally {
-      if (this.compactionInFlight === run) {
-        this.compactionInFlight = null;
-      }
-    }
   }
 
   private async writeNavigationArtifactsIfPending(
@@ -2083,3 +1087,4 @@ export class ChaunyomsSessionRuntime {
     return this.sessionData.getStores();
   }
 }
+

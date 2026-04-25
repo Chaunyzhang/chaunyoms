@@ -142,6 +142,13 @@ export interface RuntimeAssetSyncReport {
   warnings: string[];
 }
 
+export interface RuntimePurgeReport {
+  ok: boolean;
+  scope: "session" | "agent";
+  target: string;
+  deleted: Record<string, number>;
+}
+
 export interface OmsGrepHit {
   message: RawMessage;
   before: RawMessage[];
@@ -1125,6 +1132,52 @@ export class SQLiteRuntimeStore {
     }
   }
 
+  purgeSession(sessionId: string): RuntimePurgeReport {
+    if (!sessionId.trim()) {
+      return { ok: false, scope: "session", target: sessionId, deleted: {} };
+    }
+    this.openDatabase();
+    if (!this.db) {
+      return { ok: false, scope: "session", target: sessionId, deleted: {} };
+    }
+    const deleted = this.runPurgeTransaction({
+      scope: "session",
+      target: sessionId.trim(),
+      whereColumn: "session_id",
+    });
+    return {
+      ok: true,
+      scope: "session",
+      target: sessionId.trim(),
+      deleted,
+    };
+  }
+
+  purgeAgent(agentId: string): RuntimePurgeReport {
+    if (!agentId.trim()) {
+      return { ok: false, scope: "agent", target: agentId, deleted: {} };
+    }
+    this.openDatabase();
+    if (!this.db) {
+      return { ok: false, scope: "agent", target: agentId, deleted: {} };
+    }
+    const deleted = this.runPurgeTransaction({
+      scope: "agent",
+      target: agentId.trim(),
+      whereColumn: "agent_id",
+    });
+    return {
+      ok: true,
+      scope: "agent",
+      target: agentId.trim(),
+      deleted,
+    };
+  }
+
+  dispose(): void {
+    this.closeDatabase();
+  }
+
   private async initOnce(): Promise<void> {
     const DatabaseSync = this.loadSQLite();
     if (!DatabaseSync) {
@@ -1171,6 +1224,71 @@ export class SQLiteRuntimeStore {
       this.db = null;
       this.statementCache.clear();
     }
+  }
+
+  private runPurgeTransaction(args: {
+    scope: "session" | "agent";
+    target: string;
+    whereColumn: "session_id" | "agent_id";
+  }): Record<string, number> {
+    const deleted: Record<string, number> = {};
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      deleted.retrieval_candidates = this.deleteBySql(
+        `
+          DELETE FROM retrieval_candidates
+          WHERE context_run_id IN (
+            SELECT id FROM context_runs WHERE ${args.whereColumn} = ?
+          )
+        `,
+        args.target,
+      );
+      deleted.context_runs = this.deleteBySql(
+        `DELETE FROM context_runs WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.source_edges = this.deleteBySql(
+        `DELETE FROM source_edges WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.messages = this.deleteBySql(
+        `DELETE FROM messages WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.summaries = this.deleteBySql(
+        `DELETE FROM summaries WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.memories = this.deleteBySql(
+        `DELETE FROM memories WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return deleted;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // best effort
+        }
+      }
+      throw error;
+    }
+  }
+
+  private deleteBySql(sql: string, param: SQLiteValue): number {
+    this.prepare(sql)?.run(param);
+    return this.getSingleNumber("SELECT changes() AS count");
+  }
+
+  private getSingleNumber(sql: string): number {
+    const row = this.prepare(sql)?.get();
+    const value = row?.count;
+    return typeof value === "number" ? value : Number(value ?? 0) || 0;
   }
 
   private prepare(sql: string): SQLiteStatementLike | null {

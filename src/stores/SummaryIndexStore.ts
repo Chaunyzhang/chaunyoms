@@ -64,6 +64,16 @@ export class SummaryIndexStore implements SummaryRepository {
     await this.flush();
   }
 
+  async removeSession(sessionId: string): Promise<number> {
+    const before = this.summaries.length;
+    this.summaries = this.summaries.filter((entry) => entry.sessionId !== sessionId);
+    const removed = before - this.summaries.length;
+    if (removed > 0) {
+      await this.flush();
+    }
+    return removed;
+  }
+
   async attachParent(parentSummaryId: string, childSummaryIds: string[]): Promise<void> {
     let changed = false;
     this.summaries = this.summaries.map((summary) => {

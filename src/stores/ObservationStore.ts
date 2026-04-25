@@ -38,6 +38,19 @@ export class ObservationStore {
     await this.flush();
   }
 
+  async removeSession(sessionId: string): Promise<number> {
+    const before = this.observations.length;
+    const kept = this.observations.filter((entry) => entry.sessionId !== sessionId);
+    const removed = before - kept.length;
+    if (removed <= 0) {
+      return 0;
+    }
+    this.observations.length = 0;
+    this.observations.push(...kept);
+    await this.flush();
+    return removed;
+  }
+
   getAll(): ObservationEntry[] {
     return [...this.observations];
   }

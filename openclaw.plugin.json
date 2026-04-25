@@ -81,6 +81,32 @@
       "knowledgePromotionEnabled": {
         "type": "boolean"
       },
+      "knowledgePromotionManualReviewEnabled": {
+        "type": "boolean"
+      },
+      "knowledgeIntakeMode": {
+        "type": "string",
+        "enum": [
+          "conservative",
+          "balanced",
+          "aggressive"
+        ]
+      },
+      "knowledgeIntakeAllowProjectState": {
+        "type": "boolean"
+      },
+      "knowledgeIntakeAllowBranchSummaries": {
+        "type": "boolean"
+      },
+      "knowledgeIntakeUserOverrideEnabled": {
+        "type": "boolean"
+      },
+      "knowledgeIntakeUserOverridePatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
       "semanticCandidateExpansionEnabled": {
         "type": "boolean"
       },
@@ -90,6 +116,13 @@
       },
       "emergencyBrake": {
         "type": "boolean"
+      },
+      "sqliteJournalMode": {
+        "type": "string",
+        "enum": [
+          "delete",
+          "wal"
+        ]
       }
     }
   }

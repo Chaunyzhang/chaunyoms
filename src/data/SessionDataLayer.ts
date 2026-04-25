@@ -1,4 +1,5 @@
 import path from "node:path";
+import { rm } from "node:fs/promises";
 
 import { DurableMemoryStore } from "../stores/DurableMemoryStore";
 import { KnowledgeRawStore } from "../stores/KnowledgeRawStore";
@@ -227,6 +228,121 @@ export class SessionDataLayer {
     return this.runtimeStore;
   }
 
+  async wipeSession(sessionId: string, config: BridgeConfig): Promise<{
+    removed: string[];
+    skipped: string[];
+    warnings: string[];
+  }> {
+    const removed: string[] = [];
+    const skipped: string[] = [];
+    const warnings: string[] = [
+      "Session wipe removes session-scoped runtime/state files and SQLite ledger rows, but leaves shared Markdown knowledge assets untouched.",
+      "Agent vault mirrors may still reflect historical summaries until the next organizer/rebuild pass.",
+    ];
+    await this.ensure(sessionId, config);
+    await this.runtimeStore?.init().catch(() => undefined);
+    if (this.runtimeStore) {
+      this.runtimeStore.purgeSession(sessionId);
+    }
+    if (this.rawStore) {
+      const count = await this.rawStore.removeSession(sessionId);
+      if (count > 0) {
+        removed.push(`raw_messages:${count}`);
+      }
+    }
+    if (this.summaryStore) {
+      const count = await this.summaryStore.removeSession(sessionId);
+      if (count > 0) {
+        removed.push(`summaries:${count}`);
+      }
+    }
+    if (this.observationStore) {
+      const count = await this.observationStore.removeSession(sessionId);
+      if (count > 0) {
+        removed.push(`observations:${count}`);
+      }
+    }
+    if (this.durableMemoryStore) {
+      const count = await this.durableMemoryStore.removeSession(sessionId);
+      if (count > 0) {
+        removed.push(`durable_memories:${count}`);
+      }
+    }
+    if (this.projectStore) {
+      const projects = this.projectStore.getAll().map((project) => ({
+        ...project,
+        sourceSessionIds: project.sourceSessionIds.filter((id) => id !== sessionId),
+        status: project.sourceSessionIds.filter((id) => id !== sessionId).length > 0
+          ? project.status
+          : "archived" as const,
+      }));
+      await this.projectStore.reconcileProjects(projects);
+    }
+    const targets = [
+      path.join(this.resolveAgentDataDir(config), `${sessionId}.knowledge-raw.json`),
+      path.join(config.dataDir, "logs", `${sessionId}.after-turn.log`),
+    ];
+    for (const target of targets) {
+      if (await this.removePathIfPresent(target)) {
+        removed.push(target);
+      } else {
+        skipped.push(target);
+      }
+    }
+    if (this.boundSessionId === sessionId && this.boundAgentId === config.agentId) {
+      await this.resetBoundStores();
+    }
+    return { removed, skipped, warnings };
+  }
+
+  async wipeAgent(config: BridgeConfig, options: {
+    wipeKnowledgeBase?: boolean;
+    wipeWorkspaceMemory?: boolean;
+    wipeBackups?: boolean;
+  } = {}): Promise<{
+    removed: string[];
+    skipped: string[];
+    warnings: string[];
+  }> {
+    const removed: string[] = [];
+    const skipped: string[] = [];
+    const warnings: string[] = [];
+    await this.ensure(config.sessionId, config);
+    const sessionIds = this.rawStore
+      ? [...new Set(this.rawStore.getAll().map((message) => message.sessionId).filter(Boolean))]
+      : [];
+    await this.runtimeStore?.init().catch(() => undefined);
+    if (this.runtimeStore) {
+      this.runtimeStore.purgeAgent(config.agentId);
+      this.runtimeStore.dispose();
+    }
+    const targets = [
+      path.join(config.dataDir, "agents", config.agentId),
+      path.join(config.memoryVaultDir, "agents", config.agentId),
+      ...sessionIds.map((sessionId) => path.join(config.dataDir, "logs", `${sessionId}.after-turn.log`)),
+      ...(options.wipeWorkspaceMemory ? [path.join(config.workspaceDir, "memory")] : []),
+      ...(options.wipeBackups ? [path.join(config.dataDir, "backups")] : []),
+      ...(options.wipeKnowledgeBase ? [config.knowledgeBaseDir] : []),
+    ];
+    if (!options.wipeKnowledgeBase) {
+      warnings.push("Shared Markdown knowledge assets were preserved. Pass wipeKnowledgeBase=true only when you explicitly want to remove reviewed knowledge docs too.");
+    }
+    if (!options.wipeWorkspaceMemory) {
+      warnings.push("Workspace memory directory was preserved. Pass wipeWorkspaceMemory=true if you want to clear workspace-side ChaunyOMS state as well.");
+    }
+    for (const target of targets) {
+      if (await this.removePathIfPresent(target)) {
+        removed.push(target);
+      } else {
+        skipped.push(target);
+      }
+    }
+    if (this.boundAgentId === config.agentId) {
+      await this.resetBoundStores();
+    }
+    return { removed, skipped, warnings };
+  }
+
   async mirrorRuntimeState(): Promise<void> {
     if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore) {
       return;
@@ -385,5 +501,40 @@ export class SessionDataLayer {
     knowledgeRawStore.getAll();
     projectStore.getAll();
     knowledgeStore.searchRelatedDocuments("upgrade validation", 1);
+  }
+
+  private async removePathIfPresent(target: string): Promise<boolean> {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException;
+      if (nodeError.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async resetBoundStores(): Promise<void> {
+    this.runtimeStore?.dispose();
+    this.rawStore = null;
+    this.summaryStore = null;
+    this.observationStore = null;
+    this.durableMemoryStore = null;
+    this.knowledgeRawStore = null;
+    this.knowledgeStore = null;
+    this.projectStore = null;
+    this.statsLogStore = null;
+    this.runtimeStore = null;
+    this.schemaRegistry = null;
+    this.migrationRunner = null;
+    this.agentVault = null;
+    this.upgradeManager = null;
+    this.boundAgentId = null;
+    this.boundSessionId = null;
+    this.boundConfig = null;
+    this.runtimeMirrorSignature = null;
+    this.runtimeMirrorDirty = false;
   }
 }

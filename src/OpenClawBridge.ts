@@ -232,10 +232,12 @@ export class OpenClawBridge {
 
     register(
       "oms_status",
-      "Show ChaunyOMS runtime health, configured paths, counters, and current feature flags.",
+      "Show ChaunyOMS runtime health, configured paths, counters, and current feature flags. Defaults to agent scope; pass scope=session for a narrower view.",
       {
         type: "object",
-        properties: {},
+        properties: {
+          scope: { type: "string", enum: ["agent", "session"] },
+        },
         additionalProperties: false,
       },
       async (_toolCallId: string, args: unknown) =>
@@ -268,10 +270,12 @@ export class OpenClawBridge {
 
     register(
       "oms_verify",
-      "Verify source trace integrity across summary DAG, SQLite source_edges, and runtime candidate audit data.",
+      "Verify source trace integrity across summary DAG, SQLite source_edges, and runtime candidate audit data. Defaults to agent scope; pass scope=session for the current session only.",
       {
         type: "object",
-        properties: {},
+        properties: {
+          scope: { type: "string", enum: ["agent", "session"] },
+        },
         additionalProperties: false,
       },
       async (_toolCallId: string, args: unknown) =>
@@ -306,6 +310,39 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsRestore(args),
+    );
+
+    register(
+      "oms_wipe_session",
+      "Dry-run or apply a session-scoped data wipe. Removes session runtime files and SQLite ledger rows while preserving shared Markdown knowledge assets.",
+      {
+        type: "object",
+        properties: {
+          apply: { type: "boolean", description: "When true, apply the wipe. Defaults to false for dry-run." },
+          backupBeforeApply: { type: "boolean", description: "Create a backup before applying the wipe. Defaults to true." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsWipeSession(args),
+    );
+
+    register(
+      "oms_wipe_agent",
+      "Dry-run or apply an agent-scoped data wipe. Removes agent runtime data and vault mirrors; shared Markdown assets stay preserved unless explicitly requested.",
+      {
+        type: "object",
+        properties: {
+          apply: { type: "boolean", description: "When true, apply the wipe. Defaults to false for dry-run." },
+          backupBeforeApply: { type: "boolean", description: "Create a backup before applying the wipe. Defaults to true." },
+          wipeKnowledgeBase: { type: "boolean", description: "Also remove shared Markdown knowledge assets. Defaults to false." },
+          wipeWorkspaceMemory: { type: "boolean", description: "Also remove workspace memory directory. Defaults to false." },
+          wipeBackups: { type: "boolean", description: "Also remove ChaunyOMS backup directories. Defaults to false." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsWipeAgent(args),
     );
 
     register(
@@ -425,13 +462,14 @@ export class OpenClawBridge {
 
     register(
       "oms_grep",
-      "Search the SQLite runtime raw-message ledger for exact/source-level evidence and return adjacent context.",
+      "Search the SQLite runtime raw-message ledger for exact/source-level evidence and return adjacent context. Defaults to agent scope; pass scope=session to limit to the current session.",
       {
         type: "object",
         properties: {
           query: { type: "string", description: "Keyword or phrase to find in raw messages." },
           limit: { type: "number", description: "Maximum hits to return. Default 10." },
           contextTurns: { type: "number", description: "Adjacent turns to include around each hit. Default 1." },
+          scope: { type: "string", enum: ["agent", "session"] },
         },
         required: ["query"],
         additionalProperties: false,
@@ -474,13 +512,14 @@ export class OpenClawBridge {
 
     register(
       "oms_replay",
-      "Replay raw messages for the current session from the SQLite runtime ledger.",
+      "Replay raw messages from the SQLite runtime ledger. Defaults to agent scope; pass scope=session to replay only the current session.",
       {
         type: "object",
         properties: {
           startTurn: { type: "number", description: "Optional first turn number." },
           endTurn: { type: "number", description: "Optional last turn number." },
           limit: { type: "number", description: "Maximum raw messages to return. Default 200." },
+          scope: { type: "string", enum: ["agent", "session"] },
         },
         additionalProperties: false,
       },

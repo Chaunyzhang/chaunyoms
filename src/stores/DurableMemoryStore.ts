@@ -66,6 +66,16 @@ export class DurableMemoryStore {
     await this.flush();
   }
 
+  async removeSession(sessionId: string): Promise<number> {
+    const before = this.memories.length;
+    this.memories = this.memories.filter((entry) => entry.sessionId !== sessionId);
+    const removed = before - this.memories.length;
+    if (removed > 0) {
+      await this.flush();
+    }
+    return removed;
+  }
+
   search(query: string, limit = 5): DurableMemoryEntry[] {
     const terms = query
       .toLowerCase()

@@ -311,8 +311,9 @@ export class ChaunyomsRetrievalService {
     const runtimeStore = await this.runtime.getRuntimeStore(context);
     const limit = this.getNumberArg(args, "limit", 10);
     const contextTurns = this.getNumberArg(args, "contextTurns", 1);
+    const scope = this.getScopeArg(args);
     const hits = runtimeStore.grepMessages(query, {
-      sessionId: context.sessionId,
+      sessionId: scope === "session" ? context.sessionId : undefined,
       limit,
       contextTurns,
     });
@@ -326,6 +327,7 @@ export class ChaunyomsRetrievalService {
       details: {
         ok: true,
         query,
+        scope,
         runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
         dbPath: runtimeStore.getPath(),
         hitCount: hits.length,
@@ -397,8 +399,9 @@ export class ChaunyomsRetrievalService {
     const startTurn = this.getOptionalNumberArg(args, "startTurn");
     const endTurn = this.getOptionalNumberArg(args, "endTurn");
     const limit = this.getNumberArg(args, "limit", 200);
+    const scope = this.getScopeArg(args);
     const messages = runtimeStore.replay({
-      sessionId: context.sessionId,
+      sessionId: scope === "session" ? context.sessionId : undefined,
       startTurn,
       endTurn,
       limit,
@@ -412,9 +415,10 @@ export class ChaunyomsRetrievalService {
       }],
       details: {
         ok: true,
+        scope,
         runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
         dbPath: runtimeStore.getPath(),
-        sessionId: context.sessionId,
+        sessionId: scope === "session" ? context.sessionId : null,
         startTurn: startTurn ?? null,
         endTurn: endTurn ?? null,
         messageCount: messages.length,
@@ -424,7 +428,7 @@ export class ChaunyomsRetrievalService {
 
   async executeOmsStatus(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const status = await this.runtime.getStatus(context);
+    const status = await this.runtime.getStatus(context, { scope: this.getScopeArg(args) });
     return this.jsonToolResponse("oms_status", status, status.ok);
   }
 
@@ -466,6 +470,7 @@ export class ChaunyomsRetrievalService {
         "Leave knowledgePromotionEnabled=false until raw recall/compaction are stable for the project.",
         "Enable knowledgePromotionManualReviewEnabled=true when promotion is enabled and the UI wants a review queue.",
         "Use oms_backup before restore/migration and oms_verify after large data operations.",
+        "Use oms_wipe_session for privacy-driven session cleanup; use oms_wipe_agent only when you intend to remove the entire agent runtime state.",
       ],
       warnings: [
         ...configGuidance.warnings,
@@ -480,7 +485,7 @@ export class ChaunyomsRetrievalService {
 
   async executeOmsVerify(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const report = await this.runtime.verify(context);
+    const report = await this.runtime.verify(context, { scope: this.getScopeArg(args) });
     return this.jsonToolResponse("oms_verify", report, report.ok);
   }
 
@@ -533,6 +538,31 @@ export class ChaunyomsRetrievalService {
     const apply = this.getBooleanArg(args, "apply", false);
     const result = await this.runtime.restore(context, backupDir, apply);
     return this.jsonToolResponse("oms_restore", result, result.ok);
+  }
+
+  async executeOmsWipeSession(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const apply = this.getBooleanArg(args, "apply", false);
+    const backupBeforeApply = this.getBooleanArg(args, "backupBeforeApply", true);
+    const result = await this.runtime.wipeSession(context, {
+      apply,
+      backupBeforeApply,
+    });
+    return this.jsonToolResponse("oms_wipe_session", result, result.ok);
+  }
+
+  async executeOmsWipeAgent(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const apply = this.getBooleanArg(args, "apply", false);
+    const backupBeforeApply = this.getBooleanArg(args, "backupBeforeApply", true);
+    const result = await this.runtime.wipeAgent(context, {
+      apply,
+      backupBeforeApply,
+      wipeKnowledgeBase: this.getBooleanArg(args, "wipeKnowledgeBase", false),
+      wipeWorkspaceMemory: this.getBooleanArg(args, "wipeWorkspaceMemory", false),
+      wipeBackups: this.getBooleanArg(args, "wipeBackups", false),
+    });
+    return this.jsonToolResponse("oms_wipe_agent", result, result.ok);
   }
 
   async executeOmsInspectContext(args: unknown): Promise<ToolResponse> {
@@ -972,6 +1002,11 @@ export class ChaunyomsRetrievalService {
       return 50;
     }
     return 48;
+  }
+
+  private getScopeArg(args: unknown): "session" | "agent" {
+    const value = this.getStringArg(args, "scope").toLowerCase();
+    return value === "session" ? "session" : "agent";
   }
 
   private shouldUseFtsRecallHints(args: unknown, context: LifecycleContext): boolean {

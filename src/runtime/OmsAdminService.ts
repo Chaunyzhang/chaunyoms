@@ -1,0 +1,499 @@
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
+import {
+  BridgeConfig,
+  DagIntegrityReport,
+  KnowledgeRawEntry,
+} from "../types";
+import {
+  LifecycleContext,
+} from "../host/OpenClawPayloadAdapter";
+import {
+  OmsAssetSyncResult,
+  OmsAssetVerifyResult,
+  OmsBackupResult,
+  OmsKnowledgeCandidateListResult,
+  OmsKnowledgeGovernanceResult,
+  OmsKnowledgeReviewResult,
+  OmsRestoreResult,
+  OmsRuntimeStatus,
+  OmsVerifyReport,
+  OmsWipeResult,
+} from "./ChaunyomsSessionRuntime";
+import {
+  SessionDataLayer,
+  SessionDataStores,
+  SummaryIntegrityInspection,
+} from "../data/SessionDataLayer";
+import { KnowledgeCandidateScorer } from "../engines/KnowledgeCandidateScorer";
+
+interface OmsAdminDependencies {
+  sessionData: SessionDataLayer;
+  contextViewStore: { getItems(): unknown[]; clear(): void };
+  knowledgeCandidateScorer: KnowledgeCandidateScorer;
+  ensureSession: (sessionId: string, config: BridgeConfig) => Promise<SessionDataStores>;
+  inspectDag: (context: Pick<LifecycleContext, "sessionId" | "config">) => Promise<DagIntegrityReport>;
+  inspectAgentDag: (context: Pick<LifecycleContext, "sessionId" | "config">) => DagIntegrityReport;
+  getLastCompactionDiagnostics: () => unknown;
+}
+
+export class OmsAdminService {
+  constructor(private readonly deps: OmsAdminDependencies) {}
+
+  async getStatus(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { scope?: "session" | "agent" } = {},
+  ): Promise<OmsRuntimeStatus> {
+    const stores = await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const scope = options.scope ?? "agent";
+    const scopedQuery = scope === "session" ? { sessionId: context.sessionId } : undefined;
+    const rawMessages = stores.rawStore.getAll(scopedQuery);
+    const summaries = stores.summaryStore.getAllSummaries(scopedQuery);
+    const durableMemories = stores.durableMemoryStore.getAll();
+    const knowledgeRawItems = stores.knowledgeRawStore.getAll();
+    return {
+      ok: true,
+      scope,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      dataDir: context.config.dataDir,
+      workspaceDir: context.config.workspaceDir,
+      knowledgeBaseDir: stores.knowledgeStore.getBaseDir(),
+      memoryVaultDir: context.config.memoryVaultDir,
+      counts: {
+        rawMessages: rawMessages.length,
+        uncompactedRawMessages: rawMessages.filter((message) => !message.compacted).length,
+        uncompactedTokens: stores.rawStore.totalUncompactedTokens(scopedQuery),
+        summaries: summaries.length,
+        summaryTokens: stores.summaryStore.getTotalTokens(scopedQuery),
+        observations: stores.observationStore.count(),
+        durableMemories: durableMemories.length,
+        activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
+        knowledgeRawItems: knowledgeRawItems.length,
+        pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "review_pending" || entry.status === "pending" || entry.status === "processing").length,
+        projects: stores.projectStore.getAll().filter((project) => project.status !== "archived").length,
+        contextItems: this.deps.contextViewStore.getItems().length,
+      },
+      config: {
+        configPreset: context.config.configPreset,
+        contextWindow: context.config.contextWindow,
+        contextThreshold: context.config.contextThreshold,
+        freshTailTokens: context.config.freshTailTokens,
+        maxFreshTailTurns: context.config.maxFreshTailTurns,
+        strictCompaction: context.config.strictCompaction,
+        compactionBarrierEnabled: context.config.compactionBarrierEnabled,
+        runtimeCaptureEnabled: context.config.runtimeCaptureEnabled,
+        durableMemoryEnabled: context.config.durableMemoryEnabled,
+        autoRecallEnabled: context.config.autoRecallEnabled,
+        knowledgePromotionEnabled: context.config.knowledgePromotionEnabled,
+        knowledgePromotionManualReviewEnabled: context.config.knowledgePromotionManualReviewEnabled,
+        semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
+        semanticCandidateLimit: context.config.semanticCandidateLimit,
+        emergencyBrake: context.config.emergencyBrake,
+        sqliteJournalMode: context.config.sqliteJournalMode,
+      },
+      runtimeStore: this.deps.sessionData.getRuntimeStore().getStatus(),
+      lastCompactionDiagnostics: this.deps.getLastCompactionDiagnostics() as OmsRuntimeStatus["lastCompactionDiagnostics"],
+    };
+  }
+
+  async verify(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { scope?: "session" | "agent" } = {},
+  ): Promise<OmsVerifyReport> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const scope = options.scope ?? "agent";
+    const summaryDag = scope === "session"
+      ? await this.deps.inspectDag(context)
+      : this.deps.inspectAgentDag(context);
+    const summaryIntegrity = this.deps.sessionData.inspectSummaryIntegrity();
+    const runtimeStore = this.deps.sessionData.getRuntimeStore().verifyIntegrity();
+    const errors = [
+      ...(summaryDag.ok ? [] : summaryDag.issues.filter((issue) => issue.severity === "error").map((issue) => `${issue.code}: ${issue.message}`)),
+      ...(summaryIntegrity.mismatched > 0 ? [`${summaryIntegrity.mismatched} summaries failed source hash verification.`] : []),
+      ...runtimeStore.errors,
+    ];
+    const warnings = [
+      ...summaryDag.issues.filter((issue) => issue.severity === "warning").map((issue) => `${issue.code}: ${issue.message}`),
+      ...(summaryIntegrity.unchecked > 0 ? [`${summaryIntegrity.unchecked} summaries have no source hash to verify.`] : []),
+      ...runtimeStore.warnings,
+    ];
+    return {
+      ok: summaryDag.ok && summaryIntegrity.mismatched === 0 && runtimeStore.ok && errors.length === 0,
+      scope,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      summaryDag,
+      summaryIntegrity,
+      runtimeStore,
+      warnings,
+      errors,
+    };
+  }
+
+  async backup(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    label = "",
+  ): Promise<OmsBackupResult> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const safeLabel = label.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupDir = path.join(context.config.dataDir, "backups", `chaunyoms-${stamp}${safeLabel ? `-${safeLabel}` : ""}`);
+    const copied: string[] = [];
+    const skipped: string[] = [];
+    await mkdir(backupDir, { recursive: true });
+    const sources = this.restoreCopyPlan(context.config, backupDir).map((item) => ({
+      label: item.label,
+      source: item.target,
+      target: item.source,
+    }));
+    for (const source of sources) {
+      if (await this.copyIfPresent(source.source, source.target)) {
+        copied.push(source.label);
+      } else {
+        skipped.push(source.label);
+      }
+    }
+    const manifest = {
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      paths: sources,
+      config: {
+        dataDir: context.config.dataDir,
+        workspaceDir: context.config.workspaceDir,
+        knowledgeBaseDir: context.config.knowledgeBaseDir,
+        memoryVaultDir: context.config.memoryVaultDir,
+      },
+    };
+    const manifestPath = path.join(backupDir, "manifest.json");
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    return { ok: true, backupDir, manifestPath, copied, skipped };
+  }
+
+  async restore(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    backupDirInput: string,
+    apply = false,
+  ): Promise<OmsRestoreResult> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    const backupsRoot = path.resolve(context.config.dataDir, "backups");
+    const backupDir = path.resolve(backupDirInput);
+    if (!backupDir.startsWith(backupsRoot)) {
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest: null,
+        copied: [],
+        skipped: [],
+        reason: "backupDir must be inside the ChaunyOMS dataDir/backups directory",
+      };
+    }
+    const manifestPath = path.join(backupDir, "manifest.json");
+    let manifest: Record<string, unknown> | null = null;
+    try {
+      manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    } catch (error) {
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest: null,
+        copied: [],
+        skipped: [],
+        reason: `manifest.json is missing or invalid: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (!apply) {
+      return {
+        ok: true,
+        backupDir,
+        apply,
+        manifest,
+        copied: [],
+        skipped: ["dry_run_only"],
+        reason: "Restore manifest validated. Re-run with apply=true to overlay files.",
+      };
+    }
+    const rollbackBackup = await this.backup(context, "pre-restore");
+    const copies = this.restoreCopyPlan(context.config, backupDir);
+    try {
+      const copied: string[] = [];
+      const skipped: string[] = [];
+      for (const item of copies) {
+        if (await this.copyIfPresent(item.source, item.target)) {
+          copied.push(item.label);
+        } else {
+          skipped.push(item.label);
+        }
+      }
+      return {
+        ok: true,
+        backupDir,
+        apply,
+        manifest,
+        rollbackBackupDir: rollbackBackup.backupDir,
+        copied,
+        skipped,
+      };
+    } catch (error) {
+      const rollback = this.restoreCopyPlan(context.config, rollbackBackup.backupDir);
+      let rollbackApplied = false;
+      try {
+        for (const item of rollback) {
+          await this.copyIfPresent(item.source, item.target);
+        }
+        rollbackApplied = true;
+      } catch {
+        rollbackApplied = false;
+      }
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest,
+        rollbackBackupDir: rollbackBackup.backupDir,
+        rollbackApplied,
+        copied: [],
+        skipped: [],
+        reason: `restore failed${rollbackApplied ? " and rollback was applied" : " and rollback failed"}: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  async curateKnowledge(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    apply = false,
+  ): Promise<OmsKnowledgeGovernanceResult> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const runtimeStore = this.deps.sessionData.getRuntimeStore();
+    const report = runtimeStore.inspectKnowledgeGovernance();
+    const actions: string[] = [];
+    if (report.duplicateCanonicalKeys.length > 0) {
+      actions.push("Review duplicate canonical keys and mark stale assets superseded after human confirmation.");
+    }
+    if (report.assetsWithoutProvenance.length > 0) {
+      actions.push("Attach source_refs or linked_summary_ids before treating these assets as reviewed knowledge.");
+    }
+    if (apply) {
+      actions.push("No automatic destructive curation was applied; ChaunyOMS keeps knowledge cleanup advisory unless a specific supersede/link action is requested.");
+    }
+    return {
+      ok: report.warnings.length === 0,
+      apply,
+      report,
+      actions,
+      warnings: report.warnings,
+    };
+  }
+
+  async syncKnowledgeAssets(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    mode: "sync" | "reindex" = "sync",
+  ): Promise<OmsAssetSyncResult> {
+    const { knowledgeStore } = await this.deps.ensureSession(context.sessionId, context.config);
+    const markdown = await knowledgeStore.syncAssetIndex(mode);
+    const runtime = await this.deps.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex(mode);
+    return {
+      ok: markdown.ok && runtime.ok,
+      mode,
+      markdown,
+      runtime,
+    };
+  }
+
+  async verifyKnowledgeAssets(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+  ): Promise<OmsAssetVerifyResult> {
+    const { knowledgeStore } = await this.deps.ensureSession(context.sessionId, context.config);
+    const markdown = await knowledgeStore.verifyAssetIndex();
+    await this.deps.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex("sync");
+    const runtime = this.deps.sessionData.getRuntimeStore().inspectKnowledgeGovernance();
+    const warnings = [...markdown.warnings, ...runtime.warnings];
+    return {
+      ok: markdown.ok && runtime.warnings.length === 0,
+      markdown,
+      runtime,
+      warnings,
+    };
+  }
+
+  async listKnowledgeCandidates(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { status?: string; limit?: number } = {},
+  ): Promise<OmsKnowledgeCandidateListResult> {
+    const { knowledgeRawStore } = await this.deps.ensureSession(context.sessionId, context.config);
+    const limit = Math.max(Math.min(options.limit ?? 20, 100), 1);
+    const candidates = knowledgeRawStore.getAll()
+      .filter((entry) => !options.status || entry.status === options.status)
+      .sort((left, right) =>
+        (right.score?.total ?? 0) - (left.score?.total ?? 0) ||
+        right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit)
+      .map((entry) => ({
+        id: entry.id,
+        oneLineSummary: entry.oneLineSummary ?? this.deps.knowledgeCandidateScorer.summarize(entry.sourceSummary),
+        score: entry.score?.total ?? null,
+        recommendation: entry.score?.recommendation ?? null,
+        status: entry.status,
+        reviewState: entry.review?.state ?? null,
+        sourceSummaryId: entry.sourceSummaryId,
+        intakeReason: entry.intakeReason,
+        createdAt: entry.createdAt,
+      }));
+    return {
+      ok: true,
+      total: candidates.length,
+      candidates,
+    };
+  }
+
+  async reviewKnowledgeCandidate(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    args: {
+      id: string;
+      action: "approve" | "reject";
+      reviewer?: string;
+      note?: string;
+      onApprove?: () => void;
+    },
+  ): Promise<OmsKnowledgeReviewResult> {
+    const { knowledgeRawStore } = await this.deps.ensureSession(context.sessionId, context.config);
+    const candidate = await knowledgeRawStore.markReview(args);
+    if (!candidate) {
+      return {
+        ok: false,
+        action: args.action,
+        candidate: null,
+        reason: "knowledge_candidate_not_found",
+      };
+    }
+    if (args.action === "approve") {
+      args.onApprove?.();
+    }
+    return {
+      ok: true,
+      action: args.action,
+      candidate,
+    };
+  }
+
+  async wipeSession(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: {
+      apply?: boolean;
+      backupBeforeApply?: boolean;
+    } = {},
+  ): Promise<OmsWipeResult> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    if (!options.apply) {
+      return {
+        ok: true,
+        scope: "session",
+        apply: false,
+        sessionId: context.sessionId,
+        removed: [],
+        skipped: [],
+        warnings: [
+          "Dry run only. Re-run with apply=true to remove session-scoped files and SQLite rows.",
+          "Shared Markdown knowledge assets are preserved by session wipe.",
+        ],
+        reason: "dry_run_only",
+      };
+    }
+    const backup = options.backupBeforeApply === false
+      ? null
+      : await this.backup(context, `pre-wipe-session-${context.sessionId}`);
+    const result = await this.deps.sessionData.wipeSession(context.sessionId, context.config);
+    this.deps.contextViewStore.clear();
+    return {
+      ok: true,
+      scope: "session",
+      apply: true,
+      sessionId: context.sessionId,
+      removed: result.removed,
+      skipped: result.skipped,
+      warnings: result.warnings,
+      backupDir: backup?.backupDir,
+    };
+  }
+
+  async wipeAgent(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: {
+      apply?: boolean;
+      backupBeforeApply?: boolean;
+      wipeKnowledgeBase?: boolean;
+      wipeWorkspaceMemory?: boolean;
+      wipeBackups?: boolean;
+    } = {},
+  ): Promise<OmsWipeResult> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    if (!options.apply) {
+      return {
+        ok: true,
+        scope: "agent",
+        apply: false,
+        sessionId: context.sessionId,
+        agentId: context.config.agentId,
+        removed: [],
+        skipped: [],
+        warnings: [
+          "Dry run only. Re-run with apply=true to remove agent-scoped runtime data.",
+          "wipeKnowledgeBase=false keeps shared reviewed Markdown knowledge assets in place.",
+        ],
+        reason: "dry_run_only",
+      };
+    }
+    const backup = options.backupBeforeApply === false
+      ? null
+      : await this.backup(context, `pre-wipe-agent-${context.config.agentId}`);
+    const result = await this.deps.sessionData.wipeAgent(context.config, {
+      wipeKnowledgeBase: options.wipeKnowledgeBase,
+      wipeWorkspaceMemory: options.wipeWorkspaceMemory,
+      wipeBackups: options.wipeBackups,
+    });
+    this.deps.contextViewStore.clear();
+    return {
+      ok: true,
+      scope: "agent",
+      apply: true,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      removed: result.removed,
+      skipped: result.skipped,
+      warnings: result.warnings,
+      backupDir: backup?.backupDir,
+    };
+  }
+
+  private restoreCopyPlan(config: BridgeConfig, backupDir: string): Array<{ label: string; source: string; target: string }> {
+    return [
+      { label: "agent_data", source: path.join(backupDir, "agent_data"), target: path.join(config.dataDir, "agents", config.agentId) },
+      { label: "knowledge", source: path.join(backupDir, "knowledge"), target: config.knowledgeBaseDir },
+      { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(config.memoryVaultDir, "agents", config.agentId) },
+      { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(config.workspaceDir, "memory") },
+    ];
+  }
+
+  private async copyIfPresent(source: string, target: string): Promise<boolean> {
+    try {
+      await cp(source, target, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException;
+      if (nodeError.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  }
+}
