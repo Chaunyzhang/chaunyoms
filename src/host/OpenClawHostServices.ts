@@ -40,6 +40,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   durableMemoryEnabled: true,
   autoRecallEnabled: true,
   knowledgePromotionEnabled: false,
+  knowledgePromotionManualReviewEnabled: false,
   knowledgeIntakeMode: "balanced",
   knowledgeIntakeAllowProjectState: false,
   knowledgeIntakeAllowBranchSummaries: false,
@@ -48,6 +49,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   semanticCandidateExpansionEnabled: true,
   semanticCandidateLimit: 5,
   emergencyBrake: false,
+  sqliteJournalMode: "delete",
 };
 
 export class ConsoleLogger implements LoggerLike {
@@ -209,8 +211,17 @@ export class OpenClawLlmCaller implements LlmCaller {
           throw new Error(`Provider ${providerId} is missing baseUrl or apiKey`);
         }
 
+        if (this.isOpenAiCompatibleApi(api)) {
+          return await this.callOpenAiCompatibleProvider({
+            apiKey,
+            baseUrl,
+            modelId,
+            params,
+          });
+        }
+
         if (api !== "anthropic-messages") {
-          throw new Error(`Configured summary fallback only supports anthropic-messages, got ${api}`);
+          throw new Error(`Configured summary fallback supports anthropic-messages and openai-compatible chat completions, got ${api}`);
         }
 
         const endpoint = baseUrl.endsWith("/v1/messages")
@@ -386,10 +397,61 @@ export class OpenClawLlmCaller implements LlmCaller {
 
   private resolveConfiguredApiKey(providerConfig: HostProviderConfig): string | null {
     const apiKey = providerConfig?.apiKey;
-    if (typeof apiKey !== "string" || !apiKey.trim()) {
-      return null;
+    if (typeof apiKey === "string" && apiKey.trim()) {
+      return apiKey.trim();
     }
-    return apiKey.trim();
+    const apiKeyEnv = providerConfig?.apiKeyEnv;
+    if (typeof apiKeyEnv === "string" && apiKeyEnv.trim()) {
+      const envValue = process.env[apiKeyEnv.trim()];
+      return typeof envValue === "string" && envValue.trim()
+        ? envValue.trim()
+        : null;
+    }
+    return null;
+  }
+
+  private isOpenAiCompatibleApi(api: string): boolean {
+    return [
+      "openai",
+      "openai-compatible",
+      "openai-chat-completions",
+      "chat-completions",
+      "minimax",
+      "minimax-openai",
+    ].includes(api.trim().toLowerCase());
+  }
+
+  private async callOpenAiCompatibleProvider(args: {
+    apiKey: string;
+    baseUrl: string;
+    modelId: string;
+    params: LlmCallParams;
+  }): Promise<unknown> {
+    const endpoint = args.baseUrl.endsWith("/chat/completions")
+      ? args.baseUrl
+      : `${args.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const body: Record<string, unknown> = {
+      model: args.modelId,
+      messages: [{ role: "user", content: args.params.prompt }],
+      temperature: args.params.temperature ?? 0,
+      max_tokens: args.params.maxOutputTokens ?? 256,
+    };
+    if (args.params.responseFormat === "json") {
+      body.response_format = { type: "json_object" };
+    }
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${args.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const json = await response.json();
+    if (!response.ok) {
+      throw new Error(`Configured OpenAI-compatible provider call failed: ${response.status} ${JSON.stringify(json).slice(0, 400)}`);
+    }
+    return json;
   }
 
   private extractTextResult(result: unknown): string | null {
@@ -424,6 +486,29 @@ export class OpenClawLlmCaller implements LlmCaller {
             return [(part as { text: string }).text];
           }
           return [];
+        })
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .join("\n");
+      return text || null;
+    }
+
+    if (Array.isArray(resultRecord.choices)) {
+      const text = resultRecord.choices
+        .flatMap((choice) => {
+          if (!choice || typeof choice !== "object") {
+            return [];
+          }
+          const choiceRecord = choice as Record<string, unknown>;
+          const message = choiceRecord.message;
+          if (message && typeof message === "object") {
+            const content = (message as Record<string, unknown>).content;
+            if (typeof content === "string") {
+              return [content];
+            }
+          }
+          const textValue = choiceRecord.text;
+          return typeof textValue === "string" ? [textValue] : [];
         })
         .map((entry) => entry.trim())
         .filter(Boolean)

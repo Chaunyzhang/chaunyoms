@@ -243,6 +243,18 @@ export class OpenClawBridge {
     );
 
     register(
+      "oms_setup_guide",
+      "Show an install/config checklist for the SQLite-first runtime, Markdown asset layer, Node sqlite adapter, and safe knowledge-promotion defaults.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsSetupGuide(args),
+    );
+
+    register(
       "oms_doctor",
       "Diagnose ChaunyOMS runtime, SQLite ledger, source bindings, config, and knowledge asset health.",
       {
@@ -326,6 +338,89 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsWhyRecalled(args),
+    );
+
+    register(
+      "oms_knowledge_curate",
+      "Inspect Markdown knowledge asset governance: duplicate canonical keys, missing provenance, draft/superseded counts. Advisory by default.",
+      {
+        type: "object",
+        properties: {
+          apply: { type: "boolean", description: "Reserved for future safe curation actions. Current implementation remains advisory." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsKnowledgeCurate(args),
+    );
+
+    register(
+      "oms_asset_sync",
+      "Synchronize Markdown knowledge assets into the SQLite runtime asset index without scanning Markdown on every turn.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAssetSync(args),
+    );
+
+    register(
+      "oms_asset_reindex",
+      "Rebuild the SQLite runtime asset index from Markdown knowledge assets after manual edits, migrations, or suspected index drift.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAssetReindex(args),
+    );
+
+    register(
+      "oms_asset_verify",
+      "Verify Markdown knowledge assets and their SQLite runtime index for missing files, stale index entries, duplicates, and missing provenance.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAssetVerify(args),
+    );
+
+    register(
+      "oms_knowledge_candidates",
+      "List scored knowledge raw candidates for UI/manual review. Shows <=20-char one-line summaries, total scores, recommendations, and status.",
+      {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "Optional status filter such as review_pending, pending, promoted, rejected, failed." },
+          limit: { type: "number", description: "Maximum candidates to return. Default 20." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsKnowledgeCandidates(args),
+    );
+
+    register(
+      "oms_knowledge_review",
+      "Approve or reject a scored knowledge raw candidate. Approval moves it into the promotion queue; rejection keeps it out of Markdown assets.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Knowledge raw candidate id." },
+          action: { type: "string", enum: ["approve", "reject"] },
+          reviewer: { type: "string", description: "Optional reviewer name/id." },
+          note: { type: "string", description: "Optional review note." },
+        },
+        required: ["id", "action"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsKnowledgeReview(args),
     );
 
     register(

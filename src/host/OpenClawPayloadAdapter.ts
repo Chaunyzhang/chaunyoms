@@ -201,6 +201,9 @@ export class OpenClawPayloadAdapter {
     if (config.knowledgePromotionEnabled && !config.durableMemoryEnabled) {
       warnings.push("Knowledge promotion is enabled while durable memory extraction is disabled; promotion inputs will be thinner than expected.");
     }
+    if (config.knowledgePromotionEnabled && !config.knowledgePromotionManualReviewEnabled) {
+      warnings.push("Knowledge promotion is automatic. Set knowledgePromotionManualReviewEnabled=true if you want a scored manual approval queue before Markdown writes.");
+    }
     return {
       preset: config.configPreset,
       warnings,
@@ -316,6 +319,15 @@ export class OpenClawPayloadAdapter {
           baseConfig.knowledgePromotionEnabled,
         );
 
+    const knowledgePromotionManualReviewEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.knowledgePromotionManualReviewEnabled,
+        pluginConfig.knowledgeManualReviewEnabled,
+        pluginConfig.manualKnowledgeReview,
+      ],
+      baseConfig.knowledgePromotionManualReviewEnabled,
+    );
+
     const knowledgeIntakeMode = this.resolveStringEnum(
       [
         pluginConfig.knowledgeIntakeMode,
@@ -353,6 +365,15 @@ export class OpenClawPayloadAdapter {
       pluginConfig.knowledgeIntakeUserOverridePatterns,
       baseConfig.knowledgeIntakeUserOverridePatterns,
     );
+
+    const sqliteJournalMode = this.resolveStringEnum(
+      [
+        pluginConfig.sqliteJournalMode,
+        pluginConfig.runtimeSqliteJournalMode,
+      ],
+      ["delete", "wal"],
+      baseConfig.sqliteJournalMode,
+    ) as BridgeConfig["sqliteJournalMode"];
 
     return this.validateConfig({
       dataDir,
@@ -430,6 +451,7 @@ export class OpenClawPayloadAdapter {
       durableMemoryEnabled,
       autoRecallEnabled,
       knowledgePromotionEnabled,
+      knowledgePromotionManualReviewEnabled,
       knowledgeIntakeMode,
       knowledgeIntakeAllowProjectState,
       knowledgeIntakeAllowBranchSummaries,
@@ -453,6 +475,7 @@ export class OpenClawPayloadAdapter {
         presetDefaults.semanticCandidateLimit,
       ),
       emergencyBrake,
+      sqliteJournalMode,
     });
   }
 
@@ -919,6 +942,9 @@ export class OpenClawPayloadAdapter {
       !Number.isInteger(config.semanticCandidateLimit)
     ) {
       errors.push("semanticCandidateLimit must be a non-negative integer");
+    }
+    if (!["delete", "wal"].includes(config.sqliteJournalMode)) {
+      errors.push("sqliteJournalMode must be either delete or wal");
     }
     if (errors.length > 0) {
       const message = `Invalid ChaunyOMS config: ${errors.join("; ")}`;

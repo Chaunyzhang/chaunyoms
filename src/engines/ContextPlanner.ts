@@ -54,12 +54,20 @@ export class ContextPlanner {
   ): ContextPlannerResult {
     const createdAt = options.createdAt ?? new Date().toISOString();
     const runId = options.runId ?? `context-run-${this.hash(`${createdAt}:${candidates.length}:${options.budget}`).slice(0, 16)}`;
+    const indexed = candidates.map((candidate, index) => ({ candidate, index }));
+    const selectionOrder = [
+      ...indexed.filter((item) => item.candidate.source === "stable_prefix"),
+      ...indexed
+        .filter((item) => item.candidate.source !== "stable_prefix" && item.candidate.source !== "recent_tail")
+        .sort((left, right) => this.compareForSelection(left.candidate, right.candidate, left.index, right.index)),
+      ...indexed.filter((item) => item.candidate.source === "recent_tail"),
+    ];
     const seen = new Set<string>();
     const selected: ContextPlannerCandidate[] = [];
     const rejected: ContextPlannerRejectedCandidate[] = [];
     let selectedTokens = 0;
 
-    for (const candidate of candidates) {
+    for (const { candidate } of selectionOrder) {
       const dedupKey = this.dedupKey(candidate);
       if (seen.has(dedupKey)) {
         rejected.push(this.reject(candidate, "duplicate_source"));
@@ -81,10 +89,16 @@ export class ContextPlanner {
       selectedTokens += tokenCount;
     }
 
+    const selectedKeys = new Set(selected.map((candidate) => candidate.id));
+    const selectedInOutputOrder = indexed
+      .filter(({ candidate }) => selectedKeys.has(candidate.id))
+      .sort((left, right) => this.compareForOutput(left.candidate, right.candidate, left.index, right.index))
+      .map(({ candidate }) => candidate);
+
     return {
       runId,
       createdAt,
-      selected,
+      selected: selectedInOutputOrder,
       rejected,
       selectedTokens,
       candidateCount: candidates.length,
@@ -109,6 +123,29 @@ export class ContextPlanner {
         `authority:${authority}`,
       ],
     };
+  }
+
+
+  private compareForSelection(
+    left: ContextPlannerCandidate,
+    right: ContextPlannerCandidate,
+    leftIndex: number,
+    rightIndex: number,
+  ): number {
+    return right.score - left.score ||
+      this.scoreAuthority(right.authority) - this.scoreAuthority(left.authority) ||
+      this.scoreSource(right.source) - this.scoreSource(left.source) ||
+      Math.max(left.item.tokenCount, 0) - Math.max(right.item.tokenCount, 0) ||
+      leftIndex - rightIndex;
+  }
+
+  private compareForOutput(
+    _left: ContextPlannerCandidate,
+    _right: ContextPlannerCandidate,
+    leftIndex: number,
+    rightIndex: number,
+  ): number {
+    return leftIndex - rightIndex;
   }
 
   private resolveAuthority(

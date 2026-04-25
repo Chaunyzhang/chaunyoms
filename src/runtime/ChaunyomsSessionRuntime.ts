@@ -3,8 +3,10 @@ import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ContextAssembler } from "../engines/ContextAssembler";
+import { ContextPlannerResult } from "../engines/ContextPlanner";
 import { CompactionEngine } from "../engines/CompactionEngine";
 import { KnowledgeIntakeGate } from "../engines/KnowledgeIntakeGate";
+import { KnowledgeCandidateScorer } from "../engines/KnowledgeCandidateScorer";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
@@ -30,6 +32,7 @@ import {
   NavigationRepository,
   ObservationRepository,
   ObservationEntry,
+  KnowledgeRawEntry,
   RawMessage,
   RawMessageRepository,
   SummaryEntry,
@@ -144,9 +147,11 @@ export interface OmsRuntimeStatus {
     | "durableMemoryEnabled"
     | "autoRecallEnabled"
     | "knowledgePromotionEnabled"
+    | "knowledgePromotionManualReviewEnabled"
     | "semanticCandidateExpansionEnabled"
     | "semanticCandidateLimit"
     | "emergencyBrake"
+    | "sqliteJournalMode"
   >;
   runtimeStore: ReturnType<SQLiteRuntimeStore["getStatus"]>;
   lastCompactionDiagnostics: CompactionDiagnostics | null;
@@ -176,8 +181,55 @@ export interface OmsRestoreResult {
   backupDir: string;
   apply: boolean;
   manifest: Record<string, unknown> | null;
+  rollbackBackupDir?: string;
+  rollbackApplied?: boolean;
   copied: string[];
   skipped: string[];
+  reason?: string;
+}
+
+export interface OmsKnowledgeGovernanceResult {
+  ok: boolean;
+  apply: boolean;
+  report: ReturnType<SQLiteRuntimeStore["inspectKnowledgeGovernance"]>;
+  actions: string[];
+  warnings: string[];
+}
+
+export interface OmsAssetSyncResult {
+  ok: boolean;
+  mode: "sync" | "reindex";
+  markdown: Awaited<ReturnType<SessionDataStores["knowledgeStore"]["syncAssetIndex"]>>;
+  runtime: Awaited<ReturnType<SQLiteRuntimeStore["syncAssetsFromMarkdownIndex"]>>;
+}
+
+export interface OmsAssetVerifyResult {
+  ok: boolean;
+  markdown: Awaited<ReturnType<SessionDataStores["knowledgeStore"]["verifyAssetIndex"]>>;
+  runtime: ReturnType<SQLiteRuntimeStore["inspectKnowledgeGovernance"]>;
+  warnings: string[];
+}
+
+export interface OmsKnowledgeCandidateListResult {
+  ok: boolean;
+  total: number;
+  candidates: Array<{
+    id: string;
+    oneLineSummary: string;
+    score: number | null;
+    recommendation: string | null;
+    status: string;
+    reviewState: string | null;
+    sourceSummaryId: string;
+    intakeReason: string;
+    createdAt: string;
+  }>;
+}
+
+export interface OmsKnowledgeReviewResult {
+  ok: boolean;
+  action: "approve" | "reject";
+  candidate: KnowledgeRawEntry | null;
   reason?: string;
 }
 
@@ -199,6 +251,7 @@ export class ChaunyomsSessionRuntime {
   private readonly assembler: ContextAssembler;
   private readonly extractionEngine = new MemoryExtractionEngine();
   private readonly knowledgeIntakeGate = new KnowledgeIntakeGate();
+  private readonly knowledgeCandidateScorer = new KnowledgeCandidateScorer();
   private knowledgePromotionEngine: KnowledgePromotionEngine;
   private summaryHierarchyEngine: SummaryHierarchyEngine;
   private backgroundOrganizerEngine: BackgroundOrganizerEngine;
@@ -299,7 +352,7 @@ export class ChaunyomsSessionRuntime {
       compacted: false,
       metadata: payload.metadata,
     };
-    await rawStore.append(message);
+    await this.sessionData.appendRawMessage(message);
     await this.persistDurableMemories(
       durableMemoryStore,
       this.extractionEngine.extractFromRawMessage(message),
@@ -309,7 +362,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async assemble(context: LifecycleContext): Promise<AssembleResult> {
-    const { rawStore, summaryStore, durableMemoryStore } = await this.ensureSession(
+    const { rawStore, summaryStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -333,30 +386,35 @@ export class ChaunyomsSessionRuntime {
     }
     await this.sessionData.mirrorRuntimeState();
 
+    const assembleOptions = {
+      includeStablePrefix: !this.config.emergencyBrake,
+      includeSummaries: !this.config.emergencyBrake,
+      includeDurableMemory: !this.config.emergencyBrake,
+      activeQuery,
+      sessionId: context.sessionId,
+    };
+
     try {
-      const result = await this.assembler.assemble(
-        rawStore,
-        summaryStore,
-        durableMemoryStore,
+      const runtimeStore = this.sessionData.getRuntimeStore();
+      const runtimeStatus = runtimeStore.getStatus();
+      if (!runtimeStatus.enabled) {
+        throw new Error("sqlite_runtime_unavailable_for_assembly");
+      }
+      const result = await this.assembler.assembleFromRuntime(
+        runtimeStore,
         context.totalBudget,
         context.systemPromptTokens,
         this.config.freshTailTokens,
         this.config.maxFreshTailTurns,
         this.config.sharedDataDir,
         this.config.workspaceDir,
-        {
-          includeStablePrefix: !this.config.emergencyBrake,
-          includeSummaries: !this.config.emergencyBrake,
-          includeDurableMemory: !this.config.emergencyBrake,
-          activeQuery,
-          sessionId: context.sessionId,
-        },
+        assembleOptions,
       );
       this.sessionData.recordContextPlan({
         sessionId: context.sessionId,
         agentId: this.config.agentId,
         totalBudget: context.totalBudget,
-        intent: activeQuery ? "assemble_with_active_query" : "assemble",
+        intent: activeQuery ? "assemble_sqlite_with_active_query" : "assemble_sqlite",
         plan: result.plan,
       });
       return {
@@ -364,16 +422,13 @@ export class ChaunyomsSessionRuntime {
         estimatedTokens: result.items.reduce((sum, item) => sum + item.tokenCount, 0),
         importedMessages: synced.importedMessages,
       };
-    } catch (error) {
-      this.logger.warn("assemble_failed_recent_tail_fallback", {
-        error: error instanceof Error ? error.message : String(error),
+    } catch (sqliteError) {
+      this.logger.warn("assemble_sqlite_failed_runtime_tail_fallback", {
+        error: sqliteError instanceof Error ? sqliteError.message : String(sqliteError),
       });
-      const fallback = this.assembler.assembleRecentTail(
-        rawStore,
+      const fallback = this.buildRuntimeMessageTailFallback(
+        context,
         Math.max(context.totalBudget - context.systemPromptTokens, 0),
-        this.config.freshTailTokens,
-        this.config.maxFreshTailTurns,
-        context.sessionId,
       );
       this.contextViewStore.setItems(fallback);
       return {
@@ -607,6 +662,22 @@ export class ChaunyomsSessionRuntime {
     return this.sessionData.getRuntimeStore();
   }
 
+  async recordRetrievalPlan(
+    context: Pick<LifecycleContext, "sessionId" | "config" | "totalBudget">,
+    intent: string,
+    plan: ContextPlannerResult,
+    totalBudget?: number,
+  ): Promise<void> {
+    await this.ensureSession(context.sessionId, context.config);
+    this.sessionData.recordContextPlan({
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      totalBudget: totalBudget ?? ("totalBudget" in context ? context.totalBudget : plan.budget),
+      intent,
+      plan,
+    });
+  }
+
   async inspectDag(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<DagIntegrityReport> {
     const { rawStore, summaryStore } = await this.ensureSession(context.sessionId, context.config);
     return this.dagIntegrityInspector.inspect(summaryStore, rawStore, {
@@ -639,7 +710,7 @@ export class ChaunyomsSessionRuntime {
         durableMemories: durableMemories.length,
         activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
         knowledgeRawItems: knowledgeRawItems.length,
-        pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "pending" || entry.status === "processing").length,
+        pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "review_pending" || entry.status === "pending" || entry.status === "processing").length,
         projects: stores.projectStore.getAll().filter((project) => project.status !== "archived").length,
         contextItems: this.contextViewStore.getItems().length,
       },
@@ -655,9 +726,11 @@ export class ChaunyomsSessionRuntime {
         durableMemoryEnabled: context.config.durableMemoryEnabled,
         autoRecallEnabled: context.config.autoRecallEnabled,
         knowledgePromotionEnabled: context.config.knowledgePromotionEnabled,
+        knowledgePromotionManualReviewEnabled: context.config.knowledgePromotionManualReviewEnabled,
         semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
         semanticCandidateLimit: context.config.semanticCandidateLimit,
         emergencyBrake: context.config.emergencyBrake,
+        sqliteJournalMode: context.config.sqliteJournalMode,
       },
       runtimeStore: this.sessionData.getRuntimeStore().getStatus(),
       lastCompactionDiagnostics: this.lastCompactionDiagnostics,
@@ -777,22 +850,176 @@ export class ChaunyomsSessionRuntime {
         reason: "Restore manifest validated. Re-run with apply=true to overlay files.",
       };
     }
-    const copies = [
-      { label: "agent_data", source: path.join(backupDir, "agent_data"), target: path.join(context.config.dataDir, "agents", context.config.agentId) },
-      { label: "knowledge", source: path.join(backupDir, "knowledge"), target: context.config.knowledgeBaseDir },
-      { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(context.config.memoryVaultDir, "agents", context.config.agentId) },
-      { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(context.config.workspaceDir, "memory") },
-    ];
-    const copied: string[] = [];
-    const skipped: string[] = [];
-    for (const item of copies) {
-      if (await this.copyIfPresent(item.source, item.target)) {
-        copied.push(item.label);
-      } else {
-        skipped.push(item.label);
+    const rollbackBackup = await this.backup(context, "pre-restore");
+    const copies = this.restoreCopyPlan(context.config, backupDir);
+    try {
+      const copied: string[] = [];
+      const skipped: string[] = [];
+      for (const item of copies) {
+        if (await this.copyIfPresent(item.source, item.target)) {
+          copied.push(item.label);
+        } else {
+          skipped.push(item.label);
+        }
       }
+      return {
+        ok: true,
+        backupDir,
+        apply,
+        manifest,
+        rollbackBackupDir: rollbackBackup.backupDir,
+        copied,
+        skipped,
+      };
+    } catch (error) {
+      const rollback = this.restoreCopyPlan(context.config, rollbackBackup.backupDir);
+      let rollbackApplied = false;
+      try {
+        for (const item of rollback) {
+          await this.copyIfPresent(item.source, item.target);
+        }
+        rollbackApplied = true;
+      } catch {
+        rollbackApplied = false;
+      }
+      return {
+        ok: false,
+        backupDir,
+        apply,
+        manifest,
+        rollbackBackupDir: rollbackBackup.backupDir,
+        rollbackApplied,
+        copied: [],
+        skipped: [],
+        reason: `restore failed${rollbackApplied ? " and rollback was applied" : " and rollback failed"}: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
-    return { ok: true, backupDir, apply, manifest, copied, skipped };
+  }
+
+  async curateKnowledge(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    apply = false,
+  ): Promise<OmsKnowledgeGovernanceResult> {
+    await this.ensureSession(context.sessionId, context.config);
+    await this.sessionData.mirrorRuntimeState();
+    const runtimeStore = this.sessionData.getRuntimeStore();
+    const report = runtimeStore.inspectKnowledgeGovernance();
+    const actions: string[] = [];
+    if (report.duplicateCanonicalKeys.length > 0) {
+      actions.push("Review duplicate canonical keys and mark stale assets superseded after human confirmation.");
+    }
+    if (report.assetsWithoutProvenance.length > 0) {
+      actions.push("Attach source_refs or linked_summary_ids before treating these assets as reviewed knowledge.");
+    }
+    if (apply) {
+      actions.push("No automatic destructive curation was applied; ChaunyOMS keeps knowledge cleanup advisory unless a specific supersede/link action is requested.");
+    }
+    return {
+      ok: report.warnings.length === 0,
+      apply,
+      report,
+      actions,
+      warnings: report.warnings,
+    };
+  }
+
+  async syncKnowledgeAssets(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    mode: "sync" | "reindex" = "sync",
+  ): Promise<OmsAssetSyncResult> {
+    const { knowledgeStore } = await this.ensureSession(context.sessionId, context.config);
+    const markdown = await knowledgeStore.syncAssetIndex(mode);
+    const runtime = await this.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex(mode);
+    return {
+      ok: markdown.ok && runtime.ok,
+      mode,
+      markdown,
+      runtime,
+    };
+  }
+
+  async verifyKnowledgeAssets(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+  ): Promise<OmsAssetVerifyResult> {
+    const { knowledgeStore } = await this.ensureSession(context.sessionId, context.config);
+    const markdown = await knowledgeStore.verifyAssetIndex();
+    await this.sessionData.getRuntimeStore().syncAssetsFromMarkdownIndex("sync");
+    const runtime = this.sessionData.getRuntimeStore().inspectKnowledgeGovernance();
+    const warnings = [...markdown.warnings, ...runtime.warnings];
+    return {
+      ok: markdown.ok && runtime.warnings.length === 0,
+      markdown,
+      runtime,
+      warnings,
+    };
+  }
+
+  async listKnowledgeCandidates(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { status?: string; limit?: number } = {},
+  ): Promise<OmsKnowledgeCandidateListResult> {
+    const { knowledgeRawStore } = await this.ensureSession(context.sessionId, context.config);
+    const limit = Math.max(Math.min(options.limit ?? 20, 100), 1);
+    const candidates = knowledgeRawStore.getAll()
+      .filter((entry) => !options.status || entry.status === options.status)
+      .sort((left, right) =>
+        (right.score?.total ?? 0) - (left.score?.total ?? 0) ||
+        right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit)
+      .map((entry) => ({
+        id: entry.id,
+        oneLineSummary: entry.oneLineSummary ?? this.knowledgeCandidateScorer.summarize(entry.sourceSummary),
+        score: entry.score?.total ?? null,
+        recommendation: entry.score?.recommendation ?? null,
+        status: entry.status,
+        reviewState: entry.review?.state ?? null,
+        sourceSummaryId: entry.sourceSummaryId,
+        intakeReason: entry.intakeReason,
+        createdAt: entry.createdAt,
+      }));
+    return {
+      ok: true,
+      total: candidates.length,
+      candidates,
+    };
+  }
+
+  async reviewKnowledgeCandidate(
+    context: Pick<LifecycleContext, "sessionId" | "config" | "summaryModel">,
+    args: {
+      id: string;
+      action: "approve" | "reject";
+      reviewer?: string;
+      note?: string;
+    },
+  ): Promise<OmsKnowledgeReviewResult> {
+    const { knowledgeRawStore } = await this.ensureSession(context.sessionId, context.config);
+    const candidate = await knowledgeRawStore.markReview(args);
+    if (!candidate) {
+      return {
+        ok: false,
+        action: args.action,
+        candidate: null,
+        reason: "knowledge_candidate_not_found",
+      };
+    }
+    if (args.action === "approve") {
+      this.scheduleKnowledgeMaintenance(context);
+    }
+    return {
+      ok: true,
+      action: args.action,
+      candidate,
+    };
+  }
+
+  private restoreCopyPlan(config: BridgeConfig, backupDir: string): Array<{ label: string; source: string; target: string }> {
+    return [
+      { label: "agent_data", source: path.join(backupDir, "agent_data"), target: path.join(config.dataDir, "agents", config.agentId) },
+      { label: "knowledge", source: path.join(backupDir, "knowledge"), target: config.knowledgeBaseDir },
+      { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(config.memoryVaultDir, "agents", config.agentId) },
+      { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(config.workspaceDir, "memory") },
+    ];
   }
 
   private async ensureSession(
@@ -907,6 +1134,8 @@ export class ChaunyomsSessionRuntime {
 
     let importedMessages = 0;
     let currentTurn = existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
+    const rawMessagesToImport: RawMessage[] = [];
+    const durableMemoryEntriesToImport: DurableMemoryEntry[] = [];
 
     for (let index = 0; index < pendingRawMessages.length; index += 1) {
       const message = pendingRawMessages[index];
@@ -936,14 +1165,13 @@ export class ChaunyomsSessionRuntime {
           runtimeIndex: overlap + index,
         },
       };
-      await this.sessionData.appendRawMessage(rawMessage);
-      await this.persistDurableMemories(
-        durableMemoryStore,
-        this.extractionEngine.extractFromRawMessage(rawMessage),
-      );
+      rawMessagesToImport.push(rawMessage);
+      durableMemoryEntriesToImport.push(...this.extractionEngine.extractFromRawMessage(rawMessage));
       existingSourceKeys.add(message.sourceKey);
       importedMessages += 1;
     }
+    await this.sessionData.appendRawMessages(rawMessagesToImport);
+    await this.persistDurableMemories(durableMemoryStore, durableMemoryEntriesToImport);
 
     for (let index = 0; index < pendingObservationMessages.length; index += 1) {
       const message = pendingObservationMessages[index];
@@ -1056,6 +1284,44 @@ export class ChaunyomsSessionRuntime {
     }
 
     return undefined;
+  }
+
+  private buildRuntimeMessageTailFallback(
+    context: LifecycleContext,
+    availableBudget: number,
+  ): ContextItem[] {
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+    let turns = 0;
+    for (let index = context.runtimeMessages.length - 1; index >= 0; index -= 1) {
+      const message = context.runtimeMessages[index];
+      if (!message.text.trim()) {
+        continue;
+      }
+      const tokenCount = Math.max(estimateTokens(message.text), 1);
+      if (selected.length > 0 && consumed + tokenCount > Math.min(availableBudget, this.config.freshTailTokens)) {
+        break;
+      }
+      selected.unshift({
+        kind: "message",
+        tokenCount,
+        role: message.role,
+        content: message.text,
+        metadata: {
+          ...(message.metadata ?? {}),
+          source: "runtime_tail_fallback",
+          sourceKey: message.sourceKey,
+        },
+      });
+      consumed += tokenCount;
+      if (message.role === "user") {
+        turns += 1;
+      }
+      if (turns >= this.config.maxFreshTailTurns) {
+        break;
+      }
+    }
+    return selected;
   }
 
   private normalizeMessageText(content: string): string {
@@ -1396,6 +1662,8 @@ export class ChaunyomsSessionRuntime {
       context.config,
     );
     const now = new Date().toISOString();
+    const score = this.knowledgeCandidateScorer.score(entry, sourceResolution.messages);
+    const manualReview = context.config.knowledgePromotionManualReviewEnabled;
     const enqueued = await knowledgeRawStore.enqueue({
       id: `knowledge-raw-${entry.id}`,
       sessionId: entry.sessionId,
@@ -1403,8 +1671,14 @@ export class ChaunyomsSessionRuntime {
       sourceSummaryId: entry.id,
       sourceSummary: entry,
       sourceBinding: sourceResolution.binding,
+      oneLineSummary: this.knowledgeCandidateScorer.summarize(entry),
+      score,
+      review: {
+        mode: manualReview ? "manual" : "auto",
+        state: manualReview ? "awaiting_review" : "auto_accepted",
+      },
       intakeReason: decision.reason,
-      status: "pending",
+      status: manualReview ? "review_pending" : "pending",
       createdAt: now,
       updatedAt: now,
     });
@@ -1418,8 +1692,14 @@ export class ChaunyomsSessionRuntime {
     this.logger.info("knowledge_raw_intake_enqueued", {
       summaryId: entry.id,
       reason: decision.reason,
+      oneLineSummary: this.knowledgeCandidateScorer.summarize(entry),
+      score: score.total,
+      recommendation: score.recommendation,
+      reviewMode: manualReview ? "manual" : "auto",
     });
-    this.scheduleKnowledgeMaintenance(context);
+    if (!manualReview) {
+      this.scheduleKnowledgeMaintenance(context);
+    }
   }
 
   private scheduleKnowledgeMaintenance(context: Pick<LifecycleContext, "sessionId" | "config" | "summaryModel">): void {

@@ -95,6 +95,10 @@ export const pluginConfigSchema = {
       type: "boolean",
       description: "Enable promotion from accepted knowledge raw into the unified knowledge store. Disabled by default.",
     },
+    knowledgePromotionManualReviewEnabled: {
+      type: "boolean",
+      description: "Require accepted knowledge raw candidates to wait in a scored manual review queue before Markdown promotion. Default false, so automatic promotion behavior is preserved.",
+    },
     knowledgeIntakeMode: {
       type: "string",
       enum: ["conservative", "balanced", "aggressive"],
@@ -131,6 +135,11 @@ export const pluginConfigSchema = {
     emergencyBrake: {
       type: "boolean",
       description: "Emergency stop: disables runtime capture, durable writes, auto recall, and knowledge promotion.",
+    },
+    sqliteJournalMode: {
+      type: "string",
+      enum: ["delete", "wal"],
+      description: "SQLite runtime journal mode. delete is conservative and default; wal improves concurrent read/write behavior when the host runtime supports it.",
     },
   },
 } as const;

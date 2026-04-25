@@ -2,11 +2,15 @@ import {
   ContextBudget,
   ContextItem,
   ContextViewRepository,
+  DurableMemoryEntry,
   DurableMemoryRepository,
   FixedPrefixProvider,
+  RawMessage,
   RawMessageRepository,
+  SummaryEntry,
   SummaryRepository,
 } from "../types";
+import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
 import { estimateTokens } from "../utils/tokenizer";
 import {
   ContextCandidateSource,
@@ -89,33 +93,10 @@ export class ContextAssembler {
     maxFreshTailTurns: number,
     sessionId?: string,
   ): ContextItem[] {
-    const recentMessages = rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns, { sessionId });
-    const selected: ContextItem[] = [];
-    let consumed = 0;
-    const turnNumbers = [...new Set(recentMessages.map((message) => message.turnNumber))];
-
-    for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
-      const turnNumber = turnNumbers[index];
-      const turnMessages = recentMessages.filter((message) => message.turnNumber === turnNumber);
-      const turnTokens = turnMessages.reduce((sum, message) => sum + message.tokenCount, 0);
-      if (consumed + turnTokens > budget && selected.length > 0) {
-        break;
-      }
-
-      consumed += turnTokens;
-      selected.unshift(
-        ...turnMessages.map((message) => ({
-          kind: "message" as const,
-          tokenCount: message.tokenCount,
-          turnNumber: message.turnNumber,
-          role: message.role,
-          content: message.content,
-          metadata: message.metadata,
-        })),
-      );
-    }
-
-    return selected;
+    return this.recentMessagesToItems(
+      rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns, { sessionId }),
+      budget,
+    );
   }
 
   assembleSummaries(summaryStore: SummaryRepository, budget: number, sessionId?: string): ContextItem[] {
@@ -129,7 +110,7 @@ export class ContextAssembler {
     const summaries = [...sourceSummaries].sort(
       (left, right) => right.endTurn - left.endTurn || right.startTurn - left.startTurn,
     );
-    const selected: ContextItem[] = [];
+    const selected: SummaryEntry[] = [];
     let consumed = 0;
 
     for (const summary of summaries) {
@@ -138,45 +119,10 @@ export class ContextAssembler {
       }
 
       consumed += summary.tokenCount;
-      selected.unshift({
-        kind: "summary",
-        tokenCount: summary.tokenCount,
-        summaryId: summary.id,
-        content: summary.summary,
-        metadata: {
-          keywords: summary.keywords,
-          toneTag: summary.toneTag,
-          memoryType: summary.memoryType,
-          phase: summary.phase,
-          constraints: summary.constraints,
-          decisions: summary.decisions,
-          blockers: summary.blockers,
-          nextSteps: summary.nextSteps,
-          keyEntities: summary.keyEntities,
-          exactFacts: summary.exactFacts,
-          promotionIntent: summary.promotionIntent,
-          projectId: summary.projectId,
-          topicId: summary.topicId,
-          summaryLevel: summary.summaryLevel,
-          nodeKind: summary.nodeKind,
-          parentSummaryId: summary.parentSummaryId,
-          parentSummaryIds: summary.parentSummaryIds,
-          childSummaryIds: summary.childSummaryIds,
-          sourceSummaryIds: summary.sourceSummaryIds,
-          startTurn: summary.startTurn,
-          endTurn: summary.endTurn,
-          sourceFirstMessageId: summary.sourceFirstMessageId,
-          sourceLastMessageId: summary.sourceLastMessageId,
-          sourceStartTimestamp: summary.sourceStartTimestamp,
-          sourceEndTimestamp: summary.sourceEndTimestamp,
-          sourceSequenceMin: summary.sourceSequenceMin,
-          sourceSequenceMax: summary.sourceSequenceMax,
-          sourceBinding: summary.sourceBinding,
-        },
-      });
+      selected.unshift(summary);
     }
 
-    return selected;
+    return this.summaryEntriesToItems(selected);
   }
 
   assembleDurableMemory(durableMemoryStore: DurableMemoryRepository, budget: number): ContextItem[] {
@@ -187,37 +133,15 @@ export class ContextAssembler {
       .filter((entry) => entry.recordStatus === "active")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, 8);
-    const selected: ContextItem[] = [];
-    let consumed = 0;
-
-    for (const memory of memories) {
-      const content = `[durable_memory:${memory.kind}] ${memory.text}`;
-      const tokenCount = estimateTokens(content);
-      if (consumed + tokenCount > budget) {
-        break;
-      }
-
-      consumed += tokenCount;
-      selected.unshift({
-        kind: "summary",
-        tokenCount,
-        content,
-        metadata: {
-          layer: "durable_memory",
-          kind: memory.kind,
-          tags: memory.tags,
-          projectId: memory.projectId,
-          topicId: memory.topicId,
-          recordStatus: memory.recordStatus,
-        },
-      });
-    }
-
-    return selected;
+    return this.durableMemoryEntriesToItems(memories, budget);
   }
 
   buildRecallGuidance(summaryStore: SummaryRepository, sessionId?: string): ContextItem | null {
     const summaryCount = summaryStore.getAllSummaries({ sessionId }).length;
+    return this.buildRecallGuidanceFromCount(summaryCount);
+  }
+
+  private buildRecallGuidanceFromCount(summaryCount: number): ContextItem | null {
     if (summaryCount <= 0) {
       return null;
     }
@@ -239,6 +163,77 @@ export class ContextAssembler {
         summaryCount,
       },
     };
+  }
+
+  async assembleFromRuntime(
+    runtimeStore: SQLiteRuntimeStore,
+    totalBudget: number,
+    systemPromptTokens: number,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+    sharedDataDir: string,
+    workspaceDir: string,
+    options: AssembleOptions = {},
+  ): Promise<{ budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult }> {
+    const budget = this.allocateBudget(totalBudget, systemPromptTokens);
+    const stablePrefix = options.includeStablePrefix === false
+      ? []
+      : await this.fixedPrefixProvider.load(
+          sharedDataDir,
+          workspaceDir,
+          budget.stablePrefixBudget,
+          { activeQuery: options.activeQuery },
+        );
+    const { leading: leadingStablePrefix, deferred: deferredStablePrefix } =
+      this.splitStablePrefix(stablePrefix);
+    const runtimeRead = runtimeStore.withAssemblyRead((runtime) => {
+      const recallGuidance = options.includeSummaries === false
+        ? null
+        : this.buildRecallGuidanceFromCount(runtime.getSummaryCount(options.sessionId));
+      const durableMemory = options.includeDurableMemory === false
+        ? []
+        : this.durableMemoryEntriesToItems(runtime.getActiveMemories(8), budget.recallBudget);
+      const fixedPluginTokens = this.sumTokens(stablePrefix) +
+        (recallGuidance?.tokenCount ?? 0) +
+        this.sumTokens(durableMemory);
+      const protectedTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
+      const dynamicSummaryBudget = Math.max(
+        budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
+        0,
+      );
+      const summaries = options.includeSummaries === false
+        ? []
+        : this.summaryEntriesToItems(runtime.getSummaries(dynamicSummaryBudget, options.sessionId));
+      const effectiveTailBudget = Math.min(
+        freshTailTokens,
+        Math.max(
+          budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
+          0,
+        ),
+      );
+      const recentTail = this.recentMessagesToItems(
+        runtime.getRecentTailByTokens(effectiveTailBudget, maxFreshTailTurns, options.sessionId),
+        effectiveTailBudget,
+      );
+      return {
+        recallGuidance,
+        durableMemory,
+        summaries,
+        recentTail,
+      };
+    });
+    if (!runtimeRead) {
+      throw new Error("SQLite runtime assembly read unavailable");
+    }
+    const { recallGuidance, durableMemory, summaries, recentTail } = runtimeRead;
+    return this.planAndStore([
+      ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
+      ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
+      ...this.tagCandidateSource(durableMemory, "active_memory"),
+      ...this.tagCandidateSource(summaries, "summary_context"),
+      ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
+      ...this.tagCandidateSource(recentTail, "recent_tail"),
+    ], budget);
   }
 
   async assemble(
@@ -297,17 +292,120 @@ export class ContextAssembler {
       maxFreshTailTurns,
       options.sessionId,
     );
-    const candidates = this.buildPlannerCandidates([
+    return this.planAndStore([
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
       ...this.tagCandidateSource(durableMemory, "active_memory"),
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
-    ]);
-    const plan = this.planner.plan(candidates, {
-      budget: budget.availableBudget,
-    });
+    ], budget);
+  }
+
+  private recentMessagesToItems(recentMessages: RawMessage[], budget: number): ContextItem[] {
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+    const turnNumbers = [...new Set(recentMessages.map((message) => message.turnNumber))];
+
+    for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
+      const turnNumber = turnNumbers[index];
+      const turnMessages = recentMessages.filter((message) => message.turnNumber === turnNumber);
+      const turnTokens = turnMessages.reduce((sum, message) => sum + message.tokenCount, 0);
+      if (consumed + turnTokens > budget && selected.length > 0) {
+        break;
+      }
+
+      consumed += turnTokens;
+      selected.unshift(
+        ...turnMessages.map((message) => ({
+          kind: "message" as const,
+          tokenCount: message.tokenCount,
+          turnNumber: message.turnNumber,
+          role: message.role,
+          content: message.content,
+          metadata: message.metadata,
+        })),
+      );
+    }
+
+    return selected;
+  }
+
+  private summaryEntriesToItems(summaries: SummaryEntry[]): ContextItem[] {
+    return summaries.map((summary) => ({
+      kind: "summary",
+      tokenCount: summary.tokenCount,
+      summaryId: summary.id,
+      content: summary.summary,
+      metadata: {
+        keywords: summary.keywords,
+        toneTag: summary.toneTag,
+        memoryType: summary.memoryType,
+        phase: summary.phase,
+        constraints: summary.constraints,
+        decisions: summary.decisions,
+        blockers: summary.blockers,
+        nextSteps: summary.nextSteps,
+        keyEntities: summary.keyEntities,
+        exactFacts: summary.exactFacts,
+        promotionIntent: summary.promotionIntent,
+        projectId: summary.projectId,
+        topicId: summary.topicId,
+        summaryLevel: summary.summaryLevel,
+        nodeKind: summary.nodeKind,
+        parentSummaryId: summary.parentSummaryId,
+        parentSummaryIds: summary.parentSummaryIds,
+        childSummaryIds: summary.childSummaryIds,
+        sourceSummaryIds: summary.sourceSummaryIds,
+        startTurn: summary.startTurn,
+        endTurn: summary.endTurn,
+        sourceFirstMessageId: summary.sourceFirstMessageId,
+        sourceLastMessageId: summary.sourceLastMessageId,
+        sourceStartTimestamp: summary.sourceStartTimestamp,
+        sourceEndTimestamp: summary.sourceEndTimestamp,
+        sourceSequenceMin: summary.sourceSequenceMin,
+        sourceSequenceMax: summary.sourceSequenceMax,
+        sourceBinding: summary.sourceBinding,
+      },
+    }));
+  }
+
+  private durableMemoryEntriesToItems(memories: DurableMemoryEntry[], budget: number): ContextItem[] {
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+
+    for (const memory of memories) {
+      const content = `[durable_memory:${memory.kind}] ${memory.text}`;
+      const tokenCount = estimateTokens(content);
+      if (consumed + tokenCount > budget) {
+        break;
+      }
+
+      consumed += tokenCount;
+      selected.unshift({
+        kind: "summary",
+        tokenCount,
+        content,
+        metadata: {
+          layer: "durable_memory",
+          kind: memory.kind,
+          tags: memory.tags,
+          projectId: memory.projectId,
+          topicId: memory.topicId,
+          recordStatus: memory.recordStatus,
+        },
+      });
+    }
+
+    return selected;
+  }
+
+  private planAndStore(
+    entries: Array<{ item: ContextItem; source: ContextCandidateSource }>,
+    budget: ContextBudget,
+  ): { budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult } {
+    const candidates = this.buildPlannerCandidates(entries);
+    const plan = this.planner.plan(candidates, { budget: budget.availableBudget });
     const items = plan.selected.map((candidate) => candidate.item);
     this.contextViewStore.setItems(items);
     return { budget, items, plan };

@@ -23,18 +23,25 @@ export class RawRecallResolver {
     recallBudget: number,
     options: RecallOptions,
   ): RecallResult {
-    const parsedMessages = rawStore
-      .getAll({ sessionId: options.sessionId })
-      .map((message) => this.parseMessage(message));
     const rawHintIds = new Set(options.rawHintMessageIds ?? []);
-    // SQLite FTS is a lossless-style anchor signal, not a hard scope gate.
-    // Keeping the full raw ledger in the scoring pass preserves multi-hop and
-    // "near but not same term" evidence, while FTS still boosts precise hits.
+    const candidateIds = new Set(options.rawCandidateMessageIds ?? []);
+    const wideInitial = this.requiresWideInitialPool(candidateIds, understanding);
+    let parsedMessages = this.loadInitialParsedMessages(rawStore, options.sessionId, candidateIds, wideInitial);
     let scored = this.scoreRawCandidates(parsedMessages, rawHintIds, understanding);
-    let expanded = this.expandCandidates(scored.slice(0, this.seedLimit(understanding)), parsedMessages, understanding);
+    let expanded = wideInitial
+      ? this.expandCandidates(scored.slice(0, this.seedLimit(understanding)), parsedMessages, understanding)
+      : this.expandCandidatesFromStore(
+        scored.slice(0, this.seedLimit(understanding)),
+        rawStore,
+        understanding,
+        options.sessionId,
+      );
     let answerCandidates = this.extractAnswerCandidates(understanding, expanded.map((item) => item.parsed));
-    if (rawHintIds.size > 0 && this.shouldFallbackToWideRaw(scored, answerCandidates)) {
-      scored = this.scoreRawCandidates(parsedMessages, new Set(), understanding);
+    if (this.shouldFallbackToWideRaw(scored, answerCandidates, options, wideInitial, understanding)) {
+      parsedMessages = rawStore
+        .getAll({ sessionId: options.sessionId })
+        .map((message) => this.parseMessage(message));
+      scored = this.scoreRawCandidates(parsedMessages, rawHintIds, understanding);
       expanded = this.expandCandidates(scored.slice(0, this.seedLimit(understanding)), parsedMessages, understanding);
       answerCandidates = this.extractAnswerCandidates(understanding, expanded.map((item) => item.parsed));
     }
@@ -104,11 +111,68 @@ export class RawRecallResolver {
       );
   }
 
-  private shouldFallbackToWideRaw(scored: ScoredMessage[], answerCandidates: AnswerCandidate[]): boolean {
+  private requiresWideInitialPool(
+    candidateIds: Set<string>,
+    understanding: QueryUnderstanding,
+  ): boolean {
+    return candidateIds.size === 0 ||
+      understanding.requiresMultiHop ||
+      understanding.answerType === "relationship" ||
+      /\b(prefer|favorite|favourite|meat|eating)\b/i.test(understanding.normalized);
+  }
+
+  private loadInitialParsedMessages(
+    rawStore: RawMessageRepository,
+    sessionId: string | undefined,
+    candidateIds: Set<string>,
+    wideInitial: boolean,
+  ): ParsedMessage[] {
+    const messages = wideInitial
+      ? rawStore.getAll({ sessionId })
+      : rawStore.getByIds([...candidateIds], { sessionId });
+    const fallbackMessages = messages.length > 0 ? messages : rawStore.getAll({ sessionId });
+    return fallbackMessages.map((message) => this.parseMessage(message));
+  }
+
+  private shouldFallbackToWideRaw(
+    scored: ScoredMessage[],
+    answerCandidates: AnswerCandidate[],
+    options: RecallOptions,
+    alreadyWide: boolean,
+    understanding: QueryUnderstanding,
+  ): boolean {
+    if (options.allowWideFallback === false || alreadyWide) {
+      return false;
+    }
     if (scored.length === 0) {
       return true;
     }
+    if (this.isMissingRequiredEventAnchor(answerCandidates, understanding)) {
+      return true;
+    }
     return !answerCandidates.some((candidate) => candidate.sourceVerified && candidate.confidence >= 0.68);
+  }
+
+  private isMissingRequiredEventAnchor(
+    answerCandidates: AnswerCandidate[],
+    understanding: QueryUnderstanding,
+  ): boolean {
+    const query = understanding.normalized.toLowerCase();
+    const requiresReason = (pattern: RegExp, reasonPattern: RegExp) =>
+      pattern.test(query) &&
+      !answerCandidates.some((candidate) =>
+        candidate.sourceVerified &&
+        candidate.confidence >= 0.68 &&
+        reasonPattern.test(candidate.reason));
+
+    return requiresReason(/\bresearch(?:ed|ing)?\b/, /research/i) ||
+      requiresReason(/\bdegree|graduat|major\b/, /degree/i) ||
+      requiresReason(/\bcommute|each way\b/, /commute/i) ||
+      requiresReason(/\btest\b/, /test/i) ||
+      requiresReason(/\bworkshop\b/, /workshop/i) ||
+      requiresReason(/\bcompany|brand|endorsement|sponsor|deal|gear|outdoor\b/, /brand|company|organization/i) ||
+      requiresReason(/\bjob|role|work(?:ed)? as\b/, /job/i) ||
+      requiresReason(/\bwall|bedroom|color|paint\b/, /color/i);
   }
 
 
@@ -298,6 +362,46 @@ export class RawRecallResolver {
     );
   }
 
+  private expandCandidatesFromStore(
+    seeds: ScoredMessage[],
+    rawStore: RawMessageRepository,
+    understanding: QueryUnderstanding,
+    sessionId?: string,
+  ): ScoredMessage[] {
+    const byId = new Map<string, ScoredMessage>();
+    const add = (parsed: ParsedMessage, score: number, reasons: string[]) => {
+      const existing = byId.get(parsed.message.id);
+      if (!existing || score > existing.score) {
+        byId.set(parsed.message.id, { parsed, score, reasons: [...new Set(reasons)] });
+      }
+    };
+
+    const window = this.expansionWindow(understanding);
+    for (const seed of seeds) {
+      add(seed.parsed, seed.score + 4, seed.reasons);
+      const startTurn = Math.max(seed.parsed.message.turnNumber - window, 0);
+      const endTurn = seed.parsed.message.turnNumber + window;
+      const adjacentMessages = rawStore.getByRange(startTurn, endTurn, {
+        sessionId: sessionId ?? seed.parsed.message.sessionId,
+      });
+      for (const message of adjacentMessages) {
+        const parsed = this.parseMessage(message);
+        const base = message.id === seed.parsed.message.id
+          ? seed.score
+          : this.scoreRawMessage(parsed, understanding).score;
+        add(parsed, Math.max(base, seed.score - 2), [
+          ...seed.reasons,
+          "adjacent_turn_expansion",
+        ]);
+      }
+    }
+
+    return [...byId.values()].sort((left, right) =>
+      right.score - left.score ||
+      (left.parsed.message.sequence ?? 0) - (right.parsed.message.sequence ?? 0),
+    );
+  }
+
   private extractAnswerCandidates(
     understanding: QueryUnderstanding,
     parsedMessages: ParsedMessage[],
@@ -398,9 +502,12 @@ export class RawRecallResolver {
       }
 
       if (understanding.answerType === "relationship") {
+        if (/single parent/i.test(text)) {
+          add("single", "relationship", 0.96, id, "relationship_status_phrase");
+        }
         for (const status of ["single", "married", "divorced", "dating"]) {
           if (lower.includes(status)) {
-            add(status, "relationship", 0.88, id, "relationship_status_phrase");
+            add(status, "relationship", status === "single" ? 0.92 : 0.88, id, "relationship_status_phrase");
           }
         }
       }

@@ -268,6 +268,28 @@ export interface KnowledgeDocumentRecord {
   content: string;
 }
 
+export interface KnowledgeAssetSyncReport {
+  ok: boolean;
+  mode: "sync" | "reindex";
+  beforeCount: number;
+  afterCount: number;
+  added: string[];
+  removed: string[];
+  updated: string[];
+  warnings: string[];
+}
+
+export interface KnowledgeAssetVerifyReport {
+  ok: boolean;
+  indexedCount: number;
+  filesystemCount: number;
+  missingFiles: Array<{ docId: string; filePath: string }>;
+  missingProvenance: Array<{ docId: string; title: string; status: string }>;
+  duplicateCanonicalKeys: Array<{ canonicalKey: string; docIds: string[] }>;
+  staleIndex: boolean;
+  warnings: string[];
+}
+
 export interface KnowledgeTrustModel {
   owner: "chaunyoms";
   layer: "unified_knowledge";
@@ -306,12 +328,44 @@ export interface KnowledgePromotionResult {
 }
 
 export type KnowledgeRawStatus =
+  | "review_pending"
   | "pending"
   | "processing"
   | "promoted"
   | "duplicate"
   | "skipped"
+  | "rejected"
   | "failed";
+
+export interface KnowledgeRawCandidateScore {
+  total: number;
+  recommendation: "promote" | "review" | "skip";
+  dimensions: {
+    value: number;
+    researchDifficulty: number;
+    sourceEffort: number;
+    contentDensity: number;
+    evidenceStrength: number;
+    novelty: number;
+  };
+  weights: {
+    value: number;
+    researchDifficulty: number;
+    sourceEffort: number;
+    contentDensity: number;
+    evidenceStrength: number;
+    novelty: number;
+  };
+  reasons: string[];
+}
+
+export interface KnowledgeRawReviewState {
+  mode: "auto" | "manual";
+  state: "auto_accepted" | "awaiting_review" | "approved" | "rejected";
+  reviewedAt?: string;
+  reviewer?: string;
+  note?: string;
+}
 
 export interface KnowledgeRawEntry {
   id: string;
@@ -320,6 +374,9 @@ export interface KnowledgeRawEntry {
   sourceSummaryId: string;
   sourceSummary: SummaryEntry;
   sourceBinding?: EvidenceBinding;
+  oneLineSummary?: string;
+  score?: KnowledgeRawCandidateScore;
+  review?: KnowledgeRawReviewState;
   intakeReason: string;
   status: KnowledgeRawStatus;
   processReason?: string;
@@ -338,9 +395,15 @@ export interface KnowledgeRawRepository {
   getAll(): KnowledgeRawEntry[];
   findBySourceSummaryId(sourceSummaryId: string): KnowledgeRawEntry | null;
   claimPending(limit?: number): Promise<KnowledgeRawEntry[]>;
+  markReview(args: {
+    id: string;
+    action: "approve" | "reject";
+    reviewer?: string;
+    note?: string;
+  }): Promise<KnowledgeRawEntry | null>;
   markSettled(args: {
     id: string;
-    status: Exclude<KnowledgeRawStatus, "pending" | "processing">;
+    status: Exclude<KnowledgeRawStatus, "review_pending" | "pending" | "processing">;
     reason: string;
     docId?: string;
     slug?: string;
@@ -352,6 +415,9 @@ export interface KnowledgeRawRepository {
 export interface KnowledgeRepository {
   init(): Promise<void>;
   getBaseDir(): string;
+  getIndexedDocuments(): KnowledgeDocumentIndexEntry[];
+  syncAssetIndex(mode?: "sync" | "reindex"): Promise<KnowledgeAssetSyncReport>;
+  verifyAssetIndex(): Promise<KnowledgeAssetVerifyReport>;
   findPromotion(summary: SummaryEntry): PromotionLedgerEntry | null;
   searchRelatedDocuments(query: string, limit?: number): KnowledgeDocumentIndexEntry[];
   getById(id: string): Promise<KnowledgeDocumentRecord | null>;
@@ -541,6 +607,7 @@ export interface BridgeConfig {
   durableMemoryEnabled: boolean;
   autoRecallEnabled: boolean;
   knowledgePromotionEnabled: boolean;
+  knowledgePromotionManualReviewEnabled: boolean;
   knowledgeIntakeMode: KnowledgeIntakeMode;
   knowledgeIntakeAllowProjectState: boolean;
   knowledgeIntakeAllowBranchSummaries: boolean;
@@ -549,6 +616,7 @@ export interface BridgeConfig {
   semanticCandidateExpansionEnabled: boolean;
   semanticCandidateLimit: number;
   emergencyBrake: boolean;
+  sqliteJournalMode: "delete" | "wal";
 }
 
 export interface RecallResult {

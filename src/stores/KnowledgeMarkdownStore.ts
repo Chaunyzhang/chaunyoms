@@ -5,6 +5,8 @@ import path from "node:path";
 
 import {
   KnowledgeDocBucket,
+  KnowledgeAssetSyncReport,
+  KnowledgeAssetVerifyReport,
   KnowledgeDocVersionRecord,
   KnowledgeDocumentRecord,
   KnowledgeDocumentIndexEntry,
@@ -86,6 +88,100 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
 
   getBaseDir(): string {
     return this.baseDir;
+  }
+
+  getIndexedDocuments(): KnowledgeDocumentIndexEntry[] {
+    return this.normalizeDocuments(this.documents);
+  }
+
+  async syncAssetIndex(mode: "sync" | "reindex" = "sync"): Promise<KnowledgeAssetSyncReport> {
+    await this.init();
+    const before = this.normalizeDocuments(this.documents);
+    const rebuilt = await this.rebuildDocumentsFromFilesystem();
+    const beforeById = new Map(before.map((entry) => [entry.docId, entry]));
+    const afterById = new Map(rebuilt.map((entry) => [entry.docId, entry]));
+    const added = rebuilt
+      .filter((entry) => !beforeById.has(entry.docId))
+      .map((entry) => entry.docId);
+    const removed = before
+      .filter((entry) => !afterById.has(entry.docId))
+      .map((entry) => entry.docId);
+    const updated = rebuilt
+      .filter((entry) => {
+        const previous = beforeById.get(entry.docId);
+        return Boolean(previous) && JSON.stringify(previous) !== JSON.stringify(entry);
+      })
+      .map((entry) => entry.docId);
+
+    this.documents = rebuilt;
+    await this.flushDocumentIndex();
+    return {
+      ok: true,
+      mode,
+      beforeCount: before.length,
+      afterCount: rebuilt.length,
+      added,
+      removed,
+      updated,
+      warnings: [],
+    };
+  }
+
+  async verifyAssetIndex(): Promise<KnowledgeAssetVerifyReport> {
+    await this.init();
+    const indexed = this.normalizeDocuments(this.documents);
+    const rebuilt = await this.rebuildDocumentsFromFilesystem();
+    const indexedById = new Map(indexed.map((entry) => [entry.docId, entry]));
+    const rebuiltById = new Map(rebuilt.map((entry) => [entry.docId, entry]));
+    const missingFiles: KnowledgeAssetVerifyReport["missingFiles"] = [];
+    const missingProvenance = indexed
+      .filter((entry) => entry.linkedSummaryIds.length === 0 && entry.sourceRefs.length === 0)
+      .map((entry) => ({
+        docId: entry.docId,
+        title: entry.title,
+        status: entry.status,
+      }));
+    const byCanonicalKey = new Map<string, KnowledgeDocumentIndexEntry[]>();
+
+    for (const entry of indexed) {
+      byCanonicalKey.set(entry.canonicalKey, [...(byCanonicalKey.get(entry.canonicalKey) ?? []), entry]);
+      for (const version of entry.versions) {
+        const filePath = path.join(this.baseDir, entry.bucket, version.fileName);
+        try {
+          await stat(filePath);
+        } catch {
+          missingFiles.push({ docId: entry.docId, filePath });
+        }
+      }
+    }
+
+    const duplicateCanonicalKeys = [...byCanonicalKey.entries()]
+      .filter(([, entries]) => entries.length > 1)
+      .map(([canonicalKey, entries]) => ({
+        canonicalKey,
+        docIds: entries.map((entry) => entry.docId),
+      }));
+    const staleIndex =
+      indexed.length !== rebuilt.length ||
+      indexed.some((entry) => JSON.stringify(entry) !== JSON.stringify(rebuiltById.get(entry.docId))) ||
+      rebuilt.some((entry) => !indexedById.has(entry.docId));
+    const warnings = [
+      ...(missingFiles.length > 0 ? [`${missingFiles.length} indexed knowledge asset files are missing.`] : []),
+      ...(missingProvenance.length > 0 ? [`${missingProvenance.length} knowledge assets have no linked summaries or source refs.`] : []),
+      ...(duplicateCanonicalKeys.length > 0 ? [`${duplicateCanonicalKeys.length} canonical keys have multiple indexed assets.`] : []),
+      ...(staleIndex ? ["Markdown filesystem and document-index.json differ; run oms_asset_sync or oms_asset_reindex."] : []),
+    ];
+
+    return {
+      ok: warnings.length === 0,
+      indexedCount: indexed.length,
+      filesystemCount: rebuilt.length,
+      missingFiles,
+      missingProvenance,
+      duplicateCanonicalKeys,
+      staleIndex,
+      warnings,
+    };
   }
 
   findPromotion(summary: SummaryEntry): PromotionLedgerEntry | null {

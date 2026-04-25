@@ -23,7 +23,7 @@
 
 SQLite owns runtime truth: raw messages, summaries, source_edges, memories, asset index, context_runs, and retrieval_candidates. Markdown owns human-readable assets. For factual history, this agent's raw ledger has priority; reviewed knowledge is advisory; ContextPlanner is the only gate that decides what enters context.
 
-Primary path: `memory_retrieve`. Evidence/ops path: `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_inspect_context`, `oms_why_recalled`.
+Primary path: `memory_retrieve`. Setup/evidence/ops path: `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, `oms_why_recalled`.
 
 ---
 
@@ -355,6 +355,10 @@ openclaw plugins install -l "D:\chaunyoms"
 openclaw plugins doctor
 openclaw plugins list
 ```
+
+安装后先跑 `oms_setup_guide` 和 `oms_doctor`：前者告诉你当前 dataDir / knowledgeBaseDir / node:sqlite / knowledge promotion 手动审核姿态是否合适，后者检查 SQLite、source_edges、配置和知识资产健康度。
+
+Markdown 知识资产不会每轮热路径扫文件；手动改完知识库后用 `oms_asset_sync` 同步进 SQLite 运行索引，迁移或怀疑索引漂移时用 `oms_asset_reindex` 重建，发布/排障前用 `oms_asset_verify` 查缺文件、重复 canonical key、索引过期和缺 provenance。
 
 ## 3. 激活为 context engine
 

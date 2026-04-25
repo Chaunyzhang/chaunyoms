@@ -84,6 +84,42 @@ export class KnowledgeRawStore implements KnowledgeRawRepository {
     }));
   }
 
+  async markReview(args: {
+    id: string;
+    action: "approve" | "reject";
+    reviewer?: string;
+    note?: string;
+  }): Promise<KnowledgeRawEntry | null> {
+    const now = new Date().toISOString();
+    let updated: KnowledgeRawEntry | null = null;
+    this.entries = this.entries.map((entry) => {
+      if (entry.id !== args.id) {
+        return entry;
+      }
+      updated = this.normalizeEntry({
+        ...entry,
+        status: args.action === "approve" ? "pending" : "rejected",
+        processReason: args.action === "approve"
+          ? "manual_review_approved"
+          : "manual_review_rejected",
+        review: {
+          mode: "manual",
+          state: args.action === "approve" ? "approved" : "rejected",
+          reviewedAt: now,
+          reviewer: args.reviewer?.trim() || undefined,
+          note: args.note?.trim() || undefined,
+        },
+        updatedAt: now,
+        lastProcessedAt: args.action === "reject" ? now : entry.lastProcessedAt,
+      });
+      return updated;
+    });
+    if (updated) {
+      await this.flush();
+    }
+    return updated;
+  }
+
   async markSettled(args: {
     id: string;
     status: "promoted" | "duplicate" | "skipped" | "failed";
@@ -117,6 +153,9 @@ export class KnowledgeRawStore implements KnowledgeRawRepository {
     return {
       ...entry,
       status: entry.status ?? "pending",
+      oneLineSummary: entry.oneLineSummary?.trim() || this.truncateOneLine(entry.sourceSummary.summary),
+      score: entry.score,
+      review: entry.review,
       intakeReason: entry.intakeReason.trim() || "accepted_for_knowledge_raw",
       processReason: entry.processReason?.trim() || undefined,
       linkedDocId: entry.linkedDocId?.trim() || undefined,
@@ -141,6 +180,10 @@ export class KnowledgeRawStore implements KnowledgeRawRepository {
       },
       sourceBinding: entry.sourceBinding ?? SourceMessageResolver.bindingFromSummary(entry.sourceSummary),
     };
+  }
+
+  private truncateOneLine(value: string): string {
+    return [...value.replace(/\s+/g, " ").trim()].slice(0, 20).join("");
   }
 
   private async flush(): Promise<void> {

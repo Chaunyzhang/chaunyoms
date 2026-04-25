@@ -49,6 +49,19 @@ export class RawMessageStore {
     await this.flush();
   }
 
+  async appendMany(messages: RawMessage[]): Promise<void> {
+    if (messages.length === 0) {
+      return;
+    }
+    for (const message of messages) {
+      if (!Number.isFinite(message.sequence)) {
+        message.sequence = this.nextSequence();
+      }
+      this.messages.push(message);
+    }
+    await this.flush();
+  }
+
   getAll(options: RawMessageQuery = {}): RawMessage[] {
     return this.filterBySession(this.messages, options);
   }

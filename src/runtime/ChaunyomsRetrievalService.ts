@@ -1,3 +1,4 @@
+import { ContextPlanner } from "../engines/ContextPlanner";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
 import {
@@ -8,6 +9,7 @@ import {
   KnowledgeDocumentIndexEntry,
   KnowledgeRepository,
   ProjectRecord,
+  RecallResult,
   RetrievalDecision,
   SemanticCandidate,
   SummaryEntry,
@@ -37,6 +39,7 @@ export interface RetrievalLayerDependencies {
 }
 
 export class ChaunyomsRetrievalService {
+  private readonly contextPlanner = new ContextPlanner();
   private readonly recallResolver = new RecallResolver();
   private readonly retrievalRouter = new MemoryRetrievalRouter();
   private readonly fixedPrefixProvider: FixedPrefixProvider;
@@ -221,24 +224,28 @@ export class ChaunyomsRetrievalService {
       const rawFtsHints = this.shouldUseFtsRecallHints(args, context)
         ? (await this.runtime.getRuntimeStore(context)).grepMessages(query, {
             sessionId: context.sessionId,
-            limit: 12,
-            contextTurns: 2,
+            limit: this.resolveRawFtsHintLimit(args),
+            contextTurns: 0,
           })
         : [];
       const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
+      const rawFtsMessageIds = rawFtsHints.map((hit) => hit.message.id);
       const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget, {
         sessionId: context.sessionId,
-        rawHintMessageIds: rawFtsHints.map((hit) => hit.message.id),
+        rawHintMessageIds: rawFtsMessageIds,
+        rawCandidateMessageIds: rawFtsMessageIds,
       });
+      const planned = this.planRecallItems(result, recallBudget);
+      await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, result.items, result.sourceTrace, result.answerCandidates) }],
+        content: [{ type: "text", text: this.formatRecallText(query, planned.items, result.sourceTrace, result.answerCandidates) }],
         details: {
           ok: true,
           route: decision.route,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
-          consumedTokens: result.consumedTokens,
-          hitCount: result.items.length,
+          consumedTokens: planned.consumedTokens,
+          hitCount: planned.items.length,
           retrievalHitType: result.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
           recallStrategy: result.strategy ?? "summary_navigation",
           rawCandidateCount: result.rawCandidateCount ?? 0,
@@ -251,6 +258,8 @@ export class ChaunyomsRetrievalService {
           explanation: decision.explanation,
           dagTrace: result.dagTrace,
           sourceTrace: result.sourceTrace,
+          plannerRunId: planned.plan.runId,
+          plannerRejectedCount: planned.plan.rejected.length,
         },
       }, query, context, decision, emptyExpansion);
     }
@@ -419,6 +428,56 @@ export class ChaunyomsRetrievalService {
     return this.jsonToolResponse("oms_status", status, status.ok);
   }
 
+  async executeOmsSetupGuide(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const status = await this.runtime.getStatus(context);
+    const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
+    const recommendedConfig = {
+      configPreset: context.config.configPreset,
+      enableTools: true,
+      runtimeCaptureEnabled: true,
+      durableMemoryEnabled: true,
+      autoRecallEnabled: context.config.configPreset !== "safe",
+      knowledgePromotionEnabled: false,
+      knowledgePromotionManualReviewEnabled: true,
+      knowledgeIntakeMode: context.config.knowledgeIntakeMode,
+      sqliteJournalMode: context.config.sqliteJournalMode,
+    };
+    const setup = {
+      ok: status.ok,
+      purpose: "Configure ChaunyOMS as a SQLite-first runtime with Markdown assets as reviewed human-readable output.",
+      runtime: {
+        adapter: status.runtimeStore.adapter,
+        sqliteEnabled: status.runtimeStore.enabled,
+        nodeVersion: process.version,
+        journalMode: status.runtimeStore.journalMode,
+        dbPath: status.runtimeStore.dbPath,
+      },
+      paths: {
+        dataDir: context.config.dataDir,
+        workspaceDir: context.config.workspaceDir,
+        knowledgeBaseDir: context.config.knowledgeBaseDir,
+        memoryVaultDir: context.config.memoryVaultDir,
+      },
+      recommendedConfig,
+      checklist: [
+        "Run oms_doctor after install; it verifies config, SQLite availability, source edges, and asset governance.",
+        "Keep sqliteJournalMode=delete unless the deployment needs concurrent reads/writes and supports WAL files reliably.",
+        "Leave knowledgePromotionEnabled=false until raw recall/compaction are stable for the project.",
+        "Enable knowledgePromotionManualReviewEnabled=true when promotion is enabled and the UI wants a review queue.",
+        "Use oms_backup before restore/migration and oms_verify after large data operations.",
+      ],
+      warnings: [
+        ...configGuidance.warnings,
+        ...(status.runtimeStore.enabled ? [] : ["node:sqlite is unavailable; pin a compatible Node version before production use."]),
+        ...(context.config.knowledgePromotionEnabled && !context.config.knowledgePromotionManualReviewEnabled
+          ? ["Automatic knowledge promotion is enabled without manual review; this is faster but gives the user less control."]
+          : []),
+      ],
+    };
+    return this.jsonToolResponse("oms_setup_guide", setup, setup.ok);
+  }
+
   async executeOmsVerify(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const report = await this.runtime.verify(context);
@@ -435,6 +494,7 @@ export class ChaunyomsRetrievalService {
       ...verify.warnings,
       ...(context.config.emergencyBrake ? ["emergencyBrake is enabled: automatic compaction/promotion paths are intentionally conservative."] : []),
       ...(status.runtimeStore.enabled ? [] : ["SQLite runtime is disabled; source recall tools will fall back to no-op results."]),
+      ...(status.runtimeStore.experimentalAdapter ? ["SQLite runtime is using Node's experimental node:sqlite adapter; pin a compatible Node version for production deployments."] : []),
       ...(context.config.knowledgePromotionEnabled ? [] : ["knowledgePromotionEnabled is false; Markdown asset promotion is opt-in/disabled."]),
     ];
     const errors = [...verify.errors];
@@ -480,12 +540,16 @@ export class ChaunyomsRetrievalService {
     const runtimeStore = await this.runtime.getRuntimeStore(context);
     const runId = this.getStringArg(args, "runId") || undefined;
     const inspection = runtimeStore.inspectContextRun(runId);
-    return this.jsonToolResponse("oms_inspect_context", {
+    const details = {
       ok: Boolean(inspection.run),
       runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
       dbPath: runtimeStore.getPath(),
       ...inspection,
-    }, Boolean(inspection.run));
+    };
+    return {
+      content: [{ type: "text", text: this.formatContextInspection(details) }],
+      details: { tool: "oms_inspect_context", ...details },
+    };
   }
 
   async executeOmsWhyRecalled(args: unknown): Promise<ToolResponse> {
@@ -497,12 +561,77 @@ export class ChaunyomsRetrievalService {
       runId: this.getStringArg(args, "runId") || undefined,
       limit: this.getNumberArg(args, "limit", 10),
     });
-    return this.jsonToolResponse("oms_why_recalled", {
+    const details = {
       ok: report.matches.length > 0,
       runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
       dbPath: runtimeStore.getPath(),
       ...report,
-    }, report.matches.length > 0);
+    };
+    return {
+      content: [{ type: "text", text: this.formatWhyRecalled(details) }],
+      details: { tool: "oms_why_recalled", ...details },
+    };
+  }
+
+  async executeOmsKnowledgeCurate(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const apply = this.getBooleanArg(args, "apply", false);
+    const result = await this.runtime.curateKnowledge(context, apply);
+    return this.jsonToolResponse("oms_knowledge_curate", result, result.ok);
+  }
+
+  async executeOmsAssetSync(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.syncKnowledgeAssets(context, "sync");
+    return this.jsonToolResponse("oms_asset_sync", result, result.ok);
+  }
+
+  async executeOmsAssetReindex(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.syncKnowledgeAssets(context, "reindex");
+    return this.jsonToolResponse("oms_asset_reindex", result, result.ok);
+  }
+
+  async executeOmsAssetVerify(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.verifyKnowledgeAssets(context);
+    return this.jsonToolResponse("oms_asset_verify", result, result.ok);
+  }
+
+  async executeOmsKnowledgeCandidates(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const status = this.getStringArg(args, "status") || undefined;
+    const limit = this.getNumberArg(args, "limit", 20);
+    const result = await this.runtime.listKnowledgeCandidates(context, { status, limit });
+    return {
+      content: [{
+        type: "text",
+        text: result.candidates.length > 0
+          ? result.candidates.map((candidate) =>
+            `${candidate.score ?? "--"} ${candidate.recommendation ?? "unknown"} ${candidate.status}/${candidate.reviewState ?? "-"} ${candidate.id}: ${candidate.oneLineSummary}`).join("\n")
+          : "No knowledge raw candidates matched this filter.",
+      }],
+      details: { tool: "oms_knowledge_candidates", ...result },
+    };
+  }
+
+  async executeOmsKnowledgeReview(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const id = this.getStringArg(args, "id");
+    const action = this.getStringArg(args, "action");
+    if (!id || !["approve", "reject"].includes(action)) {
+      return {
+        content: [{ type: "text", text: "oms_knowledge_review requires id and action=approve|reject." }],
+        details: { ok: false, tool: "oms_knowledge_review", reason: "missing_or_invalid_review_args" },
+      };
+    }
+    const result = await this.runtime.reviewKnowledgeCandidate(context, {
+      id,
+      action: action as "approve" | "reject",
+      reviewer: this.getStringArg(args, "reviewer") || undefined,
+      note: this.getStringArg(args, "note") || undefined,
+    });
+    return this.jsonToolResponse("oms_knowledge_review", result, result.ok);
   }
 
   private attachDiagnostics(
@@ -808,6 +937,21 @@ export class ChaunyomsRetrievalService {
     return undefined;
   }
 
+  private planRecallItems(result: RecallResult, recallBudget: number): {
+    items: ContextItem[];
+    consumedTokens: number;
+    plan: ReturnType<ContextPlanner["plan"]>;
+  } {
+    const source = result.strategy === "raw_first" ? "raw_exact_search" : "summary_context";
+    const candidates = result.items.map((item, index) => this.contextPlanner.buildCandidate(item, source, index));
+    const plan = this.contextPlanner.plan(candidates, { budget: recallBudget });
+    return {
+      items: plan.selected.map((candidate) => candidate.item),
+      consumedTokens: plan.selectedTokens,
+      plan,
+    };
+  }
+
   private resolveRecallBudget(args: unknown, totalBudget: number): number {
     const budget = this.isRecord(args) ? args.budget : undefined;
     return Math.max(
@@ -820,14 +964,24 @@ export class ChaunyomsRetrievalService {
     );
   }
 
-  private shouldUseFtsRecallHints(args: unknown, context: LifecycleContext): boolean {
-    if (context.config.configPreset === "enhanced_recall") {
-      return true;
+  private resolveRawFtsHintLimit(args: unknown): number {
+    if (this.isRecord(args) && args.qualityMode === true) {
+      return 50;
     }
-    if (!this.isRecord(args)) {
+    if (this.isRecord(args) && args.deepRecall === true) {
+      return 50;
+    }
+    return 48;
+  }
+
+  private shouldUseFtsRecallHints(args: unknown, context: LifecycleContext): boolean {
+    if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
       return false;
     }
-    return args.deepRecall === true || args.rawFts === true || args.qualityMode === true;
+    if (this.isRecord(args) && args.rawFts === false) {
+      return false;
+    }
+    return true;
   }
 
   private jsonToolResponse(tool: string, details: object, ok = true): ToolResponse {
@@ -843,6 +997,57 @@ export class ChaunyomsRetrievalService {
         ...payload,
       },
     };
+  }
+
+  private formatContextInspection(details: Record<string, unknown>): string {
+    const run = details.run as Record<string, unknown> | null | undefined;
+    if (!run) {
+      return "No ContextPlanner run has been recorded yet. Run assemble or memory_retrieve first.";
+    }
+    const selected = Array.isArray(details.selected) ? details.selected as Array<Record<string, unknown>> : [];
+    const rejected = Array.isArray(details.rejected) ? details.rejected as Array<Record<string, unknown>> : [];
+    const lines = [
+      `Context run: ${String(run.id ?? "")}`,
+      `Intent: ${String(run.intent ?? "")}`,
+      `Budget: selected ${Number(run.selectedTokens ?? 0)} / total ${Number(run.totalBudget ?? 0)} tokens`,
+      `Selected: ${selected.length}; Rejected: ${rejected.length}`,
+      "",
+      "Selected candidates:",
+      ...selected.slice(0, 12).map((candidate, index) =>
+        `${index + 1}. ${candidate.source}/${candidate.authority} ${candidate.targetKind}:${candidate.targetId ?? "-"} score=${candidate.score} tokens=${candidate.tokenCount} reasons=${this.formatReasonList(candidate.reasons)}`),
+      ...(selected.length > 12 ? [`... ${selected.length - 12} more selected candidates`] : []),
+      "",
+      "Rejected candidates:",
+      ...rejected.slice(0, 8).map((candidate, index) =>
+        `${index + 1}. ${candidate.source}/${candidate.authority} ${candidate.targetKind}:${candidate.targetId ?? "-"} rejected=${candidate.rejectedReason ?? "budget_or_authority"} reasons=${this.formatReasonList(candidate.reasons)}`),
+      ...(rejected.length > 8 ? [`... ${rejected.length - 8} more rejected candidates`] : []),
+    ];
+    return lines.join("\n");
+  }
+
+  private formatWhyRecalled(details: Record<string, unknown>): string {
+    const matches = Array.isArray(details.matches) ? details.matches as Array<Record<string, unknown>> : [];
+    const header = [
+      `Why recalled query: ${String(details.query ?? "-")}`,
+      `Target: ${String(details.targetId ?? "-")}`,
+      `Context run: ${String(details.inspectedRunId ?? "-")}`,
+      String(details.explanation ?? ""),
+      "",
+    ];
+    if (matches.length === 0) {
+      return [...header, "No matching candidate audit rows were found."].join("\n");
+    }
+    return [
+      ...header,
+      ...matches.map((candidate, index) =>
+        `${index + 1}. ${candidate.status} ${candidate.source}/${candidate.authority} ${candidate.targetKind}:${candidate.targetId ?? "-"} score=${candidate.score} tokens=${candidate.tokenCount} reasons=${this.formatReasonList(candidate.reasons)}${candidate.rejectedReason ? ` rejected=${candidate.rejectedReason}` : ""}`),
+    ].join("\n");
+  }
+
+  private formatReasonList(value: unknown): string {
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string").join(",")
+      : "";
   }
 
   private async resolveRetrievalDecision(

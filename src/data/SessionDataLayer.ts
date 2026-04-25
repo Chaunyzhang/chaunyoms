@@ -66,7 +66,7 @@ export class SessionDataLayer {
   private upgradeManager: SessionUpgradeManager | null = null;
   private boundAgentId: string | null = null;
   private boundSessionId: string | null = null;
-  private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"> | null = null;
+  private boundConfig: Pick<BridgeConfig, "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir" | "sqliteJournalMode"> | null = null;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private runtimeMirrorSignature: string | null = null;
   private runtimeMirrorDirty = false;
@@ -92,69 +92,19 @@ export class SessionDataLayer {
       this.boundConfig?.workspaceDir === config.workspaceDir &&
       this.boundConfig?.sharedDataDir === config.sharedDataDir &&
       this.boundConfig?.knowledgeBaseDir === config.knowledgeBaseDir &&
-      this.boundConfig?.memoryVaultDir === config.memoryVaultDir
+      this.boundConfig?.memoryVaultDir === config.memoryVaultDir &&
+      this.boundConfig?.sqliteJournalMode === config.sqliteJournalMode
     ) {
       return this.getStores();
     }
 
-    this.schemaRegistry = new DataSchemaRegistry(path.join(config.dataDir, "_state"));
-    await this.schemaRegistry.init();
-    this.migrationRunner = new SessionDataMigrationRunner(agentDataDir, config.agentId);
-    this.upgradeManager = new SessionUpgradeManager(this.logger);
-    const pendingMigrations = await this.migrationRunner.inspectPending();
-    const pendingRegistryUpgrades = this.schemaRegistry.getPendingUpgrades();
-    await this.upgradeManager.runProtectedUpgrade({
-      dataDir: config.dataDir,
-      paths: [
-        {
-          label: "agent_data",
-          sourcePath: agentDataDir,
-          snapshotRelativePath: path.join("agent_data"),
-        },
-        {
-          label: "schema_registry",
-          sourcePath: this.schemaRegistry.getFilePath(),
-          snapshotRelativePath: path.join("schema_registry.json"),
-        },
-        {
-          label: "knowledge_raw",
-          sourcePath: path.join(agentDataDir, `${sessionId}.knowledge-raw.json`),
-          snapshotRelativePath: path.join(`${sessionId}.knowledge_raw.json`),
-        },
-        {
-          label: "knowledge_markdown",
-          sourcePath: knowledgeDir,
-          snapshotRelativePath: path.join("knowledge_markdown"),
-        },
-        {
-          label: "agent_vault",
-          sourcePath: path.join(config.memoryVaultDir, "agents", config.agentId),
-          snapshotRelativePath: path.join("agent_vault"),
-        },
-      ],
-      pendingMigrations,
-      pendingRegistryUpgrades,
-      apply: async () => {
-        const migrations = await this.migrationRunner?.runAll() ?? [];
-        const registryUpgrades = await this.schemaRegistry?.ensureCurrentVersions() ?? [];
-        if (migrations.length > 0) {
-          this.logger.info("session_data_migrations_applied", {
-            agentId: config.agentId,
-            migrated: migrations,
-          });
-        }
-        if (registryUpgrades.length > 0) {
-          this.logger.info("session_data_schema_registry_updated", {
-            agentId: config.agentId,
-            upgraded: registryUpgrades,
-          });
-        }
-        return { migrations, registryUpgrades };
-      },
-      validate: async () => {
-        await this.validateUpgradedState(agentDataDir, knowledgeDir, config);
-      },
-    });
+    // Current ChaunyOMS runtime is SQLite-first and no longer treats legacy JSON
+    // migrations as a hot-path startup responsibility. Store classes below are
+    // initialized for current writes, Markdown assets, and operational mirrors;
+    // historical schema import/export remains an explicit offline concern.
+    this.schemaRegistry = null;
+    this.migrationRunner = null;
+    this.upgradeManager = null;
     this.rawStore = new RawMessageStore(agentDataDir, config.agentId);
     this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
     this.observationStore = new ObservationStore(agentDataDir, config.agentId);
@@ -168,6 +118,7 @@ export class SessionDataLayer {
       agentId: config.agentId,
       knowledgeBaseDir: knowledgeDir,
       logger: this.logger,
+      journalMode: config.sqliteJournalMode,
     });
     this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
@@ -186,6 +137,7 @@ export class SessionDataLayer {
       sharedDataDir: config.sharedDataDir,
       knowledgeBaseDir: config.knowledgeBaseDir,
       memoryVaultDir: config.memoryVaultDir,
+      sqliteJournalMode: config.sqliteJournalMode,
     };
     this.runtimeMirrorSignature = null;
     this.runtimeMirrorDirty = false;
@@ -208,7 +160,15 @@ export class SessionDataLayer {
   }
 
   async appendRawMessage(message: RawMessage): Promise<void> {
-    await this.getStores().rawStore.append(message);
+    await this.rawStore?.append(message);
+    this.runtimeMirrorDirty = true;
+  }
+
+  async appendRawMessages(messages: RawMessage[]): Promise<void> {
+    if (messages.length === 0) {
+      return;
+    }
+    await this.rawStore?.appendMany(messages);
     this.runtimeMirrorDirty = true;
   }
 
@@ -217,7 +177,8 @@ export class SessionDataLayer {
   }
 
   async addDurableEntries(entries: DurableMemoryEntry[]): Promise<number> {
-    const added = await this.getStores().durableMemoryStore.addEntries(entries);
+    const durableMemoryStore = this.getStores().durableMemoryStore;
+    const added = await durableMemoryStore.addEntries(entries);
     if (added > 0) {
       this.runtimeMirrorDirty = true;
     }
@@ -232,6 +193,7 @@ export class SessionDataLayer {
   }
 
   async appendSummaryArtifact(entry: SummaryEntry): Promise<string | null> {
+    await this.runtimeStore?.recordSummaries([entry]);
     if (!this.agentVault) {
       return null;
     }

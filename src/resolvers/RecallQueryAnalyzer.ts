@@ -136,10 +136,10 @@ export class RecallQueryAnalyzer {
     if (/\bgift|grandma\b/i.test(lower)) add("gift", "grandma", "necklace");
     if (/\bmove|from\b/i.test(lower)) add("moved", "from", "home country");
     if (/\bvisited|travel|city\b/i.test(lower)) add("visited", "travel", "trip", "city");
-    if (/\bmeat|eating\b/i.test(lower)) add("chicken", "recipe", "favorite");
+    if (/\b(meat|prefer|favorite|favourite|eating)\b/i.test(lower)) add("favorite", "favourite", "love", "cooking", "recipe", "chicken");
     if (/\bhikes?|family\b/i.test(lower)) add("hike", "camping", "marshmallows", "stories");
     if (/\bplans?|summer\b/i.test(lower)) add("plans", "summer", "adoption", "agencies", "dream");
-    if (answerType === "relationship") add("single", "parent", "relationship");
+    if (answerType === "relationship") add("single", "parent", "single parent", "relationship");
     return [...hints].filter((hint) => hint.length >= 2);
   }
 }

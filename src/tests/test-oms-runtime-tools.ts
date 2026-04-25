@@ -81,6 +81,30 @@ async function main(): Promise<void> {
     }) as { details?: Record<string, unknown> } | undefined;
     assert(doctor?.details?.engineId === "chaunyoms", "oms_doctor should identify the engine");
 
+    const setup = await tools.get("oms_setup_guide")?.execute("tool-setup", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(setup?.details?.purpose === "Configure ChaunyOMS as a SQLite-first runtime with Markdown assets as reviewed human-readable output.", "oms_setup_guide should explain setup intent");
+
+    const assetSync = await tools.get("oms_asset_sync")?.execute("tool-asset-sync", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(assetSync?.details?.mode === "sync", "oms_asset_sync should synchronize Markdown assets into SQLite");
+
+    const assetReindex = await tools.get("oms_asset_reindex")?.execute("tool-asset-reindex", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(assetReindex?.details?.mode === "reindex", "oms_asset_reindex should rebuild the SQLite asset index");
+
+    const assetVerify = await tools.get("oms_asset_verify")?.execute("tool-asset-verify", {
+      sessionId: config.sessionId,
+      config,
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(typeof assetVerify?.details?.ok === "boolean", "oms_asset_verify should return an ok flag");
+
     const inspect = await tools.get("oms_inspect_context")?.execute("tool-6", {
       sessionId: config.sessionId,
       config,
@@ -112,12 +136,16 @@ async function main(): Promise<void> {
     assert(tools.has("oms_expand"), "oms_expand should be registered");
     assert(tools.has("oms_trace"), "oms_trace should be registered");
     assert(tools.has("oms_status"), "oms_status should be registered");
+    assert(tools.has("oms_setup_guide"), "oms_setup_guide should be registered");
     assert(tools.has("oms_doctor"), "oms_doctor should be registered");
     assert(tools.has("oms_verify"), "oms_verify should be registered");
     assert(tools.has("oms_backup"), "oms_backup should be registered");
     assert(tools.has("oms_restore"), "oms_restore should be registered");
     assert(tools.has("oms_inspect_context"), "oms_inspect_context should be registered");
     assert(tools.has("oms_why_recalled"), "oms_why_recalled should be registered");
+    assert(tools.has("oms_asset_sync"), "oms_asset_sync should be registered");
+    assert(tools.has("oms_asset_reindex"), "oms_asset_reindex should be registered");
+    assert(tools.has("oms_asset_verify"), "oms_asset_verify should be registered");
     assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
     assert(!tools.has("memory_route"), "memory_route should not be registered on the standard tool surface");
     assert(!tools.has("recall_detail"), "recall_detail should not be registered on the standard tool surface");

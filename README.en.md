@@ -22,7 +22,92 @@
 
 SQLite owns runtime truth: raw messages, summaries, source edges, memories, asset index, context-run audit logs, and retrieval candidates. Markdown owns human-readable assets: decisions, patterns, facts, incidents, and reviewed notes. Runtime retrieval is raw-first for facts, asset-aware for reviewed knowledge, and always gated by ContextPlanner budget/authority rules.
 
-Use `memory_retrieve` as the primary entrypoint. Use `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_inspect_context`, and `oms_why_recalled` when you need evidence, operations, or explainability.
+Use `memory_retrieve` as the primary entrypoint. Use `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, and `oms_why_recalled` when you need setup guidance, evidence, operations, or explainability.
+
+---
+
+## Provider fallback
+
+ChaunyOMS prefers the OpenClaw host LLM caller. If the host only exposes model/provider config, the fallback caller now supports:
+
+- `anthropic-messages`
+- `openai-compatible` / `openai-chat-completions`
+- `minimax` / `minimax-openai`
+
+MiniMax can be configured through the OpenAI-compatible chat-completions shape:
+
+```json
+{
+  "models": {
+    "providers": {
+      "minimax": {
+        "api": "minimax-openai",
+        "baseUrl": "https://api.minimaxi.com/v1",
+        "apiKeyEnv": "MINIMAX_API_KEY"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "minimax/MiniMax-M2.7" }
+    }
+  }
+}
+```
+
+Use `https://api.minimax.io/v1` for international accounts and `https://api.minimaxi.com/v1` for China-region accounts.
+
+---
+
+## Runtime retrieval and SQLite tuning
+
+`memory_retrieve` now keeps one ordered path: SQLite raw search narrows history candidates, source edges expand/trace evidence, and ContextPlanner is the final budget/authority gate. Context assembly also reads recent tail, active memory, summary context, and context-run audit data from SQLite first. JSON/JSONL stores are current-write mirrors and operational sidecars only; legacy schema migration is no longer part of the hot startup path. FTS/BM25 is only a fast clue finder; it does not become a separate authority layer, and DAG/source edges remain provenance infrastructure rather than a competing recall router.
+
+SQLite defaults to conservative rollback journaling:
+
+```json
+{
+  "sqliteJournalMode": "delete"
+}
+```
+
+Set `sqliteJournalMode` to `"wal"` only when the host runtime benefits from concurrent read/write access and the deployment filesystem supports WAL files reliably.
+
+Run `oms_setup_guide` after install to see the active data paths, Node `node:sqlite` adapter status, safe defaults, and the recommended knowledge-promotion/manual-review posture for the current host configuration.
+
+Markdown assets are synchronized explicitly rather than scanned on every model turn:
+
+- `oms_asset_sync` updates SQLite's runtime asset index from Markdown after normal edits.
+- `oms_asset_reindex` rebuilds the runtime asset index from Markdown after migrations or suspected drift.
+- `oms_asset_verify` checks missing files, duplicate canonical keys, stale indexes, and missing provenance.
+
+---
+
+## Knowledge candidate review
+
+Knowledge promotion can stay fully automatic, or it can pause in a scored review queue before Markdown writes:
+
+```json
+{
+  "knowledgePromotionEnabled": true,
+  "knowledgePromotionManualReviewEnabled": true
+}
+```
+
+Every accepted knowledge-raw candidate now receives:
+
+- a <=20 character one-line summary for quick UI scanning;
+- a weighted total score;
+- dimension scores for value, research difficulty, source effort, content density, evidence strength, and novelty;
+- a recommendation: `promote`, `review`, or `skip`.
+
+UI/tooling entrypoints:
+
+- `oms_knowledge_candidates` lists scored candidates.
+- `oms_knowledge_review` approves/rejects a candidate.
+- `oms_knowledge_curate` audits the Markdown asset layer for duplicates and missing provenance.
+
+Automatic mode remains the default. `oms_doctor` reminds users that they can enable manual review if they want tighter control over knowledge writes.
 
 ---
 

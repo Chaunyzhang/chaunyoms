@@ -47,6 +47,7 @@ interface RuntimeStoreOptions {
   agentId: string;
   knowledgeBaseDir: string;
   logger: LoggerLike;
+  journalMode?: "delete" | "wal";
 }
 
 export interface RuntimeContextRunRecord {
@@ -76,6 +77,9 @@ export interface RuntimeStoreStatus {
   enabled: boolean;
   dbPath: string;
   ftsReady: boolean;
+  adapter: "node:sqlite" | "unavailable";
+  experimentalAdapter: boolean;
+  journalMode: "delete" | "wal";
   counts: RuntimeTableCounts;
 }
 
@@ -118,6 +122,26 @@ export interface RuntimeWhyRecalledReport {
   explanation: string;
 }
 
+export interface RuntimeKnowledgeGovernanceReport {
+  totalAssets: number;
+  activeAssets: number;
+  draftAssets: number;
+  supersededAssets: number;
+  duplicateCanonicalKeys: Array<{ canonicalKey: string; count: number; docIds: string[] }>;
+  assetsWithoutProvenance: Array<{ docId: string; title: string; status: string }>;
+  warnings: string[];
+}
+
+export interface RuntimeAssetSyncReport {
+  ok: boolean;
+  mode: "sync" | "reindex";
+  indexedAssets: number;
+  sqliteAssetsBefore: number;
+  sqliteAssetsAfter: number;
+  pruned: number;
+  warnings: string[];
+}
+
 export interface OmsGrepHit {
   message: RawMessage;
   before: RawMessage[];
@@ -141,6 +165,13 @@ export interface OmsExpandResult {
   edges: OmsTraceEdge[];
 }
 
+export interface RuntimeAssemblyReader {
+  getSummaryCount(sessionId?: string): number;
+  getActiveMemories(limit?: number): DurableMemoryEntry[];
+  getSummaries(budget: number, sessionId?: string): SummaryEntry[];
+  getRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[];
+}
+
 interface RuntimeDatabaseModule {
   DatabaseSync?: SQLiteDatabaseCtor;
 }
@@ -151,6 +182,7 @@ export class SQLiteRuntimeStore {
   private enabled = false;
   private schemaReady = false;
   private ftsReady = false;
+  private readonly statementCache = new Map<string, SQLiteStatementLike>();
 
   constructor(private readonly options: RuntimeStoreOptions) {}
 
@@ -208,6 +240,240 @@ export class SQLiteRuntimeStore {
     } finally {
       this.closeDatabase();
     }
+  }
+
+  async recordRawMessage(message: RawMessage): Promise<boolean> {
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    try {
+      this.upsertMessage(message);
+      return true;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async recordRawMessages(messages: RawMessage[]): Promise<boolean> {
+    if (messages.length === 0) {
+      return true;
+    }
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      for (const message of messages) {
+        this.upsertMessage(message);
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return true;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original write failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async recordSummaries(summaries: SummaryEntry[]): Promise<boolean> {
+    if (summaries.length === 0) {
+      return true;
+    }
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      for (const summary of summaries) {
+        this.upsertSummary(summary);
+        this.upsertSummarySourceEdges(summary);
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return true;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original write failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async recordMemories(memories: DurableMemoryEntry[]): Promise<boolean> {
+    if (memories.length === 0) {
+      return true;
+    }
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      for (const memory of memories) {
+        this.upsertMemory(memory);
+        this.upsertMemorySourceEdges(memory);
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return true;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original write failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+
+  withAssemblyRead<T>(reader: (runtime: RuntimeAssemblyReader) => T): T | null {
+    if (!this.openDatabase()) {
+      return null;
+    }
+    try {
+      return reader({
+        getSummaryCount: (sessionId) => this.readAssemblySummaryCount(sessionId),
+        getActiveMemories: (limit) => this.readAssemblyActiveMemories(limit),
+        getSummaries: (budget, sessionId) => this.readAssemblySummaries(budget, sessionId),
+        getRecentTailByTokens: (tokenBudget, maxTurns, sessionId) =>
+          this.readAssemblyRecentTailByTokens(tokenBudget, maxTurns, sessionId),
+      });
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  getAssemblySummaryCount(sessionId?: string): number {
+    return this.withAssemblyRead((runtime) => runtime.getSummaryCount(sessionId)) ?? 0;
+  }
+
+  getAssemblyActiveMemories(limit = 8): DurableMemoryEntry[] {
+    return this.withAssemblyRead((runtime) => runtime.getActiveMemories(limit)) ?? [];
+  }
+
+  getAssemblySummaries(budget: number, sessionId?: string): SummaryEntry[] {
+    return this.withAssemblyRead((runtime) => runtime.getSummaries(budget, sessionId)) ?? [];
+  }
+
+  getAssemblyRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[] {
+    return this.withAssemblyRead((runtime) =>
+      runtime.getRecentTailByTokens(tokenBudget, maxTurns, sessionId)) ?? [];
+  }
+
+  private readAssemblySummaryCount(sessionId?: string): number {
+    if (!this.db) {
+      return 0;
+    }
+    return Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM summaries
+      WHERE (? IS NULL OR session_id = ?)
+    `).get(sessionId ?? null, sessionId ?? null)?.count ?? 0);
+  }
+
+  private readAssemblyActiveMemories(limit = 8): DurableMemoryEntry[] {
+    if (!this.db) {
+      return [];
+    }
+    return this.db.prepare(`
+      SELECT payload_json FROM memories
+      WHERE record_status = 'active'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(Math.max(Math.min(limit, 50), 1))
+      .map((row) => this.parseObject(row.payload_json) as unknown as DurableMemoryEntry);
+  }
+
+  private readAssemblySummaries(budget: number, sessionId?: string): SummaryEntry[] {
+    if (budget <= 0 || !this.db) {
+      return [];
+    }
+    const allActive = this.db.prepare(`
+      SELECT payload_json FROM summaries
+      WHERE record_status = 'active'
+        AND (? IS NULL OR session_id = ?)
+      ORDER BY end_turn DESC, start_turn DESC
+    `).all(sessionId ?? null, sessionId ?? null)
+      .map((row) => this.parseObject(row.payload_json) as unknown as SummaryEntry);
+    const roots = allActive.filter((entry) => (
+      !entry.parentSummaryId &&
+      (!Array.isArray(entry.parentSummaryIds) || entry.parentSummaryIds.length === 0)
+    ));
+    const source = roots.length > 0 ? roots : allActive;
+    const selected: SummaryEntry[] = [];
+    let consumed = 0;
+    for (const summary of source) {
+      const tokenCount = Math.max(summary.tokenCount, 0);
+      if (consumed + tokenCount > budget) {
+        break;
+      }
+      consumed += tokenCount;
+      selected.unshift(summary);
+    }
+    return selected;
+  }
+
+  private readAssemblyRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[] {
+    if (tokenBudget <= 0 || maxTurns <= 0 || !this.db) {
+      return [];
+    }
+    const turnRows = this.db.prepare(`
+      SELECT DISTINCT turn_number FROM messages
+      WHERE (? IS NULL OR session_id = ?)
+      ORDER BY turn_number DESC
+      LIMIT ?
+    `).all(sessionId ?? null, sessionId ?? null, Math.max(maxTurns, 1));
+    const turnNumbersDesc = turnRows.map((row) => Number(row.turn_number)).filter((value) => Number.isFinite(value));
+    if (turnNumbersDesc.length === 0) {
+      return [];
+    }
+    const turnNumbers = [...turnNumbersDesc].reverse();
+    const messages = this.getMessagesByTurns(turnNumbers, sessionId);
+    const selectedTurns: number[] = [];
+    let consumed = 0;
+    for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
+      const turnNumber = turnNumbers[index];
+      const turnTokens = messages
+        .filter((message) => message.turnNumber === turnNumber)
+        .reduce((sum, message) => sum + message.tokenCount, 0);
+      if (selectedTurns.length > 0 && consumed + turnTokens > tokenBudget) {
+        break;
+      }
+      selectedTurns.unshift(turnNumber);
+      consumed += turnTokens;
+      if (selectedTurns.length >= maxTurns) {
+        break;
+      }
+    }
+    const selected = new Set(selectedTurns);
+    return messages.filter((message) => selected.has(message.turnNumber));
   }
 
   recordContextPlan(args: {
@@ -426,7 +692,7 @@ export class SQLiteRuntimeStore {
     try {
       const normalizedKind = this.normalizeKind(kind, id);
       const target = this.lookupTarget(normalizedKind, id);
-      const edges = this.traceEdges(normalizedKind, id);
+      const edges = this.traceEdgesRecursive(normalizedKind, id, 5);
       const messageIds = new Set<string>();
       const summaryIds = new Set<string>();
 
@@ -439,14 +705,6 @@ export class SQLiteRuntimeStore {
         }
         if (edge.targetKind === "summary") {
           summaryIds.add(edge.targetId);
-          for (const nested of this.traceEdges("summary", edge.targetId)) {
-            if (nested.targetKind === "message") {
-              messageIds.add(nested.targetId);
-            }
-            if (nested.targetKind === "summary") {
-              summaryIds.add(nested.targetId);
-            }
-          }
         }
       }
 
@@ -467,7 +725,7 @@ export class SQLiteRuntimeStore {
     }
     try {
       const normalizedKind = this.normalizeKind(kind, id);
-      return this.traceEdges(normalizedKind, id);
+      return this.traceEdgesRecursive(normalizedKind, id, 5);
     } finally {
       this.closeDatabase();
     }
@@ -478,14 +736,45 @@ export class SQLiteRuntimeStore {
       SELECT * FROM source_edges
       WHERE source_kind = ? AND source_id = ?
       ORDER BY relation ASC, target_kind ASC, target_id ASC
-    `).all(kind, id).map((row) => ({
+    `).all(kind, id).map((row) => this.rowToTraceEdge(row)) ?? [];
+  }
+
+  private traceEdgesRecursive(kind: string, id: string, maxDepth: number): OmsTraceEdge[] {
+    const edges: OmsTraceEdge[] = [];
+    const seenEdges = new Set<string>();
+    const seenNodes = new Set<string>([`${kind}:${id}`]);
+    const queue: Array<{ kind: string; id: string; depth: number }> = [{ kind, id, depth: 0 }];
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (!next || next.depth >= maxDepth) {
+        continue;
+      }
+      for (const edge of this.traceEdges(next.kind, next.id)) {
+        const edgeKey = `${edge.sourceKind}:${edge.sourceId}->${edge.relation}->${edge.targetKind}:${edge.targetId}`;
+        if (seenEdges.has(edgeKey)) {
+          continue;
+        }
+        seenEdges.add(edgeKey);
+        edges.push(edge);
+        const nodeKey = `${edge.targetKind}:${edge.targetId}`;
+        if (!seenNodes.has(nodeKey) && (edge.targetKind === "summary" || edge.targetKind === "memory" || edge.targetKind === "asset")) {
+          seenNodes.add(nodeKey);
+          queue.push({ kind: edge.targetKind, id: edge.targetId, depth: next.depth + 1 });
+        }
+      }
+    }
+    return edges;
+  }
+
+  private rowToTraceEdge(row: Record<string, unknown>): OmsTraceEdge {
+    return {
       sourceKind: String(row.source_kind ?? ""),
       sourceId: String(row.source_id ?? ""),
       relation: String(row.relation ?? ""),
       targetKind: String(row.target_kind ?? ""),
       targetId: String(row.target_id ?? ""),
       metadata: this.parseObject(row.metadata_json),
-    })) ?? [];
+    };
   }
 
   getLatestContextRuns(limit = 5): RuntimeContextRunRecord[] {
@@ -520,6 +809,9 @@ export class SQLiteRuntimeStore {
         enabled: false,
         dbPath: this.options.dbPath,
         ftsReady: false,
+        adapter: "unavailable",
+        experimentalAdapter: false,
+        journalMode: this.resolveJournalMode(),
         counts: this.emptyCounts(),
       };
     }
@@ -528,6 +820,9 @@ export class SQLiteRuntimeStore {
         enabled: this.enabled,
         dbPath: this.options.dbPath,
         ftsReady: this.ftsReady,
+        adapter: "node:sqlite",
+        experimentalAdapter: true,
+        journalMode: this.resolveJournalMode(),
         counts: this.collectCounts(),
       };
     } finally {
@@ -541,6 +836,9 @@ export class SQLiteRuntimeStore {
         enabled: false,
         dbPath: this.options.dbPath,
         ftsReady: false,
+        adapter: "unavailable",
+        experimentalAdapter: false,
+        journalMode: this.resolveJournalMode(),
         counts: this.emptyCounts(),
         ok: false,
         errors: ["SQLite runtime is unavailable in this Node runtime."],
@@ -605,6 +903,9 @@ export class SQLiteRuntimeStore {
         enabled: this.enabled,
         dbPath: this.options.dbPath,
         ftsReady: this.ftsReady,
+        adapter: "node:sqlite",
+        experimentalAdapter: true,
+        journalMode: this.resolveJournalMode(),
         counts,
         ok: errors.length === 0,
         errors,
@@ -696,6 +997,134 @@ export class SQLiteRuntimeStore {
     }
   }
 
+  inspectKnowledgeGovernance(): RuntimeKnowledgeGovernanceReport {
+    if (!this.openDatabase()) {
+      return {
+        totalAssets: 0,
+        activeAssets: 0,
+        draftAssets: 0,
+        supersededAssets: 0,
+        duplicateCanonicalKeys: [],
+        assetsWithoutProvenance: [],
+        warnings: ["SQLite runtime is unavailable; knowledge asset governance cannot inspect the indexed asset layer."],
+      };
+    }
+    try {
+      const rows = this.db?.prepare(`
+        SELECT doc_id, title, canonical_key, status, linked_summary_ids_json, source_refs_json
+        FROM assets
+        ORDER BY canonical_key ASC, updated_at DESC
+      `).all() ?? [];
+      const byCanonicalKey = new Map<string, Array<Record<string, unknown>>>();
+      for (const row of rows) {
+        const key = String(row.canonical_key ?? "").trim() || `doc:${String(row.doc_id ?? "")}`;
+        byCanonicalKey.set(key, [...(byCanonicalKey.get(key) ?? []), row]);
+      }
+      const duplicateCanonicalKeys = [...byCanonicalKey.entries()]
+        .filter(([, group]) => group.length > 1)
+        .map(([canonicalKey, group]) => ({
+          canonicalKey,
+          count: group.length,
+          docIds: group.map((row) => String(row.doc_id ?? "")),
+        }));
+      const assetsWithoutProvenance = rows
+        .filter((row) =>
+          this.parseStringArray(row.linked_summary_ids_json).length === 0 &&
+          this.parseStringArray(row.source_refs_json).length === 0)
+        .map((row) => ({
+          docId: String(row.doc_id ?? ""),
+          title: String(row.title ?? ""),
+          status: String(row.status ?? ""),
+        }));
+      const activeAssets = rows.filter((row) => row.status === "active").length;
+      const draftAssets = rows.filter((row) => row.status === "draft").length;
+      const supersededAssets = rows.filter((row) => row.status === "superseded").length;
+      const warnings = [
+        ...(duplicateCanonicalKeys.length > 0 ? [`${duplicateCanonicalKeys.length} canonical keys have duplicate indexed assets.`] : []),
+        ...(assetsWithoutProvenance.length > 0 ? [`${assetsWithoutProvenance.length} assets have no source refs or linked summaries.`] : []),
+      ];
+      return {
+        totalAssets: rows.length,
+        activeAssets,
+        draftAssets,
+        supersededAssets,
+        duplicateCanonicalKeys,
+        assetsWithoutProvenance,
+        warnings,
+      };
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async syncAssetsFromMarkdownIndex(mode: "sync" | "reindex" = "sync"): Promise<RuntimeAssetSyncReport> {
+    await this.init();
+    const documents = await this.loadMarkdownAssetIndex();
+    if (!this.openDatabase()) {
+      return {
+        ok: false,
+        mode,
+        indexedAssets: documents.length,
+        sqliteAssetsBefore: 0,
+        sqliteAssetsAfter: 0,
+        pruned: 0,
+        warnings: ["SQLite runtime is unavailable; Markdown assets could not be indexed into runtime storage."],
+      };
+    }
+    let transactionStarted = false;
+    try {
+      const before = this.countTable("assets");
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      if (mode === "reindex") {
+        this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'asset'").run();
+        this.db?.prepare("DELETE FROM assets").run();
+      }
+      for (const document of documents) {
+        this.upsertAsset(document);
+        this.upsertAssetSourceEdges(document);
+      }
+      const documentIds = new Set(documents.map((document) => document.docId));
+      let pruned = 0;
+      if (mode === "reindex") {
+        pruned = Math.max(before - documents.length, 0);
+      } else {
+        const rows = this.db?.prepare("SELECT doc_id FROM assets").all() ?? [];
+        for (const row of rows) {
+          const docId = String(row.doc_id ?? "");
+          if (!documentIds.has(docId)) {
+            this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'asset' AND source_id = ?").run(docId);
+            this.db?.prepare("DELETE FROM assets WHERE doc_id = ?").run(docId);
+            pruned += 1;
+          }
+        }
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      const after = this.countTable("assets");
+      return {
+        ok: true,
+        mode,
+        indexedAssets: documents.length,
+        sqliteAssetsBefore: before,
+        sqliteAssetsAfter: after,
+        pruned,
+        warnings: [],
+      };
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve original sync failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
   private async initOnce(): Promise<void> {
     const DatabaseSync = this.loadSQLite();
     if (!DatabaseSync) {
@@ -740,7 +1169,21 @@ export class SQLiteRuntimeStore {
       this.db.close();
     } finally {
       this.db = null;
+      this.statementCache.clear();
     }
+  }
+
+  private prepare(sql: string): SQLiteStatementLike | null {
+    if (!this.db) {
+      return null;
+    }
+    const cached = this.statementCache.get(sql);
+    if (cached) {
+      return cached;
+    }
+    const statement = this.db.prepare(sql);
+    this.statementCache.set(sql, statement);
+    return statement;
   }
 
   private loadSQLite(): SQLiteDatabaseCtor | null {
@@ -757,7 +1200,7 @@ export class SQLiteRuntimeStore {
       return;
     }
     try {
-      this.db.exec("PRAGMA journal_mode = DELETE;");
+      this.db.exec(`PRAGMA journal_mode = ${this.resolveJournalMode().toUpperCase()};`);
       this.db.exec("PRAGMA synchronous = NORMAL;");
       this.db.exec("PRAGMA foreign_keys = ON;");
     } catch (error) {
@@ -765,6 +1208,10 @@ export class SQLiteRuntimeStore {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private resolveJournalMode(): "delete" | "wal" {
+    return this.options.journalMode === "wal" ? "wal" : "delete";
   }
 
   private createSchema(): void {
@@ -911,7 +1358,7 @@ export class SQLiteRuntimeStore {
   }
 
   private upsertMessage(message: RawMessage): void {
-    this.db?.prepare(`
+    this.prepare(`
       INSERT INTO messages (
         id, session_id, agent_id, role, content, turn_number, sequence,
         created_at, token_count, compacted, metadata_json
@@ -927,7 +1374,7 @@ export class SQLiteRuntimeStore {
         token_count=excluded.token_count,
         compacted=excluded.compacted,
         metadata_json=excluded.metadata_json
-    `).run(
+    `)?.run(
       message.id,
       message.sessionId,
       message.agentId ?? null,
@@ -1005,7 +1452,7 @@ export class SQLiteRuntimeStore {
   }
 
   private upsertSummary(summary: SummaryEntry): void {
-    this.db?.prepare(`
+    this.prepare(`
       INSERT INTO summaries (
         id, session_id, agent_id, project_id, topic_id, record_status,
         summary, keywords_json, start_turn, end_turn, token_count, created_at,
@@ -1034,7 +1481,7 @@ export class SQLiteRuntimeStore {
         summary_level=excluded.summary_level,
         node_kind=excluded.node_kind,
         payload_json=excluded.payload_json
-    `).run(
+    `)?.run(
       summary.id,
       summary.sessionId,
       summary.agentId ?? null,
@@ -1060,7 +1507,7 @@ export class SQLiteRuntimeStore {
   }
 
   private upsertMemory(memory: DurableMemoryEntry): void {
-    this.db?.prepare(`
+    this.prepare(`
       INSERT INTO memories (
         id, session_id, agent_id, project_id, topic_id, kind, record_status,
         text, tags_json, source_ids_json, created_at, payload_json
@@ -1077,7 +1524,7 @@ export class SQLiteRuntimeStore {
         source_ids_json=excluded.source_ids_json,
         created_at=excluded.created_at,
         payload_json=excluded.payload_json
-    `).run(
+    `)?.run(
       memory.id,
       memory.sessionId,
       memory.agentId ?? null,
@@ -1098,23 +1545,30 @@ export class SQLiteRuntimeStore {
     if (!this.db) {
       return;
     }
+    const documents = await this.loadMarkdownAssetIndex();
+    for (const document of documents) {
+      this.upsertAsset(document);
+      this.upsertAssetSourceEdges(document);
+    }
+  }
+
+  private async loadMarkdownAssetIndex(): Promise<KnowledgeDocumentIndexEntry[]> {
     const indexPath = path.join(this.options.knowledgeBaseDir, "indexes", "document-index.json");
     try {
       const parsed = JSON.parse(await readFile(indexPath, "utf8")) as { documents?: KnowledgeDocumentIndexEntry[] } | KnowledgeDocumentIndexEntry[];
       const documents = Array.isArray(parsed) ? parsed : parsed.documents;
       if (!Array.isArray(documents)) {
-        return;
+        return [];
       }
-      for (const document of documents) {
-        this.upsertAsset(document);
-      }
+      return documents;
     } catch {
       // Markdown assets may not exist yet; runtime mirror remains usable for raw/summary/memory.
+      return [];
     }
   }
 
   private upsertAsset(asset: KnowledgeDocumentIndexEntry): void {
-    this.db?.prepare(`
+    this.prepare(`
       INSERT INTO assets (
         doc_id, slug, bucket, title, summary, canonical_key, origin, status,
         tags_json, linked_summary_ids_json, source_refs_json, latest_file,
@@ -1134,7 +1588,7 @@ export class SQLiteRuntimeStore {
         latest_file=excluded.latest_file,
         updated_at=excluded.updated_at,
         payload_json=excluded.payload_json
-    `).run(
+    `)?.run(
       asset.docId,
       asset.slug,
       asset.bucket,
@@ -1159,43 +1613,11 @@ export class SQLiteRuntimeStore {
     }
     this.db.prepare("DELETE FROM source_edges").run();
     for (const summary of summaries) {
-      const messageIds = [
-        ...(summary.sourceBinding?.messageIds ?? []),
-        ...(summary.sourceMessageIds ?? []),
-      ];
-      for (const messageId of [...new Set(messageIds)]) {
-        this.insertEdge("summary", summary.id, "derived_from", "message", messageId, {
-          sessionId: summary.sessionId,
-          agentId: summary.agentId,
-          projectId: summary.projectId,
-          sourceHash: summary.sourceHash,
-        });
-      }
-      for (const sourceSummaryId of [...new Set(summary.sourceSummaryIds ?? [])]) {
-        this.insertEdge("summary", summary.id, "derived_from", "summary", sourceSummaryId, {
-          sessionId: summary.sessionId,
-          agentId: summary.agentId,
-          projectId: summary.projectId,
-        });
-      }
-      for (const childSummaryId of [...new Set(summary.childSummaryIds ?? [])]) {
-        this.insertEdge("summary", summary.id, "has_child", "summary", childSummaryId, {
-          sessionId: summary.sessionId,
-          agentId: summary.agentId,
-          projectId: summary.projectId,
-        });
-      }
+      this.upsertSummarySourceEdges(summary, { deleteExisting: false });
     }
 
     for (const memory of memories) {
-      for (const sourceId of [...new Set(memory.sourceIds ?? [])]) {
-        this.insertEdge("memory", memory.id, "derived_from", this.targetKindForSourceId(sourceId), sourceId, {
-          sessionId: memory.sessionId,
-          agentId: memory.agentId,
-          projectId: memory.projectId,
-          sourceType: memory.sourceType,
-        });
-      }
+      this.upsertMemorySourceEdges(memory, { deleteExisting: false });
     }
 
     const assetRows = this.db.prepare("SELECT payload_json FROM assets").all();
@@ -1204,18 +1626,96 @@ export class SQLiteRuntimeStore {
       if (!asset.docId) {
         continue;
       }
-      for (const summaryId of asset.linkedSummaryIds ?? []) {
-        this.insertEdge("asset", asset.docId, "derived_from", "summary", summaryId, {
-          bucket: asset.bucket,
-        });
-      }
-      for (const ref of asset.sourceRefs ?? []) {
-        this.insertEdge("asset", asset.docId, "has_source_ref", "source_ref", ref, {
-          bucket: asset.bucket,
-          origin: asset.origin,
-        });
-      }
+      this.upsertAssetSourceEdges(asset, { deleteExisting: false });
     }
+  }
+
+  private upsertAssetSourceEdges(
+    asset: KnowledgeDocumentIndexEntry,
+    options: { deleteExisting?: boolean } = {},
+  ): void {
+    if (!this.db || !asset.docId) {
+      return;
+    }
+    if (options.deleteExisting !== false) {
+      this.deleteEdgesForSource("asset", asset.docId);
+    }
+    for (const summaryId of asset.linkedSummaryIds ?? []) {
+      this.insertEdge("asset", asset.docId, "derived_from", "summary", summaryId, {
+        bucket: asset.bucket,
+      });
+    }
+    for (const ref of asset.sourceRefs ?? []) {
+      this.insertEdge("asset", asset.docId, "has_source_ref", "source_ref", ref, {
+        bucket: asset.bucket,
+        origin: asset.origin,
+      });
+    }
+  }
+
+  private upsertSummarySourceEdges(
+    summary: SummaryEntry,
+    options: { deleteExisting?: boolean } = {},
+  ): void {
+    if (!this.db) {
+      return;
+    }
+    if (options.deleteExisting !== false) {
+      this.deleteEdgesForSource("summary", summary.id);
+    }
+    const messageIds = [
+      ...(summary.sourceBinding?.messageIds ?? []),
+      ...(summary.sourceMessageIds ?? []),
+    ];
+    for (const messageId of [...new Set(messageIds)]) {
+      this.insertEdge("summary", summary.id, "derived_from", "message", messageId, {
+        sessionId: summary.sessionId,
+        agentId: summary.agentId,
+        projectId: summary.projectId,
+        sourceHash: summary.sourceHash,
+      });
+    }
+    for (const sourceSummaryId of [...new Set(summary.sourceSummaryIds ?? [])]) {
+      this.insertEdge("summary", summary.id, "derived_from", "summary", sourceSummaryId, {
+        sessionId: summary.sessionId,
+        agentId: summary.agentId,
+        projectId: summary.projectId,
+      });
+    }
+    for (const childSummaryId of [...new Set(summary.childSummaryIds ?? [])]) {
+      this.insertEdge("summary", summary.id, "has_child", "summary", childSummaryId, {
+        sessionId: summary.sessionId,
+        agentId: summary.agentId,
+        projectId: summary.projectId,
+      });
+    }
+  }
+
+  private upsertMemorySourceEdges(
+    memory: DurableMemoryEntry,
+    options: { deleteExisting?: boolean } = {},
+  ): void {
+    if (!this.db) {
+      return;
+    }
+    if (options.deleteExisting !== false) {
+      this.deleteEdgesForSource("memory", memory.id);
+    }
+    for (const sourceId of [...new Set(memory.sourceIds ?? [])]) {
+      this.insertEdge("memory", memory.id, "derived_from", this.targetKindForSourceId(sourceId), sourceId, {
+        sessionId: memory.sessionId,
+        agentId: memory.agentId,
+        projectId: memory.projectId,
+        sourceType: memory.sourceType,
+      });
+    }
+  }
+
+  private deleteEdgesForSource(sourceKind: string, sourceId: string): void {
+    this.prepare(`
+      DELETE FROM source_edges
+      WHERE source_kind = ? AND source_id = ?
+    `)?.run(sourceKind, sourceId);
   }
 
   private insertEdge(
@@ -1230,13 +1730,13 @@ export class SQLiteRuntimeStore {
       return;
     }
     const id = this.hash(`${sourceKind}:${sourceId}:${relation}:${targetKind}:${targetId}`);
-    this.db?.prepare(`
+    this.prepare(`
       INSERT INTO source_edges (
         id, source_kind, source_id, relation, target_kind, target_id,
         session_id, agent_id, project_id, metadata_json
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET metadata_json=excluded.metadata_json
-    `).run(
+    `)?.run(
       id,
       sourceKind,
       sourceId,
@@ -1283,26 +1783,58 @@ export class SQLiteRuntimeStore {
     `).all(sessionId, startTurn, endTurn).map((row) => this.rowToMessage(row));
   }
 
+  private getMessagesByTurns(turnNumbers: number[], sessionId?: string): RawMessage[] {
+    if (!this.db || turnNumbers.length === 0) {
+      return [];
+    }
+    const uniqueTurns = [...new Set(turnNumbers)].sort((left, right) => left - right);
+    const placeholders = uniqueTurns.map(() => "?").join(", ");
+    return this.db.prepare(`
+      SELECT * FROM messages
+      WHERE turn_number IN (${placeholders})
+        AND (? IS NULL OR session_id = ?)
+      ORDER BY turn_number ASC, sequence ASC, created_at ASC
+    `).all(...uniqueTurns, sessionId ?? null, sessionId ?? null).map((row) => this.rowToMessage(row));
+  }
+
   private getMessagesByIds(ids: string[]): RawMessage[] {
     if (!this.db || ids.length === 0) {
       return [];
     }
-    const wanted = new Set(ids);
-    return this.db.prepare("SELECT * FROM messages ORDER BY turn_number ASC, sequence ASC, created_at ASC")
-      .all()
-      .map((row) => this.rowToMessage(row))
-      .filter((message) => wanted.has(message.id));
+    const uniqueIds = [...new Set(ids)];
+    const rows = this.selectByIdChunks("messages", "*", uniqueIds, "turn_number ASC, sequence ASC, created_at ASC");
+    return rows.map((row) => this.rowToMessage(row));
   }
 
   private getSummariesByIds(ids: string[]): SummaryEntry[] {
     if (!this.db || ids.length === 0) {
       return [];
     }
-    const wanted = new Set(ids);
-    return this.db.prepare("SELECT payload_json FROM summaries ORDER BY start_turn ASC, end_turn ASC")
-      .all()
-      .map((row) => this.parseObject(row.payload_json) as unknown as SummaryEntry)
-      .filter((summary) => wanted.has(summary.id));
+    const uniqueIds = [...new Set(ids)];
+    const rows = this.selectByIdChunks("summaries", "payload_json", uniqueIds, "start_turn ASC, end_turn ASC");
+    return rows.map((row) => this.parseObject(row.payload_json) as unknown as SummaryEntry);
+  }
+
+  private selectByIdChunks(
+    table: "messages" | "summaries",
+    projection: "*" | "payload_json",
+    ids: string[],
+    orderBy: string,
+  ): Array<Record<string, unknown>> {
+    if (!this.db) {
+      return [];
+    }
+    const rows: Array<Record<string, unknown>> = [];
+    for (let index = 0; index < ids.length; index += 250) {
+      const chunk = ids.slice(index, index + 250);
+      const placeholders = chunk.map(() => "?").join(", ");
+      rows.push(...this.db.prepare(`
+        SELECT ${projection} FROM ${table}
+        WHERE id IN (${placeholders})
+        ORDER BY ${orderBy}
+      `).all(...chunk));
+    }
+    return rows;
   }
 
   private collectCounts(): RuntimeTableCounts {

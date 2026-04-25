@@ -21,6 +21,7 @@ export interface HostContextNamespace extends HostRecord {
 export interface HostProviderConfig extends HostRecord {
   api?: unknown;
   apiKey?: unknown;
+  apiKeyEnv?: unknown;
   baseUrl?: unknown;
 }
 

@@ -78,6 +78,8 @@ export interface ScoredMessage {
 export interface RecallOptions {
   sessionId?: string;
   rawHintMessageIds?: string[];
+  rawCandidateMessageIds?: string[];
+  allowWideFallback?: boolean;
 }
 
 export function parseMessage(message: RawMessage): ParsedMessage {
