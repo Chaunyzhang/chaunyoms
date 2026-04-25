@@ -499,6 +499,9 @@ export class ChaunyomsRetrievalService {
       ...verify.warnings,
       ...(context.config.emergencyBrake ? ["emergencyBrake is enabled: automatic compaction/promotion paths are intentionally conservative."] : []),
       ...(status.runtimeStore.enabled ? [] : ["SQLite runtime is disabled; source recall tools will fall back to no-op results."]),
+      ...(status.runtimeStore.ftsStatus === "lazy_not_initialized"
+        ? ["SQLite FTS is lazy and has not been initialized yet; this is expected until oms_grep/deep raw recall needs full-text anchors."]
+        : []),
       ...(status.runtimeStore.experimentalAdapter ? ["SQLite runtime is using Node's experimental node:sqlite adapter; pin a compatible Node version for production deployments."] : []),
       ...(context.config.knowledgePromotionEnabled ? [] : ["knowledgePromotionEnabled is false; Markdown asset promotion is opt-in/disabled."]),
     ];

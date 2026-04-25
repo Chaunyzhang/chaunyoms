@@ -77,6 +77,7 @@ export interface RuntimeStoreStatus {
   enabled: boolean;
   dbPath: string;
   ftsReady: boolean;
+  ftsStatus: "unavailable" | "lazy_not_initialized" | "ready";
   adapter: "node:sqlite" | "unavailable";
   experimentalAdapter: boolean;
   journalMode: "delete" | "wal";
@@ -533,7 +534,7 @@ export class SQLiteRuntimeStore {
         selected.source,
         selected.authority,
         this.itemTargetKind(selected.item),
-        this.itemTargetId(selected.item),
+        this.itemTargetId(selected.item, selected.id),
         "selected",
         selected.score,
         selected.item.tokenCount,
@@ -818,6 +819,7 @@ export class SQLiteRuntimeStore {
         enabled: false,
         dbPath: this.options.dbPath,
         ftsReady: false,
+        ftsStatus: "unavailable",
         adapter: "unavailable",
         experimentalAdapter: false,
         journalMode: this.resolveJournalMode(),
@@ -829,6 +831,7 @@ export class SQLiteRuntimeStore {
         enabled: this.enabled,
         dbPath: this.options.dbPath,
         ftsReady: this.ftsReady,
+        ftsStatus: this.ftsRuntimeStatus(),
         adapter: "node:sqlite",
         experimentalAdapter: true,
         journalMode: this.resolveJournalMode(),
@@ -845,6 +848,7 @@ export class SQLiteRuntimeStore {
         enabled: false,
         dbPath: this.options.dbPath,
         ftsReady: false,
+        ftsStatus: "unavailable",
         adapter: "unavailable",
         experimentalAdapter: false,
         journalMode: this.resolveJournalMode(),
@@ -912,6 +916,7 @@ export class SQLiteRuntimeStore {
         enabled: this.enabled,
         dbPath: this.options.dbPath,
         ftsReady: this.ftsReady,
+        ftsStatus: this.ftsRuntimeStatus(),
         adapter: "node:sqlite",
         experimentalAdapter: true,
         journalMode: this.resolveJournalMode(),
@@ -2134,7 +2139,7 @@ export class SQLiteRuntimeStore {
     return "context_item";
   }
 
-  private itemTargetId(item: ContextPlannerResult["selected"][number]["item"]): string | null {
+  private itemTargetId(item: ContextPlannerResult["selected"][number]["item"], fallbackId?: string): string | null {
     if (item.summaryId) {
       return item.summaryId;
     }
@@ -2147,7 +2152,17 @@ export class SQLiteRuntimeStore {
     if (typeof item.metadata?.docId === "string") {
       return item.metadata.docId;
     }
+    if (fallbackId?.trim()) {
+      return fallbackId;
+    }
     return null;
+  }
+
+  private ftsRuntimeStatus(): RuntimeStoreStatus["ftsStatus"] {
+    if (!this.enabled) {
+      return "unavailable";
+    }
+    return this.ftsReady ? "ready" : "lazy_not_initialized";
   }
 
   private queryTerms(query: string): string[] {

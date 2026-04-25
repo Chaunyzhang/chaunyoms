@@ -92,7 +92,11 @@ async function main(): Promise<void> {
 
     await store.mirror({ messages, summaries, memories });
     assert(store.isEnabled(), "SQLite runtime store should be enabled under Node 24");
+    const initialStatus = store.getStatus();
+    assert(initialStatus.ftsStatus === "lazy_not_initialized", "FTS should be reported as lazy before first FTS-backed query");
     assert(store.grepMessages("15432", { sessionId: "s-1" }).length === 1, "grep should find raw source message");
+    const ftsStatus = store.getStatus();
+    assert(ftsStatus.ftsReady === true && ftsStatus.ftsStatus === "ready", "FTS should report ready after grep initializes it");
     assert(store.expand("summary", "summary-1").messages.length === 2, "expand should follow summary source edges to raw messages");
     assert(store.trace("memory", "memory-1").some((edge) => edge.targetId === "m-1"), "trace should expose memory source edge");
     assert(store.replay({ sessionId: "s-1", startTurn: 1, endTurn: 1 }).length === 2, "replay should return turn messages");
@@ -110,6 +114,10 @@ async function main(): Promise<void> {
       plan,
     });
     assert(store.getLatestContextRuns(1)[0]?.id === "run-1", "context run should be recorded in SQLite");
+    const verify = store.verifyIntegrity();
+    assert(verify.selectedCandidatesWithoutTarget === 0, "selected runtime context candidates should have synthetic target ids for why/trace");
+    const inspect = store.inspectContextRun("run-1");
+    assert(inspect.selected.every((candidate) => typeof candidate.targetId === "string" && candidate.targetId.length > 0), "selected candidates should expose target ids");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
