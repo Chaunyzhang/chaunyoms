@@ -47,13 +47,15 @@ export class SummaryHierarchyEngine {
     const result = await this.generateRollupSummary(candidateGroup, summaryModel, maxOutputTokens);
     const sourceMessageIds = [...new Set(candidateGroup.flatMap((entry) => entry.sourceMessageIds ?? []))];
     const sourceSummaryIds = candidateGroup.map((entry) => entry.id);
+    const sharedProjectId = this.getSharedValue(candidateGroup, (entry) => entry.projectId) ?? identity.projectId;
+    const sharedTopicId = this.getSharedValue(candidateGroup, (entry) => entry.topicId) ?? identity.topicId;
     const entry: SummaryEntry = {
       id: randomUUID(),
       eventId: buildStableEventId("summary", `${sessionId}|rollup|${sourceSummaryIds.join("|")}`),
       sessionId,
       agentId,
-      projectId: candidateGroup[0].projectId ?? identity.projectId,
-      topicId: candidateGroup[0].topicId ?? identity.topicId,
+      projectId: sharedProjectId,
+      topicId: sharedTopicId,
       recordStatus: "active",
       summary: result.summary,
       keywords: result.keywords,
@@ -107,10 +109,12 @@ export class SummaryHierarchyEngine {
   }
 
   private selectRollupGroup(summaries: SummaryEntry[]): SummaryEntry[] | null {
-    const grouped = new Map<string, SummaryEntry[]>();
-    for (const summary of summaries
+    const activeRoots = summaries
       .filter((entry) => entry.recordStatus === "active")
-      .sort((left, right) => left.startTurn - right.startTurn || left.endTurn - right.endTurn)) {
+      .sort((left, right) => left.startTurn - right.startTurn || left.endTurn - right.endTurn);
+
+    const grouped = new Map<string, SummaryEntry[]>();
+    for (const summary of activeRoots) {
       const key = `${summary.projectId ?? "none"}|${summary.summaryLevel ?? 1}`;
       const bucket = grouped.get(key) ?? [];
       bucket.push(summary);
@@ -123,7 +127,33 @@ export class SummaryHierarchyEngine {
       }
       return bucket.slice(0, 3);
     }
+
+    const byLevel = new Map<number, SummaryEntry[]>();
+    for (const summary of activeRoots) {
+      const level = summary.summaryLevel ?? 1;
+      const bucket = byLevel.get(level) ?? [];
+      bucket.push(summary);
+      byLevel.set(level, bucket);
+    }
+
+    for (const bucket of byLevel.values()) {
+      if (bucket.length < 3) {
+        continue;
+      }
+      return bucket.slice(0, 3);
+    }
     return null;
+  }
+
+  private getSharedValue(
+    entries: SummaryEntry[],
+    pick: (entry: SummaryEntry) => string | undefined,
+  ): string | undefined {
+    const first = pick(entries[0]);
+    if (!first) {
+      return undefined;
+    }
+    return entries.every((entry) => pick(entry) === first) ? first : undefined;
   }
 
   private async generateRollupSummary(

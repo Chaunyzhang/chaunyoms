@@ -79,7 +79,9 @@ export interface RecallOptions {
   sessionId?: string;
   rawHintMessageIds?: string[];
   rawCandidateMessageIds?: string[];
+  allowRawFirst?: boolean;
   allowWideFallback?: boolean;
+  includeSummaryItems?: boolean;
 }
 
 export function parseMessage(message: RawMessage): ParsedMessage {

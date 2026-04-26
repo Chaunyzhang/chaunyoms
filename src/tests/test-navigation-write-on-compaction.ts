@@ -104,14 +104,13 @@ async function main(): Promise<void> {
     turnNumber: 1,
   });
 
-  const firstAfterTurn = await runtime.afterTurn({
+  await runtime.afterTurn({
     sessionId,
     config,
     totalBudget: 1000,
     systemPromptTokens: 0,
     runtimeMessages: [],
   });
-  assert(firstAfterTurn.compactedThisTurn === false, "expected first afterTurn to avoid compaction");
 
   const workspaceMemoryDir = path.join(workspaceDir, "memory");
   const vaultNavigationPath = path.join(
@@ -124,6 +123,8 @@ async function main(): Promise<void> {
   assert(!(await exists(vaultNavigationPath)), "expected vault navigation snapshot to stay absent before compaction");
   const preCompactionFiles = await readdir(workspaceMemoryDir).catch(() => []);
   assert(preCompactionFiles.length === 0, "expected workspace memory snapshots to stay empty before compaction");
+  let stores = await runtime.getSessionStores({ sessionId, config });
+  assert(stores.summaryStore.getAllSummaries().length === 0, "expected afterTurn not to create summaries");
 
   for (let turn = 2; turn <= 7; turn += 1) {
     await runtime.ingest({
@@ -144,19 +145,31 @@ async function main(): Promise<void> {
     });
   }
 
-  const secondAfterTurn = await runtime.afterTurn({
+  await runtime.assemble({
     sessionId,
     config,
     totalBudget: 200,
     systemPromptTokens: 0,
     runtimeMessages: [],
   });
-  assert(secondAfterTurn.compactedThisTurn === true, "expected second afterTurn to trigger compaction");
+
+  const summariesAfterAssemble = stores.summaryStore.getAllSummaries().length;
+  await runtime.afterTurn({
+    sessionId,
+    config,
+    totalBudget: 200,
+    systemPromptTokens: 0,
+    runtimeMessages: [],
+  });
   assert(await exists(vaultNavigationPath), "expected vault navigation snapshot to be written after compaction");
   const postCompactionFiles = await readdir(workspaceMemoryDir);
   assert(postCompactionFiles.length > 0, "expected workspace memory snapshot to be written after compaction");
 
-  const stores = await runtime.getSessionStores({ sessionId, config });
+  stores = await runtime.getSessionStores({ sessionId, config });
+  assert(
+    stores.summaryStore.getAllSummaries().length === summariesAfterAssemble,
+    "expected afterTurn not to create additional summaries after assemble compaction",
+  );
   assert(
     stores.summaryStore.getAllSummaries().length > 0,
     "expected compaction-triggered navigation write test to create at least one summary",

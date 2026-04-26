@@ -103,10 +103,12 @@ export class ContextAssembler {
     if (budget <= 0) {
       return [];
     }
-    const rootSummaries = summaryStore.getRootSummaries({ sessionId });
+    const rootSummaries = summaryStore
+      .getRootSummaries({ sessionId })
+      .filter((entry) => entry.nodeKind === "branch" || (entry.summaryLevel ?? 1) > 1);
     const sourceSummaries = rootSummaries.length > 0
       ? rootSummaries
-      : summaryStore.getActiveSummaries({ sessionId });
+      : [];
     const summaries = [...sourceSummaries].sort(
       (left, right) => right.endTurn - left.endTurn || right.startTurn - left.startTurn,
     );
@@ -148,8 +150,10 @@ export class ContextAssembler {
 
     const content = [
       "[oms_recall_guidance]",
-      "Compacted summaries exist in chaunyoms.",
-      "Use `memory_retrieve` as the primary recall entrypoint; use `oms_expand`/`oms_trace` only when source inspection is explicitly needed.",
+      "Compacted source messages and summaries exist in chaunyoms.",
+      "Default context only carries higher-level summaries; level-1 base summaries are retained out of context as recall substrate.",
+      "Use `memory_retrieve` as the primary recall entrypoint when the current higher-level summary is insufficient or old details appear missing.",
+      "Use `oms_expand`/`oms_trace` to descend from summary hits to level-1 base summaries and then source messages.",
       "Treat navigation/index hits as hints, not final facts.",
       "For exact constraints/parameters/quotes, continue recall to source messages.",
     ].join("\n");

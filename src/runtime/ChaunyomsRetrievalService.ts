@@ -1,6 +1,7 @@
 import { ContextPlanner } from "../engines/ContextPlanner";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
+import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
 import {
   AnswerCandidate,
   ContextItem,
@@ -12,7 +13,9 @@ import {
   RecallResult,
   RetrievalDecision,
   SemanticCandidate,
+  SourceTrace,
   SummaryEntry,
+  DagTraversalStep,
 } from "../types";
 import {
   LifecycleContext,
@@ -32,6 +35,12 @@ interface SemanticExpansionResult {
   durableHits: DurableMemoryEntry[];
   summaryHits: SummaryEntry[];
   projectHit: ProjectRecord | null;
+}
+
+interface RecallPresentationOptions {
+  maxItems: number;
+  maxCharsPerItem: number;
+  includeFullTrace: boolean;
 }
 
 export interface RetrievalLayerDependencies {
@@ -56,6 +65,8 @@ export class ChaunyomsRetrievalService {
     const context = this.resolveContext(args);
     const stores = await this.runtime.getSessionStores(context);
     const query = this.getQuery(args);
+    const scope = this.getScopeArg(args);
+    const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
     const semanticExpansion = await this.collectSemanticExpansion({
       query,
@@ -66,7 +77,7 @@ export class ChaunyomsRetrievalService {
         query,
         context.config.semanticCandidateLimit,
       ),
-      summaryHits: stores.summaryStore.search(query, { sessionId: context.sessionId }),
+      summaryHits: stores.summaryStore.search(query, { sessionId: scopedSessionId }),
       projects: stores.projectStore.getAll().filter((project) => project.status !== "archived"),
       matchedProject: decision.matchedProjectId
         ? stores.projectStore.findById(decision.matchedProjectId)
@@ -100,6 +111,8 @@ export class ChaunyomsRetrievalService {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
 
+    const scope = this.getScopeArg(args);
+    const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
@@ -221,24 +234,37 @@ export class ChaunyomsRetrievalService {
         );
       }
 
+      const timings: Record<string, number> = {};
+      const startedAt = Date.now();
+      const ftsStartedAt = Date.now();
       const rawFtsHints = this.shouldUseFtsRecallHints(args, context)
         ? (await this.runtime.getRuntimeStore(context)).grepMessages(query, {
-            sessionId: context.sessionId,
+            sessionId: scopedSessionId,
             limit: this.resolveRawFtsHintLimit(args),
             contextTurns: 0,
           })
         : [];
+      timings.ftsMs = Date.now() - ftsStartedAt;
       const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
       const rawFtsMessageIds = rawFtsHints.map((hit) => hit.message.id);
+      const recallStartedAt = Date.now();
       const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget, {
-        sessionId: context.sessionId,
+        sessionId: scopedSessionId,
         rawHintMessageIds: rawFtsMessageIds,
         rawCandidateMessageIds: rawFtsMessageIds,
+        allowRawFirst: decision.reason !== "keyword_query_with_compacted_history",
+        allowWideFallback: this.allowWideRawFallback(args, decision),
+        includeSummaryItems: true,
       });
+      timings.resolveMs = Date.now() - recallStartedAt;
+      const planStartedAt = Date.now();
       const planned = this.planRecallItems(result, recallBudget);
+      timings.planMs = Date.now() - planStartedAt;
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
+      const presentation = this.resolveRecallPresentationOptions(args);
+      timings.totalMs = Date.now() - startedAt;
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, planned.items, result.sourceTrace, result.answerCandidates) }],
+        content: [{ type: "text", text: this.formatRecallText(query, planned.items, result.sourceTrace, result.answerCandidates, presentation) }],
         details: {
           ok: true,
           route: decision.route,
@@ -250,14 +276,19 @@ export class ChaunyomsRetrievalService {
           recallStrategy: result.strategy ?? "summary_navigation",
           rawCandidateCount: result.rawCandidateCount ?? 0,
           rawFtsHintCount: rawFtsHints.length,
-          answerCandidates: result.answerCandidates ?? [],
           autoRecall: true,
           autoRecallReason: this.explainAutoRecall(decision, context),
           routePlan: decision.routePlan,
           layerScores: decision.layerScores ?? [],
           explanation: decision.explanation,
-          dagTrace: result.dagTrace,
-          sourceTrace: result.sourceTrace,
+          timings,
+          recallBudget,
+          rawFtsHintLimit: this.resolveRawFtsHintLimit(args),
+          scope,
+          sessionId: scopedSessionId ?? null,
+          dagTrace: presentation.includeFullTrace ? result.dagTrace : this.compactDagTrace(result.dagTrace),
+          sourceTrace: presentation.includeFullTrace ? result.sourceTrace : this.compactSourceTrace(result.sourceTrace),
+          answerCandidates: this.compactAnswerCandidates(result.answerCandidates ?? [], presentation),
           plannerRunId: planned.plan.runId,
           plannerRejectedCount: planned.plan.rejected.length,
         },
@@ -348,7 +379,11 @@ export class ChaunyomsRetrievalService {
     return {
       content: [{
         type: "text",
-        text: this.formatExpandResult(kind, id, result),
+        text: this.formatExpandResult(kind, id, result, {
+          full: this.getBooleanArg(args, "full", false),
+          maxMessages: Math.max(1, Math.min(40, Math.floor(this.getOptionalNumberArg(args, "maxMessages") ?? 8))),
+          maxCharsPerMessage: Math.max(300, Math.min(4000, Math.floor(this.getOptionalNumberArg(args, "maxCharsPerMessage") ?? 1200))),
+        }),
       }],
       details: {
         ok: true,
@@ -360,7 +395,7 @@ export class ChaunyomsRetrievalService {
         messageCount: result.messages.length,
         summaryCount: result.summaries.length,
         edgeCount: result.edges.length,
-        sourceTrace: result.edges,
+        sourceTrace: result.edges.slice(0, this.getBooleanArg(args, "full", false) ? result.edges.length : 20),
       },
     };
   }
@@ -970,6 +1005,69 @@ export class ChaunyomsRetrievalService {
     return undefined;
   }
 
+  private allowWideRawFallback(args: unknown, decision: RetrievalDecision): boolean {
+    if (this.isRecord(args) && args.wideRawFallback === true) {
+      return true;
+    }
+    // Keyword lookups over compacted corpora should stay summary-guided by default.
+    // Wide raw scans are still available for explicit deep/quality recall.
+    return decision.reason !== "keyword_query_with_compacted_history" ||
+      (this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true));
+  }
+
+  private resolveRecallPresentationOptions(args: unknown): RecallPresentationOptions {
+    const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
+    const maxItems = this.getOptionalNumberArg(args, "maxItems");
+    const maxCharsPerItem = this.getOptionalNumberArg(args, "maxCharsPerItem");
+    return {
+      maxItems: Math.max(1, Math.min(12, Math.floor(maxItems ?? (deepRecall ? 8 : 4)))),
+      maxCharsPerItem: Math.max(240, Math.min(2000, Math.floor(maxCharsPerItem ?? (deepRecall ? 1200 : 700)))),
+      includeFullTrace: this.getBooleanArg(args, "debugTrace", false) || this.getBooleanArg(args, "verbose", false),
+    };
+  }
+
+  private compactAnswerCandidates(
+    candidates: AnswerCandidate[],
+    presentation: RecallPresentationOptions,
+  ): AnswerCandidate[] {
+    if (presentation.includeFullTrace) {
+      return candidates;
+    }
+    return candidates.slice(0, 5).map((candidate) => ({
+      ...candidate,
+      evidenceMessageIds: candidate.evidenceMessageIds.slice(0, 3),
+    }));
+  }
+
+  private compactSourceTrace(sourceTrace: SourceTrace[]): Array<Record<string, unknown>> {
+    return sourceTrace.slice(0, 6).map((trace) => ({
+      route: trace.route,
+      summaryId: trace.summaryId,
+      strategy: trace.strategy,
+      verified: trace.verified,
+      reason: trace.reason,
+      resolvedMessageCount: trace.resolvedMessageCount,
+      turnStart: trace.turnStart,
+      turnEnd: trace.turnEnd,
+      sequenceMin: trace.sequenceMin,
+      sequenceMax: trace.sequenceMax,
+      messageIds: trace.messageIds?.slice(0, 3),
+      messageIdCount: trace.messageIds?.length ?? 0,
+    }));
+  }
+
+  private compactDagTrace(dagTrace: DagTraversalStep[]): Array<Record<string, unknown>> {
+    return dagTrace.slice(0, 8).map((step) => ({
+      summaryId: step.summaryId,
+      summaryLevel: step.summaryLevel,
+      nodeKind: step.nodeKind,
+      score: step.score,
+      action: step.action,
+      reasons: step.reasons.slice(0, 6),
+      childCount: step.childSummaryIds?.length ?? 0,
+    }));
+  }
+
   private planRecallItems(result: RecallResult, recallBudget: number): {
     items: ContextItem[];
     consumedTokens: number;
@@ -996,24 +1094,24 @@ export class ChaunyomsRetrievalService {
 
   private resolveRecallBudget(args: unknown, totalBudget: number): number {
     const budget = this.isRecord(args) ? args.budget : undefined;
-    return Math.max(
-      256,
-      Math.floor(
-        typeof budget === "number" && Number.isFinite(budget)
-          ? budget
-          : totalBudget * 0.2,
-      ),
-    );
+    const maxAutomaticBudget = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true)
+      ? Math.min(totalBudget * 0.05, 10000)
+      : Math.min(totalBudget * 0.015, 3000);
+    const resolvedBudget = typeof budget === "number" && Number.isFinite(budget)
+      ? Math.min(budget, totalBudget * 0.1, 20000)
+      : maxAutomaticBudget;
+    return Math.max(256, Math.floor(resolvedBudget));
   }
 
   private resolveRawFtsHintLimit(args: unknown): number {
     const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
-    const floor = deepRecall ? 96 : 48;
+    const defaultLimit = deepRecall ? 48 : 16;
     const explicit = this.getOptionalNumberArg(args, "rawFtsLimit");
     if (typeof explicit === "number") {
-      return Math.max(floor, Math.min(200, Math.floor(explicit)));
+      const floor = deepRecall ? defaultLimit : 1;
+      return Math.max(floor, Math.min(100, Math.floor(explicit)));
     }
-    return floor;
+    return defaultLimit;
   }
 
   private getScopeArg(args: unknown): "session" | "agent" {
@@ -1191,6 +1289,11 @@ export class ChaunyomsRetrievalService {
     items: ContextItem[],
     sourceTrace: Array<{ summaryId?: string; strategy: string; verified: boolean; resolvedMessageCount: number }> = [],
     answerCandidates: AnswerCandidate[] = [],
+    presentation: RecallPresentationOptions = {
+      maxItems: 4,
+      maxCharsPerItem: 700,
+      includeFullTrace: false,
+    },
   ): string {
     if (items.length === 0) {
       if (answerCandidates.length === 0) {
@@ -1206,28 +1309,142 @@ export class ChaunyomsRetrievalService {
           "",
         ].join("\n")
       : "";
-    const messages = items
+    const summaryItems = items.filter((item) => item.kind === "summary");
+    const messageItems = items
+      .filter((item) => item.kind !== "summary")
+      .sort((left, right) => this.scoreRecallDisplayItem(right, query) - this.scoreRecallDisplayItem(left, query));
+    const localMatches = this.buildLocalSourceMatches(messageItems, query).slice(0, 3);
+    const summaryBudget = Math.min(2, Math.max(1, Math.floor(presentation.maxItems / 2)));
+    const messageBudget = Math.max(1, presentation.maxItems - summaryBudget);
+    const visibleItems = messageItems.length > 0
+      ? [
+          ...messageItems.slice(0, messageBudget),
+          ...summaryItems.slice(0, summaryBudget),
+        ].slice(0, presentation.maxItems)
+      : summaryItems.slice(0, presentation.maxItems);
+    const localMatchText = localMatches.length > 0
+      ? [
+          "Top local source matches (prefer these over broad multi-dossier summaries):",
+          ...localMatches.map((match, index) =>
+            `${index + 1}. ${match.slug ? `slug ${match.slug}` : "no slug anchor"} at turn ${match.turnNumber ?? "?"} score=${match.score}${match.roles.length > 0 ? ` roles=${match.roles.slice(0, 3).join(",")}` : ""}: ${this.truncateText(match.excerpt, 260)}`,
+          ),
+          "",
+        ].join("\n")
+      : "";
+    const messages = visibleItems
       .map(
-        (item) =>
-          `[turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}: ${String(item.content ?? "")}`,
+        (item) => {
+          const label = item.kind === "summary"
+            ? `[summary ${item.summaryId ?? "?"}]`
+            : `[turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}`;
+          return `${label}: ${this.truncateText(String(item.content ?? ""), presentation.maxCharsPerItem)}`;
+        },
       )
       .join("\n\n");
+    const omitted = items.length > visibleItems.length
+      ? `\n\n... ${items.length - visibleItems.length} more hit(s) omitted. Use oms_expand with a listed summaryId/messageId, or call memory_retrieve with deepRecall=true for a wider pull.`
+      : "";
     const traces = sourceTrace.length > 0
       ? [
           "",
           "Source trace:",
-          ...sourceTrace.map((trace) =>
+          ...sourceTrace.slice(0, presentation.includeFullTrace ? sourceTrace.length : 6).map((trace) =>
             `- summary ${trace.summaryId ?? "?"} -> ${trace.strategy} -> ${trace.verified ? "verified" : "unverified"} (${trace.resolvedMessageCount} messages)`,
           ),
+          ...(!presentation.includeFullTrace && sourceTrace.length > 6 ? [`- ... ${sourceTrace.length - 6} more source trace node(s) omitted`] : []),
         ].join("\n")
       : "";
     return [
       `Historical source hits for: ${query}`,
       "",
       answers,
+      localMatchText,
       messages,
+      omitted,
       traces,
     ].filter(Boolean).join("\n");
+  }
+
+  private truncateText(value: string, maxChars: number): string {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (normalized.length <= maxChars) {
+      return normalized;
+    }
+    return `${normalized.slice(0, Math.max(0, maxChars - 20)).trimEnd()} ... [truncated]`;
+  }
+
+  private scoreRecallDisplayItem(item: ContextItem, query: string): number {
+    const content = String(item.content ?? "").toLowerCase();
+    const terms = this.queryTerms(query);
+    let score = 0;
+    for (const term of terms) {
+      if (content.includes(term.toLowerCase())) {
+        score += term.length >= 6 ? 4 : 2;
+      }
+    }
+    const anchors = query.match(/\b[A-Z][A-Z0-9_]{2,}\b|\b\d{2,}\b/g) ?? [];
+    for (const anchor of anchors) {
+      if (String(item.content ?? "").includes(anchor)) {
+        score += 8;
+      }
+    }
+    score += scoreIntentRoleMatch(query, String(item.content ?? "")).score;
+    return score;
+  }
+
+  private buildLocalSourceMatches(
+    messageItems: ContextItem[],
+    query: string,
+  ): Array<{ slug: string | null; turnNumber: number | undefined; score: number; roles: string[]; excerpt: string }> {
+    return messageItems
+      .map((item) => {
+        const content = String(item.content ?? "");
+        const roleMatch = scoreIntentRoleMatch(query, content);
+        return {
+          slug: this.extractBestSlugAnchor(content, query),
+          turnNumber: typeof item.turnNumber === "number" ? item.turnNumber : undefined,
+          score: this.scoreRecallDisplayItem(item, query),
+          roles: roleMatch.roles,
+          excerpt: content,
+        };
+      })
+      .filter((match) => match.score > 0 || match.slug !== null)
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        if (left.slug && !right.slug) {
+          return -1;
+        }
+        if (!left.slug && right.slug) {
+          return 1;
+        }
+        return (left.turnNumber ?? Number.MAX_SAFE_INTEGER) - (right.turnNumber ?? Number.MAX_SAFE_INTEGER);
+      });
+  }
+
+  private extractBestSlugAnchor(content: string, query: string): string | null {
+    const explicitSlug = content.match(/(?:^|\||\b)slug\s*(?:\||:|=)\s*`?(\d{2}_[a-z0-9_]+)`?/i)?.[1];
+    if (explicitSlug) {
+      return explicitSlug;
+    }
+    const slugs = [...new Set(content.match(/\b\d{2}_[a-z0-9_]+\b/gi) ?? [])];
+    if (slugs.length === 0) {
+      return null;
+    }
+    if (slugs.length === 1) {
+      return slugs[0];
+    }
+    const terms = this.queryTerms(query);
+    const windows = slugs.map((slug) => {
+      const index = content.toLowerCase().indexOf(slug.toLowerCase());
+      const start = Math.max(0, index - 500);
+      const end = Math.min(content.length, index + 500);
+      const window = content.slice(start, end).toLowerCase();
+      const score = terms.reduce((sum, term) => sum + (window.includes(term.toLowerCase()) ? (term.length >= 6 ? 4 : 2) : 0), 0);
+      return { slug, score };
+    });
+    return windows.sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug))[0]?.slug ?? slugs[0];
   }
 
   private shouldProbeDurableMemory(query: string): boolean {
@@ -1619,15 +1836,21 @@ export class ChaunyomsRetrievalService {
     ].join("\n");
   }
 
-  private formatExpandResult(kind: string, id: string, result: OmsExpandResult): string {
+  private formatExpandResult(
+    kind: string,
+    id: string,
+    result: OmsExpandResult,
+    options: { full: boolean; maxMessages: number; maxCharsPerMessage: number },
+  ): string {
     if (!result.target) {
       return `No runtime target found for ${kind}:${id}`;
     }
-    const messages = result.messages.map((message) =>
-      `[turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+    const visibleMessages = options.full ? result.messages : result.messages.slice(0, options.maxMessages);
+    const messages = visibleMessages.map((message) =>
+      `[turn ${message.turnNumber}] ${message.role}: ${options.full ? message.content : this.truncateText(message.content, options.maxCharsPerMessage)}`,
     );
     const summaries = result.summaries.map((summary) =>
-      `[summary ${summary.id}] turns ${summary.startTurn}-${summary.endTurn}: ${summary.summary}`,
+      `[summary ${summary.id}] turns ${summary.startTurn}-${summary.endTurn}: ${this.truncateText(summary.summary, options.full ? 10000 : 1200)}`,
     );
     const edges = result.edges.map((edge) =>
       `${edge.sourceKind}:${edge.sourceId} --${edge.relation}--> ${edge.targetKind}:${edge.targetId}`,
@@ -1643,6 +1866,9 @@ export class ChaunyomsRetrievalService {
       "",
       "Raw messages:",
       messages.length > 0 ? messages.join("\n\n") : "(none)",
+      !options.full && result.messages.length > visibleMessages.length
+        ? `\n... ${result.messages.length - visibleMessages.length} more raw message(s) omitted. Re-run oms_expand with full=true if you need the whole source window.`
+        : "",
     ].join("\n");
   }
 

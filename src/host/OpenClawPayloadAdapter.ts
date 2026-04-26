@@ -4,7 +4,7 @@ import path from "node:path";
 import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
 import { getOpenClawConfigPath } from "./HostPathResolver";
-import { isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
+import { HostRecord, isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
 
 export interface ToolConfigResult {
   enabled: boolean;
@@ -384,12 +384,10 @@ export class OpenClawPayloadAdapter {
       sharedDataDir,
       memoryVaultDir,
       knowledgeBaseDir,
-      contextWindow: this.resolveNumberConfig(
-        [
-          pluginConfig.contextWindow,
-          payload?.contextWindow,
-        ],
-        baseConfig.contextWindow,
+      contextWindow: this.resolveConfiguredContextWindow(
+        pluginConfig,
+        payload,
+        baseConfig,
       ),
       contextThreshold: this.resolveNumberConfig(
         [
@@ -600,6 +598,36 @@ export class OpenClawPayloadAdapter {
     return isHostRecord(metadata) ? metadata : undefined;
   }
 
+  private resolveConfiguredContextWindow(
+    pluginConfig: Record<string, unknown>,
+    payload: OpenClawPayloadLike,
+    baseConfig: BridgeConfig,
+  ): number {
+    const explicitPluginWindow = this.resolvePositiveNumber([
+      pluginConfig.contextWindow,
+      pluginConfig.maxContextWindow,
+      pluginConfig.contextWindowTokens,
+    ]);
+    if (explicitPluginWindow !== null) {
+      return explicitPluginWindow;
+    }
+
+    const hostWindow = this.resolveHostModelContextWindow(payload);
+    if (hostWindow !== null) {
+      return hostWindow;
+    }
+
+    const payloadWindow = this.resolvePositiveNumber([
+      payload?.contextWindow,
+      payload?.context?.contextWindow,
+    ]);
+    if (payloadWindow !== null) {
+      return payloadWindow;
+    }
+
+    return baseConfig.contextWindow;
+  }
+
   private resolveContextWindow(
     payload: OpenClawPayloadLike,
     config: BridgeConfig,
@@ -620,6 +648,129 @@ export class OpenClawPayloadAdapter {
       return runtimeBudget;
     }
     return configuredBudget;
+  }
+
+  private resolveHostModelContextWindow(payload: OpenClawPayloadLike): number | null {
+    const api = this.getApi();
+    const configCandidates = [
+      api?.config,
+      api?.context?.config,
+      api?.runtime?.config,
+    ].filter((config): config is NonNullable<typeof config> => isHostRecord(config));
+    const modelRefs = [
+      this.resolveModelRefCandidate(payload?.model),
+      this.resolveModelRefCandidate(api?.context?.model),
+      this.resolveModelRefCandidate(api?.runtime?.model),
+      ...configCandidates.map((config) => {
+        const primary = config?.agents?.defaults?.model?.primary;
+        return typeof primary === "string" && primary.trim().length > 0
+          ? primary.trim()
+          : undefined;
+      }),
+    ].filter((value, index, list): value is string =>
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      list.indexOf(value) === index,
+    );
+
+    for (const modelRef of modelRefs) {
+      for (const config of configCandidates) {
+        const fromDeclaredModel = this.resolveDeclaredModelContextWindow(config, modelRef);
+        if (fromDeclaredModel !== null) {
+          return fromDeclaredModel;
+        }
+
+        const fromProviderModel = this.resolveProviderModelContextWindow(config, modelRef);
+        if (fromProviderModel !== null) {
+          return fromProviderModel;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private resolveDeclaredModelContextWindow(
+    config: HostRecord,
+    modelRef: string,
+  ): number | null {
+    const defaults = config.agents;
+    if (!isHostRecord(defaults)) {
+      return null;
+    }
+    const agentsDefaults = defaults.defaults;
+    if (!isHostRecord(agentsDefaults)) {
+      return null;
+    }
+    const models = agentsDefaults.models;
+    if (!isHostRecord(models)) {
+      return null;
+    }
+
+    const modelConfig = models[modelRef] ?? models[this.stripProviderId(modelRef)];
+    return this.resolveContextWindowFromRecord(modelConfig);
+  }
+
+  private resolveProviderModelContextWindow(
+    config: HostRecord,
+    modelRef: string,
+  ): number | null {
+    const providerId = this.resolveProviderId(modelRef);
+    if (!providerId) {
+      return null;
+    }
+    const modelId = this.stripProviderId(modelRef);
+    const modelsConfig = config.models;
+    if (!isHostRecord(modelsConfig)) {
+      return null;
+    }
+    const providers = modelsConfig.providers;
+    if (!isHostRecord(providers)) {
+      return null;
+    }
+    const providerConfig = providers[providerId];
+    if (!isHostRecord(providerConfig)) {
+      return null;
+    }
+    const providerModels = providerConfig.models;
+    if (!Array.isArray(providerModels)) {
+      return this.resolveContextWindowFromRecord(providerConfig);
+    }
+
+    const matched = providerModels.find((entry) => {
+      if (!isHostRecord(entry)) {
+        return false;
+      }
+      const ids = [
+        entry.id,
+        entry.name,
+        entry.model,
+        entry.ref,
+        entry.modelRef,
+        entry.fullRef,
+      ].filter((value): value is string => typeof value === "string");
+      return ids.some((id) =>
+        id.trim() === modelId ||
+        id.trim() === modelRef ||
+        `${providerId}/${id.trim()}` === modelRef,
+      );
+    });
+
+    return this.resolveContextWindowFromRecord(matched);
+  }
+
+  private resolveContextWindowFromRecord(value: unknown): number | null {
+    if (!isHostRecord(value)) {
+      return null;
+    }
+    return this.resolvePositiveNumber([
+      value.contextWindow,
+      value.context_window,
+      value.maxContextWindow,
+      value.maxContextTokens,
+      value.contextLength,
+      value.maxInputTokens,
+    ]);
   }
 
   private resolveSystemPromptTokens(payload: OpenClawPayloadLike): number {
@@ -877,6 +1028,33 @@ export class OpenClawPayloadAdapter {
       }
     }
     return fallback;
+  }
+
+  private resolvePositiveNumber(candidates: unknown[]): number | null {
+    for (const candidate of candidates) {
+      const value = typeof candidate === "number"
+        ? candidate
+        : typeof candidate === "string" && candidate.trim().length > 0
+          ? Number(candidate)
+          : Number.NaN;
+      if (Number.isFinite(value) && value > 0) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  private resolveProviderId(modelRef: string): string | null {
+    const slashIndex = modelRef.indexOf("/");
+    if (slashIndex <= 0) {
+      return null;
+    }
+    return modelRef.slice(0, slashIndex);
+  }
+
+  private stripProviderId(modelRef: string): string {
+    const slashIndex = modelRef.indexOf("/");
+    return slashIndex <= 0 ? modelRef.trim() : modelRef.slice(slashIndex + 1).trim();
   }
 
   private resolveNumberConfig(candidates: unknown[], fallback: number): number {

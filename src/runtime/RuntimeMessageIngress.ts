@@ -5,6 +5,7 @@ export type RuntimeMessageClassification =
   | "assistant_message"
   | "tool_output"
   | "tool_receipt"
+  | "chaunyoms_context"
   | "system_message"
   | "heartbeat"
   | "control_plane"
@@ -59,6 +60,28 @@ const PSEUDO_USER_PATTERNS = [
   /^Observation\s*:/i,
 ];
 
+const CHAUNYOMS_CONTEXT_PREFIX_PATTERNS = [
+  /^\[ChaunyOMS recalled memory\b[^\]]*\]/i,
+  /^ChaunyOMS recalled memory\b/i,
+  /^\[oms_recall_guidance\]/i,
+  /^\[shared_cognition\]/i,
+  /^\[navigation\]/i,
+  /^\[knowledge_base_index\]/i,
+];
+
+const CHAUNYOMS_MEMORY_PREFIX_PATTERN = /^\[durable_memory:[^\]]+\]/i;
+
+const CHAUNYOMS_METADATA_MARKERS = new Set([
+  "chaunyoms",
+  "chaunyoms_summary",
+  "untrusted_memory",
+  "durable_memory",
+  "oms_recall_guidance",
+  "shared_cognition",
+  "navigation",
+  "knowledge_base_index",
+]);
+
 export class RuntimeMessageIngress {
   inspect(message: RuntimeMessageSnapshot): RuntimeMessageIngressDecision {
     const normalizedText = this.normalize(message.text);
@@ -68,6 +91,10 @@ export class RuntimeMessageIngress {
 
     if (message.role === "system") {
       return this.skip("system_message", normalizedText, "system_role_not_persisted");
+    }
+
+    if (this.isChaunyomsInjectedContext(message, normalizedText)) {
+      return this.skip("chaunyoms_context", normalizedText, "chaunyoms_context_replay");
     }
 
     if (HEARTBEAT_PATTERNS.some((pattern) => pattern.test(normalizedText))) {
@@ -171,6 +198,66 @@ export class RuntimeMessageIngress {
       }
       return /tool|command|process|control|system|hook|orchestr|host/i.test(value);
     });
+  }
+
+  private isChaunyomsInjectedContext(
+    message: RuntimeMessageSnapshot,
+    normalizedText: string,
+  ): boolean {
+    const metadataSignals = this.hasChaunyomsMetadataSignal(message);
+    const rawText = message.text.trim();
+    const generatedWrapper =
+      CHAUNYOMS_CONTEXT_PREFIX_PATTERNS.some((pattern) =>
+        pattern.test(rawText) || pattern.test(normalizedText),
+      );
+
+    if (generatedWrapper) {
+      return true;
+    }
+
+    if (!metadataSignals) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private hasChaunyomsMetadataSignal(message: RuntimeMessageSnapshot): boolean {
+    const metadata = message.metadata;
+    if (!metadata) {
+      return false;
+    }
+
+    const candidates = [
+      metadata.authority,
+      metadata.source,
+      metadata.layer,
+      metadata.kind,
+      metadata.origin,
+      metadata.type,
+      metadata.name,
+    ];
+
+    if (candidates.some((value) => this.isChaunyomsMarker(value))) {
+      return true;
+    }
+
+    if (CHAUNYOMS_MEMORY_PREFIX_PATTERN.test(message.text.trim())) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private isChaunyomsMarker(value: unknown): boolean {
+    if (typeof value !== "string") {
+      return false;
+    }
+
+    const normalized = value.trim().toLowerCase();
+    return CHAUNYOMS_METADATA_MARKERS.has(normalized) ||
+      normalized.startsWith("chaunyoms_") ||
+      normalized.startsWith("chaunyoms:");
   }
 
   private isLowValueToolReceipt(text: string): boolean {

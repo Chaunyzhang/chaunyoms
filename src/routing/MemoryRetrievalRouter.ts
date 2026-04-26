@@ -11,6 +11,11 @@ const KNOWLEDGE_ADVISORY_RE = /(想想|发散|灵感|创造力|创意|知识广�
 const RAW_KNOWLEDGE_RE = /(raw knowledge|raw notes|manual knowledge|manual notes|原始知识|原始资料|手动知识|手动资料|手动笔记)/i;
 const FUZZY_SEARCH_RE = /(类似|相关|找一下|搜一下|something about|something related|fuzzy)/i;
 const COMPLEX_TASK_RE = /(怎么推进|怎么做|计划|方案|顺序|依赖|风险|tradeoff|compare|versus| vs |plan|sequence|dependency|risk|rollout|migration|how should|what's left|what remains)/i;
+const KEYWORD_LOOKUP_STOP_WORDS = new Set([
+  "about", "after", "answer", "before", "current", "does", "from", "have",
+  "history", "into", "memory", "question", "recall", "source", "that", "the",
+  "this", "what", "when", "where", "which", "with", "would", "your",
+]);
 
 export interface RouteContext {
   hasKnowledgeHits?: boolean;
@@ -47,6 +52,14 @@ export class MemoryRetrievalRouter {
     const fuzzyLookup = FUZZY_SEARCH_RE.test(normalized);
     const complexTask = COMPLEX_TASK_RE.test(normalized) || context.queryComplexity === "high";
     const explicitProjectState = this.isExplicitProjectStateQuery(normalized);
+    const keywordHistoryLookup = context.hasCompactedHistory === true &&
+      this.keywordLookupTerms(normalized).length >= 4 &&
+      !asksCurrentFact &&
+      !mentionsKnowledge &&
+      !asksRawKnowledge &&
+      !asksDurable &&
+      !complexTask &&
+      !(asksProjectState && explicitProjectState);
 
     if (asksDurable && context.hasDurableHits) {
       return this.decision(
@@ -87,6 +100,20 @@ export class MemoryRetrievalRouter {
         false,
         ["summary_tree", "recent_tail"],
         "The query needs historical detail, so use the compressed history map only to navigate back to source messages.",
+        context.matchedProjectId,
+        context.matchedProjectTitle,
+      );
+    }
+
+    if (keywordHistoryLookup) {
+      return this.decision(
+        "summary_tree",
+        "keyword_query_with_compacted_history",
+        false,
+        true,
+        false,
+        ["summary_tree", "recent_tail"],
+        "The query is a keyword-style lookup and compacted history is available, so search the summary tree before falling back to the recent tail.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
@@ -230,11 +257,23 @@ export class MemoryRetrievalRouter {
     const asksKnowledgeAdvisory = KNOWLEDGE_ADVISORY_RE.test(query);
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(query);
     const explicitProjectState = this.isExplicitProjectStateQuery(query);
+    const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
 
     if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
     if (needsFacts && asksCurrentFact) add("durable_memory", 6, "current_fact_terms");
     if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
     if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");
+    if (
+      context.hasCompactedHistory &&
+      this.keywordLookupTerms(query).length >= 4 &&
+      !mentionsKnowledge &&
+      !asksRawKnowledge &&
+      !asksDurable &&
+      !complexTask &&
+      !(asksProjectState && explicitProjectState)
+    ) {
+      add("summary_tree", 6, "keyword_query_with_compacted_history");
+    }
 
     if (asksProjectState && (referencesCurrentWork || explicitProjectState)) add("project_registry", 7, "project_state_terms");
     if (referencesCurrentWork) add("project_registry", 4, "references_current_work");
@@ -271,5 +310,13 @@ export class MemoryRetrievalRouter {
 
   private isExplicitProjectStateQuery(query: string): boolean {
     return /(project|repo|repository|task|work|branch|build|test|plugin|implementation|release|status of project|项目|仓库|任务|构建|测试|插件|分支|发布)/i.test(query);
+  }
+
+  private keywordLookupTerms(query: string): string[] {
+    return query
+      .toLowerCase()
+      .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 3 && !KEYWORD_LOOKUP_STOP_WORDS.has(term));
   }
 }

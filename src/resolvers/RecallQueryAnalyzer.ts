@@ -38,11 +38,13 @@ export class RecallQueryAnalyzer {
   }
 
   shouldUseRawFirst(understanding: QueryUnderstanding, options: RecallOptions): boolean {
-    // Raw-first history QA is intentionally scoped. Without an explicit session
-    // gate it can over-match the agent-level raw ledger and leak neighboring
-    // sessions into exact/config lookups; summary navigation remains the safer
-    // fallback for unscoped calls.
-    if (!options.sessionId) {
+    if (options.allowRawFirst === false) {
+      return false;
+    }
+    // Raw-first history QA is intentionally scoped. Agent-level calls may still
+    // use raw-first when SQLite/FTS has already narrowed the candidate ids; that
+    // preserves exact marker recall without wide-scanning unrelated sessions.
+    if (!options.sessionId && (options.rawCandidateMessageIds?.length ?? 0) === 0) {
       return false;
     }
     return (

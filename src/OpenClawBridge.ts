@@ -15,6 +15,7 @@ import {
 import { createRuntimeLayerDependencies } from "./runtime/createRuntimeLayerDependencies";
 import { ChaunyomsRetrievalService } from "./runtime/ChaunyomsRetrievalService";
 import { StablePrefixAdapter } from "./data/StablePrefixAdapter";
+import { OmsTestService } from "./runtime/OmsTestService";
 
 export class OpenClawBridge {
   private api?: OpenClawApiLike;
@@ -38,6 +39,7 @@ export class OpenClawBridge {
       fixedPrefixProvider: this.stablePrefixAdapter,
     },
   );
+  private readonly testService = new OmsTestService(() => this.logger);
 
   register(api: OpenClawApiLike): void {
     this.api = api;
@@ -205,6 +207,12 @@ export class OpenClawBridge {
             type: "number",
             description: "Optional token budget when source recall is needed.",
           },
+          scope: {
+            type: "string",
+            enum: ["agent", "session"],
+            description:
+              "Retrieval scope. Defaults to agent-wide memory; use session only for deliberately narrow current-session recall.",
+          },
         },
         required: ["query"],
         additionalProperties: false,
@@ -343,6 +351,441 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsWipeAgent(args),
+    );
+
+    register(
+      "oms_test_start",
+      "Start a background QA run. Default suite is stable_smoke_v1; real_smoke_v1 remains available for full OpenClaw live-path testing.",
+      {
+        type: "object",
+        properties: {
+          suite: { type: "string", description: "Optional suite id. Default stable_smoke_v1." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const suite = typeof (args as Record<string, unknown> | undefined)?.suite === "string"
+          ? String((args as Record<string, unknown>).suite)
+          : undefined;
+        const run = await this.testService.start(context.config, { suite });
+        return {
+          content: [{
+            type: "text",
+            text: [
+              "Background real test started.",
+              "",
+              this.formatTestRunSummary(run as unknown as Record<string, unknown>),
+            ].join("\n"),
+          }],
+          details: {
+            ok: true,
+            runId: run.id,
+            status: run.status,
+            phase: run.phase,
+            suite: run.suite,
+            agentId: run.agentId,
+            sessionId: run.sessionId,
+            progress: run.progress,
+            logPath: run.logPath,
+            reportPath: run.reportPath,
+          },
+        };
+      },
+    );
+
+    register(
+      "oms_test_cancel",
+      "Request cancellation for a running real OpenClaw background test. Cancellation is graceful-first so the isolated test agent can still be cleaned up.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by oms_test_start." },
+          reason: { type: "string", description: "Optional cancellation reason." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const reason = typeof (args as Record<string, unknown> | undefined)?.reason === "string"
+          ? String((args as Record<string, unknown>).reason)
+          : "cancel_requested";
+        const run = await this.testService.cancel(context.config, runId, reason);
+        return {
+          content: [{
+            type: "text",
+            text: run
+              ? `Cancellation requested.\n\n${this.formatTestRunSummary(run as unknown as Record<string, unknown>)}`
+              : "No matching test run found.",
+          }],
+          details: {
+            ok: Boolean(run),
+            run,
+          },
+        };
+      },
+    );
+
+    register(
+      "oms_test_status",
+      "Read the current status of an asynchronous real OpenClaw background test run.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by oms_test_start." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const run = await this.testService.get(context.config, runId);
+        return {
+          content: [{
+            type: "text",
+            text: run
+              ? this.formatTestRunSummary(run as unknown as Record<string, unknown>)
+              : "No matching test run found.",
+          }],
+          details: {
+            ok: Boolean(run),
+            run,
+          },
+        };
+      },
+    );
+
+    register(
+      "oms_test_result",
+      "Read the final report, runtime report, and session smoke report for a completed real OpenClaw background test run.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by oms_test_start." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const result = await this.testService.readResult(context.config, runId);
+        return {
+          content: [{
+            type: "text",
+            text: result
+              ? this.formatTestResultSummary(result)
+              : "No matching test result found.",
+          }],
+          details: {
+            ok: Boolean(result),
+            result,
+          },
+        };
+      },
+    );
+
+    register(
+      "oms_test_list",
+      "List recent real OpenClaw background test runs for monitoring and UI status panels.",
+      {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Maximum runs to return. Default 20." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const limit = typeof (args as Record<string, unknown> | undefined)?.limit === "number"
+          ? Number((args as Record<string, unknown>).limit)
+          : 20;
+        const runs = await this.testService.list(context.config, limit);
+        return {
+          content: [{
+            type: "text",
+            text: runs.length > 0
+              ? runs.map((run) => this.formatTestRunSummary(run as unknown as Record<string, unknown>)).join("\n\n---\n\n")
+              : "No test runs found.",
+          }],
+          details: {
+            ok: true,
+            runs,
+          },
+        };
+      },
+    );
+
+    register(
+      "qa",
+      "Unified short QA command. Use action=start|status|report|runs|cancel.",
+      {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["start", "status", "report", "runs", "cancel"] },
+          runId: { type: "string", description: "Required for status/report/cancel." },
+          suite: { type: "string", description: "Optional suite id for start." },
+          limit: { type: "number", description: "Optional run list limit for runs." },
+          reason: { type: "string", description: "Optional cancellation reason for cancel." },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const record = this.asRecord(args);
+        const action = typeof record.action === "string" ? record.action : "";
+
+        if (action === "start") {
+          const suite = typeof record.suite === "string" ? record.suite : undefined;
+          const run = await this.testService.start(context.config, { suite });
+          return {
+            content: [{ type: "text", text: ["Background real test started.", "", this.formatTestRunSummary(run as unknown as Record<string, unknown>)].join("\n") }],
+            details: {
+              ok: true,
+              action,
+              runId: run.id,
+              run,
+            },
+          };
+        }
+
+        if (action === "runs") {
+          const limit = typeof record.limit === "number" ? Number(record.limit) : 20;
+          const runs = await this.testService.list(context.config, limit);
+          return {
+            content: [{ type: "text", text: runs.length > 0 ? runs.map((run) => this.formatTestRunSummary(run as unknown as Record<string, unknown>)).join("\n\n---\n\n") : "No test runs found." }],
+            details: {
+              ok: true,
+              action,
+              runs,
+            },
+          };
+        }
+
+        const runId = typeof record.runId === "string" ? record.runId : "";
+        if (!runId) {
+          return {
+            content: [{ type: "text", text: "runId is required for this qa action." }],
+            details: {
+              ok: false,
+              action,
+              missingParam: "runId",
+            },
+          };
+        }
+
+        if (action === "status") {
+          const run = await this.testService.get(context.config, runId);
+          return {
+            content: [{ type: "text", text: run ? this.formatTestRunSummary(run as unknown as Record<string, unknown>) : "No matching test run found." }],
+            details: {
+              ok: Boolean(run),
+              action,
+              run,
+            },
+          };
+        }
+
+        if (action === "report") {
+          const result = await this.testService.readResult(context.config, runId);
+          return {
+            content: [{ type: "text", text: result ? this.formatTestResultSummary(result) : "No matching test result found." }],
+            details: {
+              ok: Boolean(result),
+              action,
+              result,
+            },
+          };
+        }
+
+        if (action === "cancel") {
+          const reason = typeof record.reason === "string" ? record.reason : "cancel_requested";
+          const run = await this.testService.cancel(context.config, runId, reason);
+          return {
+            content: [{ type: "text", text: run ? `Cancellation requested.\n\n${this.formatTestRunSummary(run as unknown as Record<string, unknown>)}` : "No matching test run found." }],
+            details: {
+              ok: Boolean(run),
+              action,
+              run,
+            },
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: "Unknown qa action." }],
+          details: {
+            ok: false,
+            action,
+          },
+        };
+      },
+    );
+
+    register(
+      "qa_start",
+      "Short alias for oms_test_start.",
+      {
+        type: "object",
+        properties: {
+          suite: { type: "string", description: "Optional suite id. Default stable_smoke_v1." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(
+          args,
+          this.runtime.getConfig(),
+        );
+        const suite = typeof (args as Record<string, unknown> | undefined)?.suite === "string"
+          ? String((args as Record<string, unknown>).suite)
+          : undefined;
+        const run = await this.testService.start(context.config, { suite });
+        return {
+          content: [{
+            type: "text",
+            text: ["Background real test started.", "", this.formatTestRunSummary(run as unknown as Record<string, unknown>)].join("\n"),
+          }],
+          details: {
+            ok: true,
+            runId: run.id,
+            status: run.status,
+            phase: run.phase,
+            suite: run.suite,
+            agentId: run.agentId,
+            sessionId: run.sessionId,
+            progress: run.progress,
+            logPath: run.logPath,
+            reportPath: run.reportPath,
+          },
+        };
+      },
+    );
+
+    register(
+      "qa_status",
+      "Short alias for oms_test_status.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by qa_start." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(args, this.runtime.getConfig());
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const run = await this.testService.get(context.config, runId);
+        return {
+          content: [{ type: "text", text: run ? this.formatTestRunSummary(run as unknown as Record<string, unknown>) : "No matching test run found." }],
+          details: { ok: Boolean(run), run },
+        };
+      },
+    );
+
+    register(
+      "qa_report",
+      "Short alias for oms_test_result.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by qa_start." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(args, this.runtime.getConfig());
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const result = await this.testService.readResult(context.config, runId);
+        return {
+          content: [{ type: "text", text: result ? this.formatTestResultSummary(result) : "No matching test result found." }],
+          details: { ok: Boolean(result), result },
+        };
+      },
+    );
+
+    register(
+      "qa_runs",
+      "Short alias for oms_test_list.",
+      {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Maximum runs to return. Default 20." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(args, this.runtime.getConfig());
+        const limit = typeof (args as Record<string, unknown> | undefined)?.limit === "number"
+          ? Number((args as Record<string, unknown>).limit)
+          : 20;
+        const runs = await this.testService.list(context.config, limit);
+        return {
+          content: [{ type: "text", text: runs.length > 0 ? runs.map((run) => this.formatTestRunSummary(run as unknown as Record<string, unknown>)).join("\n\n---\n\n") : "No test runs found." }],
+          details: { ok: true, runs },
+        };
+      },
+    );
+
+    register(
+      "qa_cancel",
+      "Short alias for oms_test_cancel.",
+      {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "The run id returned by qa_start." },
+          reason: { type: "string", description: "Optional cancellation reason." },
+        },
+        required: ["runId"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) => {
+        const context = this.payloadAdapter.resolveLifecycleContext(args, this.runtime.getConfig());
+        const runId = typeof (args as Record<string, unknown> | undefined)?.runId === "string"
+          ? String((args as Record<string, unknown>).runId)
+          : "";
+        const reason = typeof (args as Record<string, unknown> | undefined)?.reason === "string"
+          ? String((args as Record<string, unknown>).reason)
+          : "cancel_requested";
+        const run = await this.testService.cancel(context.config, runId, reason);
+        return {
+          content: [{ type: "text", text: run ? `Cancellation requested.\n\n${this.formatTestRunSummary(run as unknown as Record<string, unknown>)}` : "No matching test run found." }],
+          details: { ok: Boolean(run), run },
+        };
+      },
     );
 
     register(
@@ -560,5 +1003,71 @@ export class OpenClawBridge {
         metadata: item.metadata,
       };
     });
+  }
+
+  private formatTestRunSummary(run: Record<string, unknown> | null | undefined): string {
+    if (!run) {
+      return "No test run found.";
+    }
+    return [
+      `runId: ${String(run.id ?? "")}`,
+      `status: ${String(run.status ?? "")}`,
+      `phase: ${String(run.phase ?? "")}`,
+      `suite: ${String(run.suite ?? "")}`,
+      `progress: ${String(run.progress ?? "")}`,
+      `agentId: ${String(run.agentId ?? "")}`,
+      `sessionId: ${String(run.sessionId ?? "")}`,
+      `reportPath: ${String(run.reportPath ?? "")}`,
+    ].join("\n");
+  }
+
+  private formatTestResultSummary(resultEnvelope: Record<string, unknown> | null | undefined): string {
+    if (!resultEnvelope) {
+      return "No test result found.";
+    }
+    const run = this.asRecord(resultEnvelope.run);
+    const result = this.asRecord(resultEnvelope.result);
+    const smoke = this.asRecord(resultEnvelope.smokeReport);
+    const runtimeReport = this.asRecord(resultEnvelope.runtimeReport);
+    const latestContextRun = this.asRecord(runtimeReport.latestContextRun);
+    const metrics = this.asRecord(result.metrics);
+    const benchmark = this.asRecord(result.benchmark);
+    return [
+      `runId: ${String(run.id ?? "")}`,
+      `status: ${String(run.status ?? "")}`,
+      `suite: ${String(run.suite ?? "")}`,
+      `ok: ${String(result.ok ?? smoke.ok ?? false)}`,
+      ...(Object.keys(metrics).length > 0 ? [
+        `passRate: ${String(this.asRecord(metrics.passRate).rate ?? "")}`,
+        `exactFactRecoveryRate: ${String(this.asRecord(metrics.exactFactRecoveryRate).rate ?? "")}`,
+        `sourceVerificationRate: ${String(this.asRecord(metrics.sourceVerificationRate).rate ?? "")}`,
+        `avgLatencyMs: ${String(metrics.avgLatencyMs ?? "")}`,
+        `p95LatencyMs: ${String(metrics.p95LatencyMs ?? "")}`,
+      ] : []),
+      ...(Object.keys(benchmark).length > 0 ? [
+        `benchmark.retrieveMs: ${String(benchmark.retrieveMs ?? "")}`,
+        `benchmark.summaryCount: ${String(benchmark.summaryCount ?? "")}`,
+        `benchmark.compactionTriggered: ${String(benchmark.compactionTriggered ?? "")}`,
+      ] : []),
+      ...(Object.keys(smoke).length > 0 ? [`smoke.ok: ${String(smoke.ok ?? false)}`] : []),
+      `sessionId: ${String(run.sessionId ?? "")}`,
+      `agentId: ${String(run.agentId ?? "")}`,
+      ...(Object.keys(runtimeReport).length > 0 ? [
+        `leakedMessageCount: ${String(runtimeReport.leakedMessageCount ?? "")}`,
+        `selectedLeakCount: ${String(latestContextRun.selectedLeakCount ?? "")}`,
+        `totalBudget: ${String(latestContextRun.totalBudget ?? "")}`,
+        `selectedCount: ${String(latestContextRun.selectedCount ?? "")}`,
+      ] : []),
+      `reportPath: ${String(run.reportPath ?? "")}`,
+      ...(Object.keys(runtimeReport).length > 0 ? [`runtimeReportPath: ${String(run.runtimeReportPath ?? "")}`] : []),
+      ...(Object.keys(smoke).length > 0 ? [`smokeReportPath: ${String(run.smokeReportPath ?? "")}`] : []),
+      ...(typeof run.error === "string" && run.error ? [`error: ${String(run.error)}`] : []),
+    ].join("\n");
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
   }
 }

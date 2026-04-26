@@ -101,13 +101,14 @@ async function main(): Promise<void> {
     });
   }
 
-  await runtime.afterTurn({
+  const compactResult = await runtime.compact({
     sessionId: config.sessionId,
     config,
     totalBudget: config.contextWindow,
     systemPromptTokens: 0,
     runtimeMessages: [],
   });
+  assert(compactResult.compacted, "expected explicit compaction to create a knowledge raw candidate");
   await runtime.waitForBackgroundWork();
 
   const stores = await runtime.getSessionStores({ sessionId: config.sessionId, config });

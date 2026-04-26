@@ -107,6 +107,13 @@ async function main(): Promise<void> {
     });
 
     if (turn % 6 === 0) {
+      await runtime.compact({
+        sessionId: config.sessionId,
+        config,
+        totalBudget: config.contextWindow,
+        systemPromptTokens: 0,
+        runtimeMessages: [],
+      });
       await runtime.afterTurn({
         sessionId: config.sessionId,
         config,

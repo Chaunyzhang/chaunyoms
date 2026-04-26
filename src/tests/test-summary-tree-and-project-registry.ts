@@ -85,7 +85,7 @@ async function main(): Promise<void> {
     });
 
     if (turn % 3 === 0) {
-      await runtime.afterTurn({
+      await runtime.compact({
         sessionId: config.sessionId,
         config,
         totalBudget: config.contextWindow,
@@ -121,7 +121,10 @@ async function main(): Promise<void> {
 
   const projects = stores.projectStore.getAll();
   assert(projects.length > 0, "expected project registry to contain at least one project");
-  const project = projects[0];
+  const project = projects.find((entry) => entry.summaryIds.length > 0);
+  if (!project) {
+    throw new Error("expected project registry to link summaries");
+  }
   assert(project.summaryIds.length > 0, "expected project registry to link summaries");
   assert(project.title.length > 0, "expected project registry to carry a title");
 

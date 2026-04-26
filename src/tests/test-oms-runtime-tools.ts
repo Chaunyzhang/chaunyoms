@@ -224,6 +224,17 @@ async function main(): Promise<void> {
     assert(tools.has("oms_asset_sync"), "oms_asset_sync should be registered");
     assert(tools.has("oms_asset_reindex"), "oms_asset_reindex should be registered");
     assert(tools.has("oms_asset_verify"), "oms_asset_verify should be registered");
+    assert(tools.has("oms_test_start"), "oms_test_start should be registered");
+    assert(tools.has("oms_test_status"), "oms_test_status should be registered");
+    assert(tools.has("oms_test_result"), "oms_test_result should be registered");
+    assert(tools.has("oms_test_list"), "oms_test_list should be registered");
+    assert(tools.has("oms_test_cancel"), "oms_test_cancel should be registered");
+    assert(tools.has("qa_start"), "qa_start should be registered");
+    assert(tools.has("qa_status"), "qa_status should be registered");
+    assert(tools.has("qa_report"), "qa_report should be registered");
+    assert(tools.has("qa_runs"), "qa_runs should be registered");
+    assert(tools.has("qa_cancel"), "qa_cancel should be registered");
+    assert(tools.has("qa"), "qa should be registered");
     assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
     assert(!tools.has("memory_route"), "memory_route should not be registered on the standard tool surface");
     assert(!tools.has("recall_detail"), "recall_detail should not be registered on the standard tool surface");

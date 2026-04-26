@@ -45,22 +45,6 @@ export class CompactionCoordinator {
 
   constructor(private readonly deps: CompactionCoordinatorDependencies) {}
 
-  async runBestEffortCompaction(
-    context: LifecycleContext,
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-  ): Promise<{ compacted: boolean; entry: SummaryEntry | null }> {
-    const compaction = await this.runSerializedCompaction(
-      rawStore,
-      summaryStore,
-      context,
-    );
-    const entry = compaction.status === "compacted" || compaction.status === "deduped"
-      ? compaction.summary
-      : null;
-    return { compacted: Boolean(entry), entry };
-  }
-
   async runCompactionBarrier(
     context: LifecycleContext,
     rawStore: RawMessageRepository,
@@ -92,10 +76,10 @@ export class CompactionCoordinator {
     }
 
     const tokensBefore = budgetState.compressibleHistoryTokens;
-    const maxPasses = 12;
+    const maxPasses = Math.max(64, this.deps.getConfig().compactionBatchTurns * 4);
     let passes = 0;
 
-    while (budgetState.compressibleHistoryTokens > budgetState.compressibleHistoryBudget) {
+    while (budgetState.compressibleHistoryTokens > 0) {
       passes += 1;
       if (passes > maxPasses) {
         this.deps.logger.warn("compaction_barrier_soft_failed", {
@@ -187,6 +171,7 @@ export class CompactionCoordinator {
       pluginFixedTokens: budgetState.pluginFixedTokens,
       freshTailTokens: budgetState.freshTailTokens,
       compressibleHistoryBudget: budgetState.compressibleHistoryBudget,
+      compactionGoal: "compact_all_eligible_history",
       passes,
       strictCompaction: this.deps.getConfig().strictCompaction,
     });
@@ -203,7 +188,7 @@ export class CompactionCoordinator {
       freshTailTokens: budgetState.freshTailTokens,
       passes,
       status: "compacted",
-      reason: "barrier_recovered_context_budget",
+      reason: "barrier_compacted_eligible_history",
     });
   }
 

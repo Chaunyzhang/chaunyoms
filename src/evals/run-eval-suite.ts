@@ -26,12 +26,14 @@ import {
 interface EvalRunOptions {
   suitePath?: string;
   reportPrefix: string;
+  reportDir: string;
 }
 
 function parseArgs(argv: string[]): EvalRunOptions {
   const options: EvalRunOptions = {
     suitePath: process.env.CHAUNYOMS_EVAL_SUITE,
     reportPrefix: process.env.CHAUNYOMS_EVAL_REPORT_PREFIX ?? "memory-eval-report",
+    reportDir: process.env.CHAUNYOMS_EVAL_REPORT_DIR ?? path.join(process.cwd(), "artifacts", "evals"),
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -52,6 +54,15 @@ function parseArgs(argv: string[]): EvalRunOptions {
     }
     if (arg.startsWith("--report-prefix=")) {
       options.reportPrefix = arg.slice("--report-prefix=".length);
+      continue;
+    }
+    if (arg === "--report-dir") {
+      options.reportDir = argv[index + 1] ?? options.reportDir;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--report-dir=")) {
+      options.reportDir = arg.slice("--report-dir=".length);
     }
   }
 
@@ -352,7 +363,7 @@ async function main(): Promise<void> {
 
   const json = JSON.stringify(report, null, 2);
   const markdown = reportMarkdown(report);
-  const reportDir = path.join(process.cwd(), "artifacts", "evals");
+  const reportDir = path.resolve(process.cwd(), options.reportDir);
   await writeReportArtifacts(
     reportDir,
     `${options.reportPrefix}.json`,

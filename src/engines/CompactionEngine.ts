@@ -45,6 +45,15 @@ const PROMOTION_INTENTS = [
   "priority_promote",
 ] as const;
 
+const LEVEL_ONE_TARGET_RATIO = 0.12;
+const COMPACTION_BATCH_TARGET_TOKENS = 24000;
+const COMPACTION_BATCH_MIN_TOKENS = 12000;
+const COMPACTION_BATCH_MAX_TOKENS = 48000;
+
+function isSummarySourceMessage(message: RawMessage): boolean {
+  return message.role === "user" || message.role === "assistant";
+}
+
 export class CompactionEngine {
   constructor(
     private readonly llmCaller: LlmCaller | null,
@@ -126,14 +135,20 @@ export class CompactionEngine {
       maxFreshTailTurns,
     );
     const candidateTurnNumbers = turnNumbers.filter((turnNumber) => !protectedTurns.has(turnNumber));
-    const candidateTurns = candidateTurnNumbers.slice(0, Math.min(maxTurns, candidateTurnNumbers.length));
+    const candidateTurns = this.selectAdaptiveCandidateTurns(
+      uncompacted,
+      candidateTurnNumbers,
+      maxTurns,
+    );
     if (candidateTurns.length === 0) {
       return null;
     }
 
     const startTurn = candidateTurns[0];
     const endTurn = candidateTurns[candidateTurns.length - 1];
-    const messages = rawStore.getByRange(startTurn, endTurn, query).filter((message) => !message.compacted);
+    const messages = rawStore
+      .getByRange(startTurn, endTurn, query)
+      .filter((message) => !message.compacted && isSummarySourceMessage(message));
     return messages.length === 0 ? null : { startTurn, endTurn, messages };
   }
 
@@ -146,22 +161,19 @@ export class CompactionEngine {
       return null;
     }
 
+    const outputBudget = this.resolveLevelOneOutputBudget(messages, maxOutputTokens);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        const attemptMaxOutputTokens = Math.min(
-          Math.max(maxOutputTokens * attempt, maxOutputTokens),
-          1024,
-        );
-        const prompt = this.buildPrompt(messages, attempt);
+        const prompt = this.buildPrompt(messages, attempt, outputBudget);
         const raw = await this.llmCaller.call({
           model: summaryModel,
           prompt,
           temperature: 0.1,
-          maxOutputTokens: attemptMaxOutputTokens,
-          responseFormat: "json",
+          maxOutputTokens: outputBudget,
+          responseFormat: "text",
         });
         const parsed = this.parseSummaryResult(raw);
-        if (parsed) {
+        if (parsed && !this.isLongerThanSource(parsed, messages)) {
           return parsed;
         }
       } catch (error) {
@@ -336,33 +348,36 @@ export class CompactionEngine {
     }
   }
 
-  private buildPrompt(messages: RawMessage[], attempt: number): string {
-    const transcript = messages
+  private buildPrompt(messages: RawMessage[], attempt: number, maxOutputTokens: number): string {
+    const sourceMessages = messages.filter(isSummarySourceMessage);
+    const transcript = sourceMessages
       .map((message) => `Turn ${message.turnNumber} | ${message.role}\n${message.content}`)
       .join("\n\n");
+    const sourceTokenCount = this.sumSummarySourceTokens(sourceMessages);
 
     return [
-      "You are generating a high-quality structured memory node for a context engine.",
-      "Do not optimize for extreme brevity. Optimize for factual retention, structure, and future reuse.",
-      "Return JSON with exactly these keys: summary, keywords, toneTag, memoryType, phase, constraints, decisions, blockers, nextSteps, keyEntities, exactFacts, promotionIntent.",
-      "Output only one JSON object. Do not wrap it in markdown.",
-      "Do not output any extra commentary before or after the JSON object.",
+      "You are generating a high-quality level-1 memory extraction in Markdown.",
+      "This is not a JSON object and not a short abstract. It is the cleaned nutrient layer that later rollups, knowledge intake, and source recall will use.",
+      "Treat the task like a careful meeting-minutes distillation: remove noise, repeated boilerplate, tool chatter, acknowledgements, false starts, and clearly corrected mistakes while preserving usable substance.",
+      "Do not optimize for brevity. Optimize for functional retention, downstream retrieval, knowledge intake, and future rollups.",
+      `The source span is about ${sourceTokenCount} tokens. Let the length follow functional retention needs. Roughly ${LEVEL_ONE_TARGET_RATIO * 100}% of useful source density is a starting heuristic for information-rich spans, not a hard cap.`,
+      `The API output budget is set to ${maxOutputTokens} tokens so the extraction can be as rich as needed, but the final extraction must never exceed the source length.`,
+      "Keep enough detail that later retrieval can answer source-specific questions without immediately reopening every raw message.",
+      "A good level-1 extraction preserves section structure, named mechanisms, comparisons, caveats, exact values, source-local terminology, and testable claims.",
+      "Correct only errors that are clearly corrected by the source itself. Preserve uncertainty and disagreement instead of smoothing them away.",
+      "Do not invent connective tissue, conclusions, citations, or facts that are not supported by the source.",
+      "Return Markdown only. Do not wrap it in a code fence.",
       attempt > 1
-        ? "Important: suppress reasoning and emit the final JSON object immediately."
+        ? "Important: suppress reasoning and emit the final Markdown extraction immediately."
         : "",
-      "summary must be structured, fact-preserving, and readable by both humans and downstream organizer logic.",
-      "keywords must be an array of short search terms.",
-      "toneTag must be a short phrase describing the dialogue tone.",
-      `memoryType must be one of: ${SUMMARY_MEMORY_TYPES.join(", ")}.`,
-      "phase must be a short lifecycle label such as planning, implementation, validation, fixing, review, or active.",
-      "constraints must list explicit limits, requirements, and must-not rules.",
-      "decisions must list concrete decisions or settled implementation choices.",
-      "blockers must list concrete failures, risks, or unresolved blockers.",
-      "nextSteps must list concrete next actions or follow-up work.",
-      "keyEntities must list important project names, files, modules, APIs, components, or other retrieval anchors.",
-      "exactFacts must list exact numbers, file names, config keys, parameter values, and other precise anchors that should survive compression.",
-      `promotionIntent must be one of: ${PROMOTION_INTENTS.join(", ")}.`,
-      "Prefer promote or priority_promote only when the node is strong enough to become a reusable long-term asset.",
+      "Use this Markdown shape when useful:",
+      "# Level-1 Memory Extraction",
+      "## Scope",
+      "## Cleaned Substance",
+      "## Mechanisms And Claims",
+      "## Exact Anchors",
+      "## Decisions / Constraints / Failure Modes",
+      "## Retrieval Cues",
       "",
       transcript,
     ].join("\n");
@@ -389,7 +404,7 @@ export class CompactionEngine {
       return embedded;
     }
 
-    return null;
+    return this.markdownToSummaryResult(raw);
   }
 
   private tryParseJsonObject(raw: string): unknown {
@@ -409,22 +424,19 @@ export class CompactionEngine {
       return null;
     }
 
+    const outputBudget = this.resolveLevelOneOutputBudget(messages, maxOutputTokens);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        const attemptMaxOutputTokens = Math.min(
-          Math.max(maxOutputTokens * attempt, maxOutputTokens),
-          1024,
-        );
-        const prompt = this.buildPrompt(messages, attempt);
+        const prompt = this.buildPrompt(messages, attempt, outputBudget);
         const raw = await this.llmCaller.call({
           model: summaryModel,
           prompt,
           temperature: 0.1,
-          maxOutputTokens: attemptMaxOutputTokens,
-          responseFormat: "json",
+          maxOutputTokens: outputBudget,
+          responseFormat: "text",
         });
         const parsed = this.parseSummaryResult(raw);
-        if (parsed) {
+        if (parsed && !this.isLongerThanSource(parsed, messages)) {
           return parsed;
         }
       } catch (error) {
@@ -436,6 +448,76 @@ export class CompactionEngine {
     }
 
     return null;
+  }
+
+  private resolveLevelOneOutputBudget(messages: RawMessage[], _configuredMaxOutputTokens: number): number {
+    const sourceTokenCount = this.sumSummarySourceTokens(messages);
+    return Math.max(1, sourceTokenCount);
+  }
+
+  private isLongerThanSource(summary: SummaryResult, messages: RawMessage[]): boolean {
+    const sourceTokenCount = this.sumSummarySourceTokens(messages);
+    return estimateTokens(summary.summary) > sourceTokenCount;
+  }
+
+  private sumSummarySourceTokens(messages: RawMessage[]): number {
+    return messages
+      .filter(isSummarySourceMessage)
+      .reduce((sum, message) => sum + message.tokenCount, 0);
+  }
+
+  private markdownToSummaryResult(raw: string): SummaryResult | null {
+    const summary = raw.trim().replace(/^```(?:md|markdown)?\s*/i, "").replace(/```$/i, "").trim();
+    if (!summary) {
+      return null;
+    }
+    const headings = [...summary.matchAll(/^#{1,3}\s+(.+)$/gm)].map((match) => match[1].trim());
+    const keywords = [...new Set([
+      ...headings,
+      ...[...summary.matchAll(/`([^`]{2,80})`/g)].map((match) => match[1].trim()),
+    ])].slice(0, 24);
+    const exactFacts = [...new Set(
+      summary
+        .split(/\r?\n/)
+        .filter((line) => /(?:https?:\/\/|arxiv|local-synthetic|20\d{2}-\d{2}-\d{2}|[A-Za-z0-9_-]+\.(?:ts|md|json|sqlite)|\b\d+(?:\.\d+)?\b)/.test(line))
+        .map((line) => line.replace(/^[-*]\s*/, "").trim())
+        .filter(Boolean),
+    )].slice(0, 40);
+    return {
+      summary,
+      keywords,
+      toneTag: "markdown level-1 extraction",
+      memoryType: "general",
+      phase: "active",
+      constraints: this.extractSectionLines(summary, /constraints?|limits?|must/i),
+      decisions: this.extractSectionLines(summary, /decisions?|choices?|settled/i),
+      blockers: this.extractSectionLines(summary, /blockers?|failure|risks?/i),
+      nextSteps: this.extractSectionLines(summary, /next steps?|follow[- ]?ups?|todo/i),
+      keyEntities: keywords,
+      exactFacts,
+      promotionIntent: "candidate",
+    };
+  }
+
+  private extractSectionLines(markdown: string, headingPattern: RegExp): string[] {
+    const lines = markdown.split(/\r?\n/);
+    const collected: string[] = [];
+    let inside = false;
+    for (const line of lines) {
+      const heading = line.match(/^#{1,3}\s+(.+)$/);
+      if (heading) {
+        inside = headingPattern.test(heading[1]);
+        continue;
+      }
+      if (!inside) {
+        continue;
+      }
+      const item = line.replace(/^[-*]\s*/, "").trim();
+      if (item) {
+        collected.push(item);
+      }
+    }
+    return collected.slice(0, 20);
   }
 
   private normalizeSummaryCandidate(candidate: unknown): SummaryResult | null {
@@ -540,6 +622,48 @@ export class CompactionEngine {
     return maxClosedTurn;
   }
 
+  private selectAdaptiveCandidateTurns(
+    messages: RawMessage[],
+    candidateTurnNumbers: number[],
+    maxTurns: number,
+  ): number[] {
+    if (candidateTurnNumbers.length === 0) {
+      return [];
+    }
+    const hardTurnLimit = Math.max(maxTurns * 3, maxTurns, 1);
+    const selected: number[] = [];
+    let consumed = 0;
+
+    for (const turnNumber of candidateTurnNumbers) {
+      const turnTokens = messages
+        .filter((message) => message.turnNumber === turnNumber && isSummarySourceMessage(message))
+        .reduce((sum, message) => sum + message.tokenCount, 0);
+      if (turnTokens <= 0) {
+        continue;
+      }
+      const wouldExceedMaxTokens = selected.length > 0 &&
+        consumed >= COMPACTION_BATCH_MIN_TOKENS &&
+        consumed + turnTokens > COMPACTION_BATCH_MAX_TOKENS;
+      const wouldExceedTurnLimit = selected.length >= hardTurnLimit &&
+        consumed >= COMPACTION_BATCH_MIN_TOKENS;
+      if (wouldExceedMaxTokens || wouldExceedTurnLimit) {
+        break;
+      }
+
+      selected.push(turnNumber);
+      consumed += turnTokens;
+
+      if (
+        consumed >= COMPACTION_BATCH_TARGET_TOKENS &&
+        selected.length >= Math.min(maxTurns, candidateTurnNumbers.length)
+      ) {
+        break;
+      }
+    }
+
+    return selected;
+  }
+
   private normalizeThresholdRatio(value: number, fallback: number): number {
     return Number.isFinite(value) && value > 0 && value < 1 ? value : fallback;
   }
@@ -578,7 +702,9 @@ export class CompactionEngine {
     );
 
     return uncompacted.reduce((sum, message) => (
-      protectedTurns.has(message.turnNumber) ? sum : sum + message.tokenCount
+      protectedTurns.has(message.turnNumber) || !isSummarySourceMessage(message)
+        ? sum
+        : sum + message.tokenCount
     ), 0);
   }
 
@@ -598,8 +724,11 @@ export class CompactionEngine {
     for (let index = turnNumbers.length - 1; index >= 0; index -= 1) {
       const turnNumber = turnNumbers[index];
       const turnTokens = messages
-        .filter((message) => message.turnNumber === turnNumber)
+        .filter((message) => message.turnNumber === turnNumber && isSummarySourceMessage(message))
         .reduce((sum, message) => sum + message.tokenCount, 0);
+      if (turnTokens <= 0) {
+        continue;
+      }
 
       if (protectedTurns.size > 0 && consumed + turnTokens > freshTailTokens) {
         break;

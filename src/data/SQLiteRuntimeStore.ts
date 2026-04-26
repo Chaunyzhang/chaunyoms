@@ -434,7 +434,8 @@ export class SQLiteRuntimeStore {
       !entry.parentSummaryId &&
       (!Array.isArray(entry.parentSummaryIds) || entry.parentSummaryIds.length === 0)
     ));
-    const source = roots.length > 0 ? roots : allActive;
+    const branchRoots = roots.filter((entry) => entry.nodeKind === "branch" || (entry.summaryLevel ?? 1) > 1);
+    const source = branchRoots;
     const selected: SummaryEntry[] = [];
     let consumed = 0;
     for (const summary of source) {

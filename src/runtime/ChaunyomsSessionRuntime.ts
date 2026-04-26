@@ -61,7 +61,7 @@ import { CompactionCoordinator } from "./CompactionCoordinator";
 
 export interface CompactionDiagnostics {
   sessionId: string;
-  mode: "manual" | "barrier" | "after_turn";
+  mode: "manual" | "barrier";
   triggerExceeded: boolean;
   triggerThreshold: number;
   compressibleHistoryTokens: number;
@@ -99,7 +99,6 @@ export interface CompactResult {
 export interface AfterTurnResult {
   stats: Record<string, unknown>;
   importedMessages: number;
-  compactedThisTurn: boolean;
 }
 
 export interface OmsRuntimeStatus {
@@ -639,16 +638,6 @@ export class ChaunyomsSessionRuntime {
       context.runtimeMessages,
     );
 
-    const compactionResult = this.config.emergencyBrake
-      ? { compacted: false, entry: null as SummaryEntry | null }
-      : await this.compactionCoordinator.runBestEffortCompaction(context, rawStore, summaryStore);
-
-    if (compactionResult.entry) {
-      await this.knowledgeMaintenance.enqueueSummaryForKnowledge(compactionResult.entry, context);
-      await this.sessionData.appendSummaryArtifact(compactionResult.entry);
-      await this.rollUpSummaryTree(summaryStore, context);
-    }
-
     const { knowledgeStore } = await this.ensureSession(
       context.sessionId,
       context.config,
@@ -665,7 +654,6 @@ export class ChaunyomsSessionRuntime {
       durableMemoryCount: durableMemoryStore.count(),
       unifiedKnowledgeDir: this.config.knowledgePromotionEnabled ? knowledgeStore.getBaseDir() : null,
       contextItems: this.contextViewStore.getItems().length,
-      compactedThisTurn: compactionResult.compacted,
       importedMessages: synced.importedMessages,
       strictCompaction: this.config.strictCompaction,
       compactionBarrierEnabled: this.config.compactionBarrierEnabled,
@@ -687,7 +675,7 @@ export class ChaunyomsSessionRuntime {
       rawStore,
       summaryStore,
       durableMemoryStore,
-      compactionResult.compacted,
+      false,
     );
     await this.updateProjectRegistry(context, rawStore, summaryStore, durableMemoryStore);
     await this.backgroundOrganizerEngine.run(
@@ -700,7 +688,6 @@ export class ChaunyomsSessionRuntime {
     return {
       stats,
       importedMessages: synced.importedMessages,
-      compactedThisTurn: compactionResult.compacted,
     };
   }
 

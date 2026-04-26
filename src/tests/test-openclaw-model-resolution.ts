@@ -102,6 +102,112 @@ async function main(): Promise<void> {
     "expected provider/id model objects to normalize into provider-scoped refs",
   );
 
+  const minimaxConfig = {
+    agents: {
+      defaults: {
+        model: {
+          primary: "minimax/MiniMax-M2.7",
+        },
+        models: {
+          "minimax/MiniMax-M2.7": {},
+        },
+      },
+    },
+    models: {
+      providers: {
+        minimax: {
+          baseUrl: "https://api.minimaxi.com/v1",
+          apiKey: "test-key",
+          api: "openai-completions",
+          models: [
+            {
+              id: "MiniMax-M2.7",
+              contextWindow: 200000,
+              maxTokens: 64000,
+            },
+          ],
+        },
+      },
+    },
+  };
+  const minimaxPayloadAdapter = new OpenClawPayloadAdapter(
+    () => ({ config: minimaxConfig }),
+    () => ({
+      info(): void {},
+      warn(): void {},
+      error(): void {},
+    }),
+  );
+
+  const autoWindowLifecycle = minimaxPayloadAdapter.resolveLifecycleContext({}, DEFAULT_BRIDGE_CONFIG);
+  assert(
+    autoWindowLifecycle.config.contextWindow === 200000,
+    "expected plugin contextWindow to auto-resolve from configured provider model",
+  );
+  assert(
+    autoWindowLifecycle.totalBudget === 200000,
+    "expected assemble budget to use auto-resolved provider context window",
+  );
+
+  const cappedByRuntimeBudget = minimaxPayloadAdapter.resolveLifecycleContext(
+    { tokenBudget: 64000 },
+    DEFAULT_BRIDGE_CONFIG,
+  );
+  assert(
+    cappedByRuntimeBudget.config.contextWindow === 200000,
+    "expected runtime tokenBudget not to overwrite configured model context window",
+  );
+  assert(
+    cappedByRuntimeBudget.totalBudget === 64000,
+    "expected runtime tokenBudget to cap per-call assemble budget",
+  );
+
+  const explicitPluginWindow = minimaxPayloadAdapter.resolveLifecycleContext(
+    { config: { contextWindow: 32000 } },
+    DEFAULT_BRIDGE_CONFIG,
+  );
+  assert(
+    explicitPluginWindow.config.contextWindow === 32000 &&
+      explicitPluginWindow.totalBudget === 32000,
+    "expected explicit plugin contextWindow to override model auto-detection",
+  );
+
+  const minimaxRequests: Array<{ url: string; body: unknown }> = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    minimaxRequests.push({
+      url: String(url),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    });
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "{\"summary\":\"ok\",\"keywords\":[],\"toneTag\":\"test\"}" } }],
+      }),
+    } as Response;
+  }) as typeof fetch;
+
+  try {
+    const minimaxCaller = new OpenClawLlmCaller(
+      {
+        config: minimaxConfig,
+      },
+      undefined,
+    );
+    const text = await minimaxCaller.call({
+      prompt: "summarize",
+      maxOutputTokens: 64,
+      responseFormat: "json",
+    });
+    assert(text.includes("\"summary\":\"ok\""), "expected openai-completions provider alias to return chat content");
+    assert(minimaxRequests.length === 1, "expected one MiniMax configured provider request");
+    assert(
+      minimaxRequests[0]?.url === "https://api.minimaxi.com/v1/chat/completions",
+      "expected openai-completions alias to use the chat completions endpoint",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
   console.log("test-openclaw-model-resolution passed");
 }
 

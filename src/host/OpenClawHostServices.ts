@@ -33,7 +33,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   freshTailTokens: 6000,
   maxFreshTailTurns: 8,
   compactionBatchTurns: 12,
-  summaryMaxOutputTokens: 300,
+  summaryMaxOutputTokens: 1600,
   strictCompaction: true,
   compactionBarrierEnabled: true,
   runtimeCaptureEnabled: true,
@@ -413,6 +413,7 @@ export class OpenClawLlmCaller implements LlmCaller {
   private isOpenAiCompatibleApi(api: string): boolean {
     return [
       "openai",
+      "openai-completions",
       "openai-compatible",
       "openai-chat-completions",
       "chat-completions",
