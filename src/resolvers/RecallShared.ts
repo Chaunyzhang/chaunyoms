@@ -141,12 +141,27 @@ export function dateMatches(left?: DateHint, right?: DateHint): boolean {
 }
 
 export function queryTerms(query: string): string[] {
-  return query
+  const terms = query
     .toLowerCase()
     .replace(/^history\s+recall\s*:\s*/i, "")
     .split(/[^a-z0-9\u4e00-\u9fff]+/i)
     .map((term) => term.trim())
-    .filter((term) => term.length >= 2 && !QUERY_STOP_WORDS.has(term));
+    .filter((term) => term.length >= 2 && !QUERY_STOP_WORDS.has(term))
+    .flatMap(expandCjkTerm);
+  return [...new Set(terms)].slice(0, 80);
+}
+
+function expandCjkTerm(term: string): string[] {
+  if (!/[\u4e00-\u9fff]/.test(term) || term.length <= 4) {
+    return [term];
+  }
+  const terms = [term];
+  for (let size = 2; size <= 4; size += 1) {
+    for (let index = 0; index <= term.length - size; index += 1) {
+      terms.push(term.slice(index, index + size));
+    }
+  }
+  return terms;
 }
 
 export function textHasTerm(text: string, term: string): boolean {

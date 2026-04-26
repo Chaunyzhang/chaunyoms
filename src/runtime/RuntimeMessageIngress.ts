@@ -121,11 +121,10 @@ export class RuntimeMessageIngress {
       if (this.isLowValueToolReceipt(normalizedText)) {
         return this.skip("tool_receipt", normalizedText, "low_value_tool_receipt");
       }
-      return this.keep(
+      return this.skip(
         "tool_output",
         normalizedText,
-        "substantive_tool_output",
-        "observation",
+        "tool_output_scratch_only_not_persisted",
       );
     }
 

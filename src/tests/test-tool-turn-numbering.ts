@@ -53,13 +53,14 @@ async function main(): Promise<void> {
     role: "assistant",
     content: "Looking it up now.",
   });
-  await runtime.ingest({
+  const toolResult = await runtime.ingest({
     sessionId: config.sessionId,
     config,
     id: "tool-1",
     role: "tool",
     content: "config.json contains enableTools=false",
   });
+  assert(toolResult.ingested === false, "expected tool output to remain scratch-only and not enter raw memory");
   await runtime.ingest({
     sessionId: config.sessionId,
     config,
@@ -78,11 +79,11 @@ async function main(): Promise<void> {
     turnNumber: message.turnNumber,
   }));
 
-  assert(turnMap.length === 4, "expected four ingested messages");
+  assert(turnMap.length === 3, "expected only user and assistant messages to be persisted");
   assert(turnMap[0]?.turnNumber === 1, "expected user message to start turn 1");
   assert(turnMap[1]?.turnNumber === 1, "expected assistant message to stay in turn 1");
-  assert(turnMap[2]?.turnNumber === 1, "expected tool message to stay in turn 1");
-  assert(turnMap[3]?.turnNumber === 1, "expected follow-up assistant message to stay in turn 1");
+  assert(turnMap[2]?.id === "assistant-2", "expected follow-up assistant message to remain after tool output is dropped");
+  assert(turnMap[2]?.turnNumber === 1, "expected follow-up assistant message to stay in turn 1");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-tool-turn-numbering passed");

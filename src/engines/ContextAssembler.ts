@@ -27,6 +27,12 @@ interface AssembleOptions {
   sessionId?: string;
 }
 
+const MIN_RECENT_TAIL_RATIO = 0.05;
+const TARGET_RECENT_TAIL_RATIO = 0.07;
+const MAX_RECENT_TAIL_RATIO = 0.1;
+const MIN_RECENT_TAIL_TURNS = 1;
+const MAX_RECENT_TAIL_TURNS = 10;
+
 export class ContextAssembler {
   private readonly planner = new ContextPlanner();
 
@@ -93,9 +99,11 @@ export class ContextAssembler {
     maxFreshTailTurns: number,
     sessionId?: string,
   ): ContextItem[] {
+    const effectiveTailBudget = this.resolveRecentTailBudget(budget, freshTailTokens);
+    const effectiveTailTurns = this.resolveRecentTailTurns(maxFreshTailTurns);
     return this.recentMessagesToItems(
-      rawStore.getRecentTailByTokens(freshTailTokens, maxFreshTailTurns, { sessionId }),
-      budget,
+      rawStore.getRecentTailByTokens(effectiveTailBudget, effectiveTailTurns, { sessionId }),
+      effectiveTailBudget,
     );
   }
 
@@ -200,7 +208,8 @@ export class ContextAssembler {
       const fixedPluginTokens = this.sumTokens(stablePrefix) +
         (recallGuidance?.tokenCount ?? 0) +
         this.sumTokens(durableMemory);
-      const protectedTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
+      const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
+      const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
       const dynamicSummaryBudget = Math.max(
         budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
         0,
@@ -209,14 +218,15 @@ export class ContextAssembler {
         ? []
         : this.summaryEntriesToItems(runtime.getSummaries(dynamicSummaryBudget, options.sessionId));
       const effectiveTailBudget = Math.min(
-        freshTailTokens,
+        configuredTailBudget,
         Math.max(
           budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
           0,
         ),
       );
+      const effectiveTailTurns = this.resolveRecentTailTurns(maxFreshTailTurns);
       const recentTail = this.recentMessagesToItems(
-        runtime.getRecentTailByTokens(effectiveTailBudget, maxFreshTailTurns, options.sessionId),
+        runtime.getRecentTailByTokens(effectiveTailBudget, effectiveTailTurns, options.sessionId),
         effectiveTailBudget,
       );
       return {
@@ -274,7 +284,8 @@ export class ContextAssembler {
     const fixedPluginTokens = this.sumTokens(stablePrefix) +
       (recallGuidance?.tokenCount ?? 0) +
       this.sumTokens(durableMemory);
-    const protectedTailBudget = Math.min(budget.recentTailBudget, freshTailTokens);
+    const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
+    const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
     const dynamicSummaryBudget = Math.max(
       budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
       0,
@@ -283,7 +294,7 @@ export class ContextAssembler {
       ? []
       : this.assembleSummaries(summaryStore, dynamicSummaryBudget, options.sessionId);
     const effectiveTailBudget = Math.min(
-      freshTailTokens,
+      configuredTailBudget,
       Math.max(
         budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
         0,
@@ -292,7 +303,7 @@ export class ContextAssembler {
     const recentTail = this.assembleRecentTail(
       rawStore,
       effectiveTailBudget,
-      freshTailTokens,
+      configuredTailBudget,
       maxFreshTailTurns,
       options.sessionId,
     );
@@ -319,20 +330,108 @@ export class ContextAssembler {
         break;
       }
 
-      consumed += turnTokens;
-      selected.unshift(
-        ...turnMessages.map((message) => ({
-          kind: "message" as const,
-          tokenCount: message.tokenCount,
-          turnNumber: message.turnNumber,
-          role: message.role,
-          content: message.content,
-          metadata: message.metadata,
-        })),
-      );
+      const remaining = Math.max(budget - consumed, 0);
+      const turnItems = this.buildTurnTailItems(turnMessages, remaining);
+      if (turnItems.length === 0) {
+        break;
+      }
+
+      consumed += this.sumTokens(turnItems);
+      selected.unshift(...turnItems);
     }
 
     return selected;
+  }
+
+  private resolveRecentTailBudget(availableBudget: number, configuredFreshTailTokens: number): number {
+    if (availableBudget <= 0 || configuredFreshTailTokens <= 0) {
+      return 0;
+    }
+    const minBudget = Math.max(1, Math.floor(availableBudget * MIN_RECENT_TAIL_RATIO));
+    const targetBudget = Math.max(1, Math.floor(availableBudget * TARGET_RECENT_TAIL_RATIO));
+    const maxBudget = Math.max(minBudget, Math.floor(availableBudget * MAX_RECENT_TAIL_RATIO));
+    const configuredBudget = Math.max(1, Math.floor(configuredFreshTailTokens));
+    return Math.min(Math.max(configuredBudget, minBudget, targetBudget), maxBudget);
+  }
+
+  private resolveRecentTailTurns(maxFreshTailTurns: number): number {
+    if (maxFreshTailTurns <= 0) {
+      return 0;
+    }
+    return Math.min(
+      MAX_RECENT_TAIL_TURNS,
+      Math.max(MIN_RECENT_TAIL_TURNS, Math.floor(maxFreshTailTurns)),
+    );
+  }
+
+  private buildTurnTailItems(turnMessages: RawMessage[], budget: number): ContextItem[] {
+    if (budget <= 0) {
+      return [];
+    }
+
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+
+    for (let index = turnMessages.length - 1; index >= 0; index -= 1) {
+      const message = turnMessages[index];
+      const tokenCount = Math.max(message.tokenCount, 0);
+      const remaining = Math.max(budget - consumed, 0);
+      if (remaining <= 0) {
+        break;
+      }
+      if (tokenCount > remaining) {
+        selected.unshift(this.truncateRecentTailMessage(message, remaining));
+        break;
+      }
+      selected.unshift(this.rawMessageToContextItem(message));
+      consumed += tokenCount;
+    }
+
+    return selected;
+  }
+
+  private rawMessageToContextItem(message: RawMessage): ContextItem {
+    return {
+      kind: "message" as const,
+      tokenCount: message.tokenCount,
+      turnNumber: message.turnNumber,
+      role: message.role,
+      content: message.content,
+      metadata: message.metadata,
+    };
+  }
+
+  private truncateRecentTailMessage(message: RawMessage, tokenBudget: number): ContextItem {
+    const marker = "\n\n[chaunyoms: recent tail clipped; full source remains in raw memory and can be recalled with oms_expand/oms_trace]";
+    const content = this.truncateByEstimatedTokens(message.content, Math.max(tokenBudget - estimateTokens(marker), 1));
+    const clippedContent = `${content}${marker}`;
+    return {
+      kind: "message",
+      tokenCount: Math.max(estimateTokens(clippedContent), 1),
+      turnNumber: message.turnNumber,
+      role: message.role,
+      content: clippedContent,
+      metadata: {
+        ...(message.metadata ?? {}),
+        recentTailClipped: true,
+        originalTokenCount: message.tokenCount,
+      },
+    };
+  }
+
+  private truncateByEstimatedTokens(content: string, tokenBudget: number): string {
+    const normalizedBudget = Math.max(Math.floor(tokenBudget), 1);
+    if (estimateTokens(content) <= normalizedBudget) {
+      return content;
+    }
+
+    let end = Math.max(1, Math.floor(content.length * (normalizedBudget / Math.max(estimateTokens(content), 1))));
+    let candidate = content.slice(Math.max(0, content.length - end));
+    while (candidate.length > 1 && estimateTokens(candidate) > normalizedBudget) {
+      end = Math.max(1, Math.floor(end * 0.85));
+      candidate = content.slice(Math.max(0, content.length - end));
+    }
+    return candidate.trimStart();
   }
 
   private summaryEntriesToItems(summaries: SummaryEntry[]): ContextItem[] {

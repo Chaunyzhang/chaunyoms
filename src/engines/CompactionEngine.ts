@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   CompactionRunResult,
@@ -292,8 +292,11 @@ export class CompactionEngine {
         candidate.messages,
         `${agentId}-${sessionId}`,
       );
+      const summaryTokenCount = estimateTokens(summary.summary);
+      const sourceTokenEstimate = this.sumSummarySourceTokens(candidate.messages);
+      const summaryId = randomUUID();
       const entry: SummaryEntry = {
-        id: randomUUID(),
+        id: summaryId,
         eventId: buildStableEventId(
           "summary",
           `${sessionId}|${candidate.startTurn}|${candidate.endTurn}|${sourceHash}`,
@@ -315,11 +318,15 @@ export class CompactionEngine {
         keyEntities: summary.keyEntities,
         exactFacts: summary.exactFacts,
         promotionIntent: summary.promotionIntent,
+        openQuestions: summary.openQuestions,
+        conflicts: summary.conflicts,
+        candidateAtomPreviews: summary.candidateAtomPreviews,
         startTurn: candidate.startTurn,
         endTurn: candidate.endTurn,
         sourceFirstMessageId: candidate.messages[0]?.id,
         sourceLastMessageId: candidate.messages[candidate.messages.length - 1]?.id,
         sourceMessageIds: candidate.messages.map((message) => message.id),
+        sourceRefs: this.buildSourceRefs(candidate.messages),
         sourceStartTimestamp: candidate.messages[0]?.createdAt,
         sourceEndTimestamp: candidate.messages[candidate.messages.length - 1]?.createdAt,
         sourceSequenceMin: candidate.messages[0]?.sequence,
@@ -327,10 +334,23 @@ export class CompactionEngine {
         sourceBinding,
         summaryLevel: 1,
         nodeKind: "leaf",
-        tokenCount: estimateTokens(summary.summary),
+        tokenCount: summaryTokenCount,
         createdAt: new Date().toISOString(),
         sourceHash,
         sourceMessageCount,
+        coverage: {
+          sourceTokenEstimate,
+          summaryTokenEstimate: summaryTokenCount,
+          compressionRatio: sourceTokenEstimate > 0 ? summaryTokenCount / sourceTokenEstimate : 0,
+        },
+        quality: {
+          confidence: 0.9,
+          sourceTraceComplete: true,
+          unresolvedConflicts: summary.conflicts?.length ?? 0,
+          needsHumanReview: (summary.conflicts?.length ?? 0) > 0,
+          generatedBy: "compaction_engine_v1",
+        },
+        sectionChunks: this.buildSectionChunks(summaryId, summary.summary),
       };
 
       await summaryStore.addSummary(entry);
@@ -364,6 +384,8 @@ export class CompactionEngine {
       `The API output budget is set to ${maxOutputTokens} tokens so the extraction can be as rich as needed, but the final extraction must never exceed the source length.`,
       "Keep enough detail that later retrieval can answer source-specific questions without immediately reopening every raw message.",
       "A good level-1 extraction preserves section structure, named mechanisms, comparisons, caveats, exact values, source-local terminology, and testable claims.",
+      "Write atomic bullets where possible: one constraint, decision, failure mode, next step, claim, or exact anchor per bullet.",
+      "Keep constraints, decisions, and failure modes in separate sections so downstream evidence atoms do not collapse different memory types together.",
       "Correct only errors that are clearly corrected by the source itself. Preserve uncertainty and disagreement instead of smoothing them away.",
       "Do not invent connective tissue, conclusions, citations, or facts that are not supported by the source.",
       "Return Markdown only. Do not wrap it in a code fence.",
@@ -376,8 +398,15 @@ export class CompactionEngine {
       "## Cleaned Substance",
       "## Mechanisms And Claims",
       "## Exact Anchors",
-      "## Decisions / Constraints / Failure Modes",
+      "## Constraints",
+      "## Decisions",
+      "## Failure Modes",
+      "## Next Steps",
+      "## Open Questions",
+      "## Conflicts / Ambiguities",
+      "## Candidate Evidence Atoms",
       "## Retrieval Cues",
+      "## Key Entities",
       "",
       transcript,
     ].join("\n");
@@ -476,30 +505,38 @@ export class CompactionEngine {
       ...headings,
       ...[...summary.matchAll(/`([^`]{2,80})`/g)].map((match) => match[1].trim()),
     ])].slice(0, 24);
-    const exactFacts = [...new Set(
-      summary
+    const exactAnchorLines = this.extractSectionLines(summary, /^(exact anchors?|mechanisms? and claims?|claims?|facts?)$/i, 40);
+    const exactFacts = [...new Set([
+      ...exactAnchorLines,
+      ...summary
         .split(/\r?\n/)
         .filter((line) => /(?:https?:\/\/|arxiv|local-synthetic|20\d{2}-\d{2}-\d{2}|[A-Za-z0-9_-]+\.(?:ts|md|json|sqlite)|\b\d+(?:\.\d+)?\b)/.test(line))
         .map((line) => line.replace(/^[-*]\s*/, "").trim())
         .filter(Boolean),
-    )].slice(0, 40);
+    ])].slice(0, 60);
     return {
       summary,
       keywords,
       toneTag: "markdown level-1 extraction",
       memoryType: "general",
       phase: "active",
-      constraints: this.extractSectionLines(summary, /constraints?|limits?|must/i),
-      decisions: this.extractSectionLines(summary, /decisions?|choices?|settled/i),
-      blockers: this.extractSectionLines(summary, /blockers?|failure|risks?/i),
-      nextSteps: this.extractSectionLines(summary, /next steps?|follow[- ]?ups?|todo/i),
-      keyEntities: keywords,
+      constraints: this.extractSectionLines(summary, /^(constraints?|limits?|musts?)$/i),
+      decisions: this.extractSectionLines(summary, /^(decisions?|choices?|settled)$/i),
+      blockers: this.extractSectionLines(summary, /^(blockers?|failure modes?|risks?)$/i),
+      nextSteps: this.extractSectionLines(summary, /^(next steps?|follow[- ]?ups?|todo)$/i),
+      keyEntities: [
+        ...this.extractSectionLines(summary, /^(key entities|entities|retrieval cues)$/i, 40),
+        ...keywords,
+      ].slice(0, 40),
       exactFacts,
       promotionIntent: "candidate",
+      openQuestions: this.extractSectionLines(summary, /^(open questions?|unknowns?)$/i),
+      conflicts: this.extractSectionLines(summary, /^(conflicts?(?: \/ ambiguities)?|ambiguities?)$/i),
+      candidateAtomPreviews: this.extractSectionLines(summary, /^(candidate evidence atoms?|evidence atoms?)$/i, 40),
     };
   }
 
-  private extractSectionLines(markdown: string, headingPattern: RegExp): string[] {
+  private extractSectionLines(markdown: string, headingPattern: RegExp, limit = 20): string[] {
     const lines = markdown.split(/\r?\n/);
     const collected: string[] = [];
     let inside = false;
@@ -517,7 +554,49 @@ export class CompactionEngine {
         collected.push(item);
       }
     }
-    return collected.slice(0, 20);
+    return collected.slice(0, limit);
+  }
+
+  private buildSourceRefs(messages: RawMessage[]): SummaryEntry["sourceRefs"] {
+    return messages.filter(isSummarySourceMessage).map((message) => ({
+      messageId: message.id,
+      role: message.role,
+      charStart: 0,
+      charEnd: message.content.length,
+      quoteHash: this.hash(message.content),
+    }));
+  }
+
+  private buildSectionChunks(summaryId: string, markdown: string): SummaryEntry["sectionChunks"] {
+    const chunks: NonNullable<SummaryEntry["sectionChunks"]> = [];
+    const lines = markdown.split(/\r?\n/);
+    let section = "Preamble";
+    let buffer: string[] = [];
+    const flush = () => {
+      const text = buffer.join("\n").trim();
+      if (!text) {
+        buffer = [];
+        return;
+      }
+      chunks.push({
+        id: `l1sec-${this.hash(`${summaryId}|${section}|${text}`).slice(0, 20)}`,
+        section,
+        text,
+        tokenCount: estimateTokens(text),
+      });
+      buffer = [];
+    };
+    for (const line of lines) {
+      const heading = line.match(/^#{1,3}\s+(.+)$/);
+      if (heading) {
+        flush();
+        section = heading[1].trim();
+        continue;
+      }
+      buffer.push(line);
+    }
+    flush();
+    return chunks;
   }
 
   private normalizeSummaryCandidate(candidate: unknown): SummaryResult | null {
@@ -559,6 +638,15 @@ export class CompactionEngine {
           ? candidateRecord.exactFacts.map((item) => String(item))
           : [],
         promotionIntent: this.normalizePromotionIntent(candidateRecord.promotionIntent),
+        openQuestions: Array.isArray(candidateRecord.openQuestions)
+          ? candidateRecord.openQuestions.map((item) => String(item))
+          : [],
+        conflicts: Array.isArray(candidateRecord.conflicts)
+          ? candidateRecord.conflicts.map((item) => String(item))
+          : [],
+        candidateAtomPreviews: Array.isArray(candidateRecord.candidateAtomPreviews)
+          ? candidateRecord.candidateAtomPreviews.map((item) => String(item))
+          : [],
       };
     }
 
@@ -666,6 +754,10 @@ export class CompactionEngine {
 
   private normalizeThresholdRatio(value: number, fallback: number): number {
     return Number.isFinite(value) && value > 0 && value < 1 ? value : fallback;
+  }
+
+  private hash(value: string): string {
+    return createHash("sha256").update(value, "utf8").digest("hex");
   }
 
   private getCompactionPressureTokens(

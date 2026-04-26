@@ -53,6 +53,7 @@ export class OmsAdminService {
     const rawMessages = stores.rawStore.getAll(scopedQuery);
     const summaries = stores.summaryStore.getAllSummaries(scopedQuery);
     const durableMemories = stores.durableMemoryStore.getAll();
+    const evidenceAtoms = stores.evidenceAtomStore.getAll(scopedQuery);
     const knowledgeRawItems = stores.knowledgeRawStore.getAll();
     return {
       ok: true,
@@ -72,6 +73,7 @@ export class OmsAdminService {
         observations: stores.observationStore.count(),
         durableMemories: durableMemories.length,
         activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
+        evidenceAtoms: evidenceAtoms.length,
         knowledgeRawItems: knowledgeRawItems.length,
         pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "review_pending" || entry.status === "pending" || entry.status === "processing").length,
         projects: stores.projectStore.getAll().filter((project) => project.status !== "archived").length,

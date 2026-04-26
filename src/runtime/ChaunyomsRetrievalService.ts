@@ -6,6 +6,7 @@ import {
   AnswerCandidate,
   ContextItem,
   DurableMemoryEntry,
+  EvidenceAtomEntry,
   FixedPrefixProvider,
   KnowledgeDocumentIndexEntry,
   KnowledgeRepository,
@@ -23,6 +24,7 @@ import {
 } from "../host/OpenClawPayloadAdapter";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
 import { OmsExpandResult, OmsGrepHit } from "../data/SQLiteRuntimeStore";
+import { estimateTokens } from "../utils/tokenizer";
 
 interface ToolResponse {
   content: Array<Record<string, unknown>>;
@@ -41,6 +43,37 @@ interface RecallPresentationOptions {
   maxItems: number;
   maxCharsPerItem: number;
   includeFullTrace: boolean;
+}
+
+interface EvidenceGateResult {
+  status: "sufficient" | "needs_expansion" | "insufficient";
+  reason: string;
+  atomHitCount: number;
+  usableAtomCount: number;
+  verifiedTraceCount: number;
+  recommendedAction: "answer" | "expand_l1" | "trace_raw" | "no_answer";
+  nextActionHint?: string;
+  targetIds: string[];
+}
+
+interface AtomEvidenceHealth {
+  atomHitCount: number;
+  usableAtomCount: number;
+  blockedReasons: string[];
+}
+
+type RecallLayer = "atom" | "summary" | "raw";
+
+interface RetrievalBudgetPlan {
+  total: number;
+  atom: number;
+  summary: number;
+  raw: number;
+  perItem: {
+    atom: number;
+    summary: number;
+    raw: number;
+  };
 }
 
 export interface RetrievalLayerDependencies {
@@ -105,7 +138,8 @@ export class ChaunyomsRetrievalService {
 
   async executeMemoryRetrieve(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
-    const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
+    const stores = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = stores;
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
@@ -245,7 +279,8 @@ export class ChaunyomsRetrievalService {
           })
         : [];
       timings.ftsMs = Date.now() - ftsStartedAt;
-      const recallBudget = this.resolveRecallBudget(args, context.totalBudget);
+      const retrievalBudget = this.resolveRetrievalBudgetPlan(args, context.totalBudget);
+      const recallBudget = retrievalBudget.total;
       const rawFtsMessageIds = rawFtsHints.map((hit) => hit.message.id);
       const recallStartedAt = Date.now();
       const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget, {
@@ -257,14 +292,27 @@ export class ChaunyomsRetrievalService {
         includeSummaryItems: true,
       });
       timings.resolveMs = Date.now() - recallStartedAt;
+      const atomStartedAt = Date.now();
+      const atomResult = this.withPersistentEvidenceAtomHits(
+        result,
+        this.queryNeedsRawSource(query)
+          ? []
+          : stores.evidenceAtomStore.search(query, {
+              sessionId: scopedSessionId,
+              limit: 8,
+            }),
+        recallBudget,
+      );
+      timings.atomMs = Date.now() - atomStartedAt;
       const planStartedAt = Date.now();
-      const planned = this.planRecallItems(result, recallBudget);
+      const planned = this.planRecallItems(query, atomResult, retrievalBudget);
       timings.planMs = Date.now() - planStartedAt;
+      const evidenceGate = this.evaluateEvidenceGate(query, planned.items, atomResult);
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
       const presentation = this.resolveRecallPresentationOptions(args);
       timings.totalMs = Date.now() - startedAt;
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, planned.items, result.sourceTrace, result.answerCandidates, presentation) }],
+        content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate) }],
         details: {
           ok: true,
           route: decision.route,
@@ -272,9 +320,11 @@ export class ChaunyomsRetrievalService {
           query,
           consumedTokens: planned.consumedTokens,
           hitCount: planned.items.length,
-          retrievalHitType: result.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
-          recallStrategy: result.strategy ?? "summary_navigation",
-          rawCandidateCount: result.rawCandidateCount ?? 0,
+          retrievalHitType: atomResult.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
+          recallStrategy: atomResult.strategy ?? "summary_navigation",
+          rawCandidateCount: atomResult.rawCandidateCount ?? 0,
+          persistentEvidenceAtomHitCount: atomResult.items.filter((item) => item.metadata?.persistentEvidenceAtom === true).length,
+          evidenceGate,
           rawFtsHintCount: rawFtsHints.length,
           autoRecall: true,
           autoRecallReason: this.explainAutoRecall(decision, context),
@@ -283,12 +333,13 @@ export class ChaunyomsRetrievalService {
           explanation: decision.explanation,
           timings,
           recallBudget,
+          retrievalBudget,
           rawFtsHintLimit: this.resolveRawFtsHintLimit(args),
           scope,
           sessionId: scopedSessionId ?? null,
-          dagTrace: presentation.includeFullTrace ? result.dagTrace : this.compactDagTrace(result.dagTrace),
-          sourceTrace: presentation.includeFullTrace ? result.sourceTrace : this.compactSourceTrace(result.sourceTrace),
-          answerCandidates: this.compactAnswerCandidates(result.answerCandidates ?? [], presentation),
+          dagTrace: presentation.includeFullTrace ? atomResult.dagTrace : this.compactDagTrace(atomResult.dagTrace),
+          sourceTrace: presentation.includeFullTrace ? atomResult.sourceTrace : this.compactSourceTrace(atomResult.sourceTrace),
+          answerCandidates: this.compactAnswerCandidates(atomResult.answerCandidates ?? [], presentation),
           plannerRunId: planned.plan.runId,
           plannerRejectedCount: planned.plan.rejected.length,
         },
@@ -1039,6 +1090,275 @@ export class ChaunyomsRetrievalService {
     }));
   }
 
+  private withPersistentEvidenceAtomHits(
+    result: RecallResult,
+    atoms: EvidenceAtomEntry[],
+    recallBudget: number,
+  ): RecallResult {
+    if (atoms.length === 0) {
+      return result;
+    }
+    const atomBudget = Math.max(300, Math.min(1600, Math.floor(recallBudget * 0.3)));
+    const atomItems: ContextItem[] = [];
+    let consumed = 0;
+    for (const atom of atoms) {
+      const item = this.buildPersistentEvidenceAtomItem(atom);
+      if (consumed + item.tokenCount > atomBudget && atomItems.length > 0) {
+        break;
+      }
+      atomItems.push(item);
+      consumed += item.tokenCount;
+    }
+    if (atomItems.length === 0) {
+      return result;
+    }
+
+    const existingAtomIds = new Set(
+      result.items
+        .map((item) => item.metadata?.atomId)
+        .filter((value): value is string => typeof value === "string"),
+    );
+    const prependedItems = atomItems.filter((item) => {
+      const atomId = item.metadata?.atomId;
+      return typeof atomId !== "string" || !existingAtomIds.has(atomId);
+    });
+    if (prependedItems.length === 0) {
+      return result;
+    }
+
+    return {
+      ...result,
+      items: [...prependedItems, ...result.items],
+      consumedTokens: result.consumedTokens + prependedItems.reduce((sum, item) => sum + item.tokenCount, 0),
+      sourceTrace: [
+        ...prependedItems.map((item) => this.buildPersistentEvidenceAtomTrace(item)),
+        ...result.sourceTrace,
+      ],
+      strategy: result.strategy ?? "summary_navigation",
+    };
+  }
+
+  private buildPersistentEvidenceAtomItem(atom: EvidenceAtomEntry): ContextItem {
+    const content = [
+      `[evidence_atom:${atom.type}] ${atom.text}`,
+      `sourceSummaryId: ${atom.sourceSummaryId}`,
+      atom.sourceMessageIds && atom.sourceMessageIds.length > 0
+        ? `sourceMessageIds: ${atom.sourceMessageIds.slice(0, 6).join(", ")}`
+        : "",
+    ].filter(Boolean).join("\n");
+    return {
+      kind: "summary",
+      summaryId: atom.sourceSummaryId,
+      tokenCount: Math.max(estimateTokens(content), 1),
+      content,
+      metadata: {
+        atomId: atom.id,
+        sessionId: atom.sessionId,
+        evidenceAtom: atom.text,
+        persistentEvidenceAtom: true,
+        evidenceType: atom.type,
+        sourceSummaryId: atom.sourceSummaryId,
+        sourceBinding: atom.sourceBinding,
+        sourceHash: atom.sourceHash,
+        sourceMessageCount: atom.sourceMessageCount,
+        sourceVerified: Boolean(atom.sourceBinding || atom.sourceHash),
+        sourceMessageIds: atom.sourceMessageIds ?? [],
+        confidence: atom.confidence,
+        importance: atom.importance,
+        stability: atom.stability,
+        atomStatus: atom.atomStatus ?? "candidate",
+        sourceTraceComplete: atom.sourceTraceComplete,
+      },
+    };
+  }
+
+  private buildPersistentEvidenceAtomTrace(item: ContextItem): SourceTrace {
+    const sourceMessageIds = Array.isArray(item.metadata?.sourceMessageIds)
+      ? item.metadata.sourceMessageIds.filter((value): value is string => typeof value === "string")
+      : [];
+    return {
+      route: "summary_tree",
+      summaryId: item.summaryId,
+      sessionId: typeof item.metadata?.sessionId === "string" ? item.metadata.sessionId : "",
+      strategy: sourceMessageIds.length > 0 ? "message_ids" : "none",
+      verified: item.metadata?.sourceVerified === true,
+      reason: "persistent_evidence_atom_hit",
+      sourceHash: typeof item.metadata?.sourceHash === "string" ? item.metadata.sourceHash : undefined,
+      sourceMessageCount: typeof item.metadata?.sourceMessageCount === "number" ? item.metadata.sourceMessageCount : undefined,
+      resolvedMessageCount: sourceMessageIds.length,
+      messageIds: sourceMessageIds,
+    };
+  }
+
+  private queryNeedsRawSource(query: string): boolean {
+    return /(quote|verbatim|exact wording|original text|raw source|source span|trace raw|原文|原话|逐字|引用|精确出处|源消息|源码片段)/i.test(query);
+  }
+
+  private evaluateEvidenceGate(
+    query: string,
+    items: ContextItem[],
+    result: RecallResult,
+  ): EvidenceGateResult {
+    const atomHealth = this.evaluateAtomEvidenceHealth(items);
+    const { atomHitCount, usableAtomCount } = atomHealth;
+    const verifiedTraceCount = result.sourceTrace.filter((trace) => trace.verified).length;
+    const verifiedAnswerCount = (result.answerCandidates ?? []).filter((candidate) => candidate.sourceVerified).length;
+    if (items.length === 0 && verifiedAnswerCount === 0) {
+      return {
+        status: "insufficient",
+        reason: "no selected context item or verified answer candidate",
+        atomHitCount,
+        usableAtomCount,
+        verifiedTraceCount,
+        recommendedAction: "no_answer",
+        nextActionHint: "Do not answer from memory; ask a targeted clarification or report not found.",
+        targetIds: [],
+      };
+    }
+    if (this.queryNeedsRawSource(query)) {
+      const targetIds = this.extractTraceTargetIds(items, result);
+      return {
+        status: verifiedTraceCount > 0 ? "sufficient" : "needs_expansion",
+        reason: verifiedTraceCount > 0
+          ? "raw-source-sensitive query has verified trace"
+          : "raw-source-sensitive query should trace raw spans before answering",
+        atomHitCount,
+        usableAtomCount,
+        verifiedTraceCount,
+        recommendedAction: verifiedTraceCount > 0 ? "answer" : "trace_raw",
+        nextActionHint: verifiedTraceCount > 0
+          ? "Answer, but cite the traced source handle when precision matters."
+          : "Call oms_trace/oms_expand on a listed atomId, summaryId, or messageId before answering.",
+        targetIds,
+      };
+    }
+    if (usableAtomCount > 0 || verifiedAnswerCount > 0) {
+      return {
+        status: "sufficient",
+        reason: usableAtomCount > 0
+          ? "selected context includes usable evidence atoms"
+          : "selected answer candidates have verified source evidence",
+        atomHitCount,
+        usableAtomCount,
+        verifiedTraceCount,
+        recommendedAction: "answer",
+        nextActionHint: "Answer from the selected evidence atoms; expand only if the user asks for exact wording.",
+        targetIds: this.extractTraceTargetIds(items, result),
+      };
+    }
+    if (atomHitCount > 0 && atomHealth.blockedReasons.length > 0) {
+      const reason = `evidence atoms are not directly usable: ${[...new Set(atomHealth.blockedReasons)].join(", ")}`;
+      return {
+        status: verifiedTraceCount > 0 ? "needs_expansion" : "insufficient",
+        reason,
+        atomHitCount,
+        usableAtomCount,
+        verifiedTraceCount,
+        recommendedAction: verifiedTraceCount > 0 ? "expand_l1" : "no_answer",
+        nextActionHint: verifiedTraceCount > 0
+          ? "Expand the listed summary/source before answering because the atom quality gate blocked direct use."
+          : "Do not answer from blocked evidence atoms; run a narrower query or report not found.",
+        targetIds: this.extractTraceTargetIds(items, result),
+      };
+    }
+    if (verifiedTraceCount > 0) {
+      return {
+        status: "needs_expansion",
+        reason: "verified summary/source trace exists, but no evidence atom was selected",
+        atomHitCount,
+        usableAtomCount,
+        verifiedTraceCount,
+        recommendedAction: "expand_l1",
+        nextActionHint: "Expand the listed summaryId before making a specific claim.",
+        targetIds: this.extractTraceTargetIds(items, result),
+      };
+    }
+    return {
+      status: "insufficient",
+      reason: "selected hits are not source-verified enough for grounded answer",
+      atomHitCount,
+      usableAtomCount,
+      verifiedTraceCount,
+      recommendedAction: "no_answer",
+      nextActionHint: "Do not answer from weak similarity alone; run a narrower query or report not found.",
+      targetIds: this.extractTraceTargetIds(items, result),
+    };
+  }
+
+  private evaluateAtomEvidenceHealth(items: ContextItem[]): AtomEvidenceHealth {
+    const atomItems = items.filter((item) =>
+      item.metadata?.persistentEvidenceAtom === true || item.metadata?.evidenceAtom === true || typeof item.metadata?.atomId === "string",
+    );
+    const blockedReasons: string[] = [];
+    let usableAtomCount = 0;
+    for (const item of atomItems) {
+      const reasons = this.atomBlockReasons(item);
+      if (reasons.length === 0) {
+        usableAtomCount += 1;
+      } else {
+        blockedReasons.push(...reasons);
+      }
+    }
+    return {
+      atomHitCount: atomItems.length,
+      usableAtomCount,
+      blockedReasons,
+    };
+  }
+
+  private atomBlockReasons(item: ContextItem): string[] {
+    const reasons: string[] = [];
+    const status = typeof item.metadata?.atomStatus === "string" ? item.metadata.atomStatus : "candidate";
+    if (status === "conflicted" || status === "expired" || status === "superseded") {
+      reasons.push(status);
+    }
+    if (item.metadata?.sourceTraceComplete === false || item.metadata?.sourceVerified === false) {
+      reasons.push("source_trace_incomplete");
+    }
+    const confidence = typeof item.metadata?.confidence === "number" ? item.metadata.confidence : undefined;
+    if (typeof confidence === "number" && confidence < 0.55) {
+      reasons.push("low_confidence");
+    }
+    const stability = typeof item.metadata?.stability === "number" ? item.metadata.stability : undefined;
+    if (typeof stability === "number" && stability < 0.35) {
+      reasons.push("low_stability");
+    }
+    return reasons;
+  }
+
+  private extractTraceTargetIds(items: ContextItem[], result: RecallResult): string[] {
+    const ids = new Set<string>();
+    for (const item of items) {
+      const atomId = item.metadata?.atomId;
+      if (typeof atomId === "string" && atomId.trim()) {
+        ids.add(`atom:${atomId}`);
+      }
+      const summaryId = item.summaryId ?? item.metadata?.sourceSummaryId;
+      if (typeof summaryId === "string" && summaryId.trim()) {
+        ids.add(`summary:${summaryId}`);
+      }
+      const messageId = item.metadata?.messageId;
+      if (typeof messageId === "string" && messageId.trim()) {
+        ids.add(`message:${messageId}`);
+      }
+    }
+    for (const trace of result.sourceTrace) {
+      if (trace.summaryId) {
+        ids.add(`summary:${trace.summaryId}`);
+      }
+      for (const messageId of trace.messageIds ?? []) {
+        ids.add(`message:${messageId}`);
+        if (ids.size >= 8) {
+          break;
+        }
+      }
+      if (ids.size >= 8) {
+        break;
+      }
+    }
+    return [...ids].slice(0, 8);
+  }
+
   private compactSourceTrace(sourceTrace: SourceTrace[]): Array<Record<string, unknown>> {
     return sourceTrace.slice(0, 6).map((trace) => ({
       route: trace.route,
@@ -1068,23 +1388,35 @@ export class ChaunyomsRetrievalService {
     }));
   }
 
-  private planRecallItems(result: RecallResult, recallBudget: number): {
+  private planRecallItems(query: string, result: RecallResult, retrievalBudget: RetrievalBudgetPlan): {
     items: ContextItem[];
     consumedTokens: number;
     plan: ReturnType<ContextPlanner["plan"]>;
   } {
-    const source = result.strategy === "raw_first" ? "raw_exact_search" : "summary_context";
     const answerEvidenceIds = new Set((result.answerCandidates ?? []).flatMap((candidate) => candidate.evidenceMessageIds));
-    const candidates = result.items.map((item, index) => {
+    const recallItems = result.items.map((item) =>
+      this.buildBudgetAwareRecallItem(query, item, this.layerPerItemBudget(this.classifyRecallLayer(item), retrievalBudget)),
+    );
+    const candidates = recallItems.map((item, index) => {
+      const source = this.contextSourceForRecallItem(item, result);
       const candidate = this.contextPlanner.buildCandidate(item, source, index);
       const messageId = typeof item.metadata?.messageId === "string" ? item.metadata.messageId : null;
       if (messageId && answerEvidenceIds.has(messageId)) {
         candidate.score += 120;
         candidate.reasons.push("answer_evidence");
       }
+      const layer = this.classifyRecallLayer(item);
+      if (layer === "atom") {
+        candidate.score += 40;
+        candidate.reasons.push("evidence_atom_first");
+      } else if (layer === "raw" && this.queryNeedsRawSource(query)) {
+        candidate.score += 30;
+        candidate.reasons.push("raw_source_requested");
+      }
       return candidate;
     });
-    const plan = this.contextPlanner.plan(candidates, { budget: recallBudget });
+    const layerLimitedCandidates = this.applyRecallLayerBudgets(candidates, retrievalBudget);
+    const plan = this.contextPlanner.plan(layerLimitedCandidates, { budget: retrievalBudget.total });
     return {
       items: plan.selected.map((candidate) => candidate.item),
       consumedTokens: plan.selectedTokens,
@@ -1092,15 +1424,149 @@ export class ChaunyomsRetrievalService {
     };
   }
 
+  private contextSourceForRecallItem(
+    item: ContextItem,
+    result: RecallResult,
+  ): "active_memory" | "summary_context" | "raw_exact_search" {
+    const layer = this.classifyRecallLayer(item);
+    if (layer === "atom") {
+      return "active_memory";
+    }
+    if (layer === "raw" || result.strategy === "raw_first") {
+      return "raw_exact_search";
+    }
+    return "summary_context";
+  }
+
+  private classifyRecallLayer(item: ContextItem): RecallLayer {
+    if (item.metadata?.persistentEvidenceAtom === true || item.metadata?.evidenceAtom === true || typeof item.metadata?.atomId === "string") {
+      return "atom";
+    }
+    if (item.kind !== "summary") {
+      return "raw";
+    }
+    return "summary";
+  }
+
+  private applyRecallLayerBudgets(
+    candidates: ReturnType<ContextPlanner["buildCandidate"]>[],
+    retrievalBudget: RetrievalBudgetPlan,
+  ): ReturnType<ContextPlanner["buildCandidate"]>[] {
+    const used: Record<RecallLayer, number> = { atom: 0, summary: 0, raw: 0 };
+    const selected: ReturnType<ContextPlanner["buildCandidate"]>[] = [];
+    const sorted = [...candidates].sort((left, right) =>
+      right.score - left.score ||
+      Math.max(left.item.tokenCount, 0) - Math.max(right.item.tokenCount, 0),
+    );
+
+    for (const candidate of sorted) {
+      const layer = this.classifyRecallLayer(candidate.item);
+      const layerBudget = retrievalBudget[layer];
+      const tokenCount = Math.max(candidate.item.tokenCount, 0);
+      if (layerBudget > 0 && used[layer] + tokenCount > layerBudget && used[layer] > 0) {
+        continue;
+      }
+      used[layer] += tokenCount;
+      selected.push(candidate);
+    }
+
+    const selectedIds = new Set(selected.map((candidate) => candidate.id));
+    return candidates.filter((candidate) => selectedIds.has(candidate.id));
+  }
+
+  private layerPerItemBudget(layer: RecallLayer, retrievalBudget: RetrievalBudgetPlan): number {
+    return retrievalBudget.perItem[layer];
+  }
+
+  private buildBudgetAwareRecallItem(query: string, item: ContextItem, recallBudget: number): ContextItem {
+    const tokenCount = Math.max(item.tokenCount, estimateTokens(String(item.content ?? "")), 1);
+    const snippetBudget = Math.max(256, Math.min(recallBudget, Math.floor(recallBudget * 0.8)));
+    if (tokenCount <= snippetBudget) {
+      return item;
+    }
+
+    const content = String(item.content ?? "");
+    const excerpt = this.buildRecallExcerpt(query, content, snippetBudget);
+    const marker = "\n\n[chaunyoms: evidence snippet; use oms_expand/oms_trace with the listed id for the full source]";
+    const snippet = `${excerpt}${marker}`;
+    return {
+      ...item,
+      tokenCount: Math.max(estimateTokens(snippet), 1),
+      content: snippet,
+      metadata: {
+        ...(item.metadata ?? {}),
+        recallSnippet: true,
+        originalTokenCount: tokenCount,
+      },
+    };
+  }
+
+  private buildRecallExcerpt(query: string, content: string, tokenBudget: number): string {
+    const normalizedBudget = Math.max(1, Math.floor(tokenBudget));
+    if (estimateTokens(content) <= normalizedBudget) {
+      return content;
+    }
+
+    const charBudget = Math.max(400, Math.floor(content.length * (normalizedBudget / Math.max(estimateTokens(content), 1))));
+    const anchor = this.findBestExcerptAnchor(query, content);
+    const start = Math.max(0, anchor - Math.floor(charBudget / 2));
+    const end = Math.min(content.length, start + charBudget);
+    let excerpt = content.slice(start, end);
+    while (excerpt.length > 1 && estimateTokens(excerpt) > normalizedBudget) {
+      const trim = Math.max(1, Math.floor(excerpt.length * 0.08));
+      excerpt = excerpt.slice(trim, Math.max(trim + 1, excerpt.length - trim));
+    }
+    const prefix = start > 0 ? "... " : "";
+    const suffix = end < content.length ? " ..." : "";
+    return `${prefix}${excerpt.trim()}${suffix}`;
+  }
+
+  private findBestExcerptAnchor(query: string, content: string): number {
+    const lower = content.toLowerCase();
+    const terms = this.queryTerms(query)
+      .filter((term) => term.length >= 3)
+      .sort((left, right) => right.length - left.length);
+    for (const term of terms) {
+      const index = lower.indexOf(term.toLowerCase());
+      if (index >= 0) {
+        return index;
+      }
+    }
+    return Math.max(0, content.length - 1);
+  }
+
   private resolveRecallBudget(args: unknown, totalBudget: number): number {
+    return this.resolveRetrievalBudgetPlan(args, totalBudget).total;
+  }
+
+  private resolveRetrievalBudgetPlan(args: unknown, totalBudget: number): RetrievalBudgetPlan {
     const budget = this.isRecord(args) ? args.budget : undefined;
-    const maxAutomaticBudget = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true)
+    const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
+    const maxAutomaticBudget = deepRecall
       ? Math.min(totalBudget * 0.05, 10000)
       : Math.min(totalBudget * 0.015, 3000);
     const resolvedBudget = typeof budget === "number" && Number.isFinite(budget)
       ? Math.min(budget, totalBudget * 0.1, 20000)
       : maxAutomaticBudget;
-    return Math.max(256, Math.floor(resolvedBudget));
+    const total = Math.max(256, Math.floor(resolvedBudget));
+    const atom = Math.max(80, Math.min(deepRecall ? 3000 : 1600, Math.floor(total * (deepRecall ? 0.35 : 0.42))));
+    let raw = Math.max(80, Math.min(deepRecall ? 4500 : 1800, Math.floor(total * (deepRecall ? 0.35 : 0.28))));
+    let summary = total - atom - raw;
+    if (summary < 80) {
+      raw = Math.max(40, raw - (80 - summary));
+      summary = total - atom - raw;
+    }
+    return {
+      total,
+      atom,
+      summary,
+      raw,
+      perItem: {
+        atom: Math.max(120, Math.min(atom, deepRecall ? 420 : 260)),
+        summary: Math.max(240, Math.min(summary, deepRecall ? 1400 : 800)),
+        raw: Math.max(300, Math.min(raw, deepRecall ? 1600 : 900)),
+      },
+    };
   }
 
   private resolveRawFtsHintLimit(args: unknown): number {
@@ -1294,6 +1760,7 @@ export class ChaunyomsRetrievalService {
       maxCharsPerItem: 700,
       includeFullTrace: false,
     },
+    evidenceGate?: EvidenceGateResult,
   ): string {
     if (items.length === 0) {
       if (answerCandidates.length === 0) {
@@ -1308,6 +1775,17 @@ export class ChaunyomsRetrievalService {
           ),
           "",
         ].join("\n")
+      : "";
+    const gate = evidenceGate
+      ? [
+          `Evidence gate: ${evidenceGate.status}`,
+          `Reason: ${evidenceGate.reason}`,
+          `Usable atoms: ${evidenceGate.usableAtomCount}/${evidenceGate.atomHitCount}`,
+          `Recommended action: ${evidenceGate.recommendedAction}`,
+          evidenceGate.nextActionHint ? `Next action hint: ${evidenceGate.nextActionHint}` : "",
+          evidenceGate.targetIds.length > 0 ? `Trace targets: ${evidenceGate.targetIds.join(", ")}` : "",
+          "",
+        ].filter((line) => line.length > 0).join("\n")
       : "";
     const summaryItems = items.filter((item) => item.kind === "summary");
     const messageItems = items
@@ -1335,7 +1813,9 @@ export class ChaunyomsRetrievalService {
       .map(
         (item) => {
           const label = item.kind === "summary"
-            ? `[summary ${item.summaryId ?? "?"}]`
+            ? item.metadata?.persistentEvidenceAtom === true
+              ? `[evidence atom ${item.metadata.atomId ?? "?"}]`
+              : `[summary ${item.summaryId ?? "?"}]`
             : `[turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}`;
           return `${label}: ${this.truncateText(String(item.content ?? ""), presentation.maxCharsPerItem)}`;
         },
@@ -1358,6 +1838,7 @@ export class ChaunyomsRetrievalService {
       `Historical source hits for: ${query}`,
       "",
       answers,
+      gate,
       localMatchText,
       messages,
       omitted,

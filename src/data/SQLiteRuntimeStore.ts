@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   DurableMemoryEntry,
+  EvidenceAtomEntry,
   KnowledgeDocumentIndexEntry,
   LoggerLike,
   RawMessage,
@@ -66,6 +67,7 @@ export interface RuntimeContextRunRecord {
 export interface RuntimeTableCounts {
   messages: number;
   summaries: number;
+  evidenceAtoms: number;
   memories: number;
   assets: number;
   sourceEdges: number;
@@ -214,6 +216,7 @@ export class SQLiteRuntimeStore {
     messages: RawMessage[];
     summaries: SummaryEntry[];
     memories: DurableMemoryEntry[];
+    atoms?: EvidenceAtomEntry[];
   }): Promise<void> {
     await this.init();
     if (!this.openDatabase()) {
@@ -232,8 +235,11 @@ export class SQLiteRuntimeStore {
       for (const memory of args.memories) {
         this.upsertMemory(memory);
       }
+      for (const atom of args.atoms ?? []) {
+        this.upsertEvidenceAtom(atom);
+      }
       await this.mirrorAssetsFromMarkdownIndex();
-      this.rebuildSourceEdges(args.summaries, args.memories);
+      this.rebuildSourceEdges(args.summaries, args.memories, args.atoms ?? []);
       this.db?.exec("COMMIT");
       transactionStarted = false;
     } catch (error) {
@@ -877,6 +883,10 @@ export class SQLiteRuntimeStore {
             WHERE edge.target_kind = 'summary' AND s.id = edge.target_id
           )
           AND NOT EXISTS (
+            SELECT 1 FROM evidence_atoms atom
+            WHERE edge.target_kind = 'evidence_atom' AND atom.id = edge.target_id
+          )
+          AND NOT EXISTS (
             SELECT 1 FROM memories mem
             WHERE edge.target_kind = 'memory' AND mem.id = edge.target_id
           )
@@ -1261,6 +1271,10 @@ export class SQLiteRuntimeStore {
         `DELETE FROM source_edges WHERE ${args.whereColumn} = ?`,
         args.target,
       );
+      deleted.evidence_atoms = this.deleteBySql(
+        `DELETE FROM evidence_atoms WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
       deleted.messages = this.deleteBySql(
         `DELETE FROM messages WHERE ${args.whereColumn} = ?`,
         args.target,
@@ -1402,6 +1416,29 @@ export class SQLiteRuntimeStore {
         payload_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_memories_project_status ON memories(project_id, record_status);
+
+      CREATE TABLE IF NOT EXISTS evidence_atoms (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        agent_id TEXT,
+        project_id TEXT,
+        topic_id TEXT,
+        record_status TEXT,
+        type TEXT NOT NULL,
+        text TEXT NOT NULL,
+        retrieval_text TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        source_summary_id TEXT NOT NULL,
+        source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+        start_turn INTEGER NOT NULL,
+        end_turn INTEGER NOT NULL,
+        confidence REAL NOT NULL,
+        importance REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_atoms_session_type ON evidence_atoms(session_id, type, record_status);
+      CREATE INDEX IF NOT EXISTS idx_atoms_project_status ON evidence_atoms(project_id, record_status);
 
       CREATE TABLE IF NOT EXISTS assets (
         doc_id TEXT PRIMARY KEY,
@@ -1667,6 +1704,54 @@ export class SQLiteRuntimeStore {
     this.refreshFts("memories_fts", "id", memory.id, [memory.text, memory.tags.join(" ")]);
   }
 
+  private upsertEvidenceAtom(atom: EvidenceAtomEntry): void {
+    this.prepare(`
+      INSERT INTO evidence_atoms (
+        id, session_id, agent_id, project_id, topic_id, record_status,
+        type, text, retrieval_text, tags_json, source_summary_id,
+        source_message_ids_json, start_turn, end_turn, confidence, importance,
+        created_at, payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        session_id=excluded.session_id,
+        agent_id=excluded.agent_id,
+        project_id=excluded.project_id,
+        topic_id=excluded.topic_id,
+        record_status=excluded.record_status,
+        type=excluded.type,
+        text=excluded.text,
+        retrieval_text=excluded.retrieval_text,
+        tags_json=excluded.tags_json,
+        source_summary_id=excluded.source_summary_id,
+        source_message_ids_json=excluded.source_message_ids_json,
+        start_turn=excluded.start_turn,
+        end_turn=excluded.end_turn,
+        confidence=excluded.confidence,
+        importance=excluded.importance,
+        created_at=excluded.created_at,
+        payload_json=excluded.payload_json
+    `)?.run(
+      atom.id,
+      atom.sessionId,
+      atom.agentId ?? null,
+      atom.projectId ?? null,
+      atom.topicId ?? null,
+      atom.recordStatus ?? "active",
+      atom.type,
+      atom.text,
+      atom.retrievalText,
+      this.stringify(atom.tags ?? []),
+      atom.sourceSummaryId,
+      this.stringify(atom.sourceMessageIds ?? []),
+      atom.startTurn,
+      atom.endTurn,
+      atom.confidence,
+      atom.importance,
+      atom.createdAt,
+      this.stringify(atom),
+    );
+  }
+
   private async mirrorAssetsFromMarkdownIndex(): Promise<void> {
     if (!this.db) {
       return;
@@ -1733,7 +1818,11 @@ export class SQLiteRuntimeStore {
     this.refreshFts("assets_fts", "doc_id", asset.docId, [asset.title, asset.summary, asset.tags.join(" ")]);
   }
 
-  private rebuildSourceEdges(summaries: SummaryEntry[], memories: DurableMemoryEntry[]): void {
+  private rebuildSourceEdges(
+    summaries: SummaryEntry[],
+    memories: DurableMemoryEntry[],
+    atoms: EvidenceAtomEntry[] = [],
+  ): void {
     if (!this.db) {
       return;
     }
@@ -1744,6 +1833,10 @@ export class SQLiteRuntimeStore {
 
     for (const memory of memories) {
       this.upsertMemorySourceEdges(memory, { deleteExisting: false });
+    }
+
+    for (const atom of atoms) {
+      this.upsertEvidenceAtomSourceEdges(atom, { deleteExisting: false });
     }
 
     const assetRows = this.db.prepare("SELECT payload_json FROM assets").all();
@@ -1967,6 +2060,7 @@ export class SQLiteRuntimeStore {
     return {
       messages: this.countTable("messages"),
       summaries: this.countTable("summaries"),
+      evidenceAtoms: this.countTable("evidence_atoms"),
       memories: this.countTable("memories"),
       assets: this.countTable("assets"),
       sourceEdges: this.countTable("source_edges"),
@@ -1979,6 +2073,7 @@ export class SQLiteRuntimeStore {
     return {
       messages: 0,
       summaries: 0,
+      evidenceAtoms: 0,
       memories: 0,
       assets: 0,
       sourceEdges: 0,
@@ -2066,6 +2161,10 @@ export class SQLiteRuntimeStore {
         const row = this.db.prepare("SELECT payload_json FROM memories WHERE id = ?").get(id);
         return row ? this.parseObject(row.payload_json) : null;
       }
+      case "evidence_atom": {
+        const row = this.db.prepare("SELECT payload_json FROM evidence_atoms WHERE id = ?").get(id);
+        return row ? this.parseObject(row.payload_json) : null;
+      }
       case "asset": {
         const row = this.db.prepare("SELECT payload_json FROM assets WHERE doc_id = ?").get(id);
         return row ? this.parseObject(row.payload_json) : null;
@@ -2093,8 +2192,14 @@ export class SQLiteRuntimeStore {
 
   private normalizeKind(kind: string, id: string): string {
     const normalized = kind.trim().toLowerCase();
-    if (["message", "summary", "memory", "asset"].includes(normalized)) {
+    if (normalized === "atom") {
+      return "evidence_atom";
+    }
+    if (["message", "summary", "memory", "asset", "evidence_atom"].includes(normalized)) {
       return normalized;
+    }
+    if (id.startsWith("atom-")) {
+      return "evidence_atom";
     }
     if (id.startsWith("memory-")) {
       return "memory";
@@ -2112,6 +2217,9 @@ export class SQLiteRuntimeStore {
   }
 
   private targetKindForSourceId(sourceId: string): string {
+    if (sourceId.startsWith("atom-")) {
+      return "evidence_atom";
+    }
     if (sourceId.startsWith("memory-")) {
       return "memory";
     }
@@ -2128,11 +2236,14 @@ export class SQLiteRuntimeStore {
     if (item.kind === "message") {
       return "message";
     }
-    if (item.summaryId) {
-      return "summary";
-    }
     if (typeof item.metadata?.memoryId === "string") {
       return "memory";
+    }
+    if (typeof item.metadata?.atomId === "string") {
+      return "evidence_atom";
+    }
+    if (item.summaryId) {
+      return "summary";
     }
     if (typeof item.metadata?.docId === "string") {
       return "asset";
@@ -2157,6 +2268,70 @@ export class SQLiteRuntimeStore {
       return fallbackId;
     }
     return null;
+  }
+
+  private upsertEvidenceAtomSourceEdges(
+    atom: EvidenceAtomEntry,
+    options: { deleteExisting?: boolean } = {},
+  ): void {
+    if (!this.db) {
+      return;
+    }
+    if (options.deleteExisting !== false) {
+      this.deleteEdgesForSource("evidence_atom", atom.id);
+    }
+    this.insertEdge("evidence_atom", atom.id, "derived_from", "summary", atom.sourceSummaryId, {
+      sessionId: atom.sessionId,
+      agentId: atom.agentId,
+      projectId: atom.projectId,
+      atomType: atom.type,
+    });
+    const messageIds = [
+      ...(atom.sourceBinding?.messageIds ?? []),
+      ...(atom.sourceMessageIds ?? []),
+    ];
+    for (const messageId of [...new Set(messageIds)]) {
+      this.insertEdge("evidence_atom", atom.id, "supported_by", "message", messageId, {
+        sessionId: atom.sessionId,
+        agentId: atom.agentId,
+        projectId: atom.projectId,
+        atomType: atom.type,
+        sourceHash: atom.sourceHash,
+      });
+    }
+  }
+
+  async recordEvidenceAtoms(atoms: EvidenceAtomEntry[]): Promise<boolean> {
+    if (atoms.length === 0) {
+      return true;
+    }
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      for (const atom of atoms) {
+        this.upsertEvidenceAtom(atom);
+        this.upsertEvidenceAtomSourceEdges(atom);
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return true;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original write failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
   }
 
   private ftsRuntimeStatus(): RuntimeStoreStatus["ftsStatus"] {

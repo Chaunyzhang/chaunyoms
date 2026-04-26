@@ -2,6 +2,7 @@ import path from "node:path";
 import { rm } from "node:fs/promises";
 
 import { DurableMemoryStore } from "../stores/DurableMemoryStore";
+import { EvidenceAtomStore } from "../stores/EvidenceAtomStore";
 import { KnowledgeRawStore } from "../stores/KnowledgeRawStore";
 import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
 import { ObservationStore } from "../stores/ObservationStore";
@@ -15,6 +16,8 @@ import {
   BridgeConfig,
   DurableMemoryEntry,
   DurableMemoryRepository,
+  EvidenceAtomEntry,
+  EvidenceAtomRepository,
   KnowledgeRawRepository,
   LoggerLike,
   KnowledgeRepository,
@@ -38,6 +41,7 @@ export interface SessionDataStores {
   summaryStore: SummaryRepository;
   observationStore: ObservationRepository;
   durableMemoryStore: DurableMemoryRepository;
+  evidenceAtomStore: EvidenceAtomRepository;
   knowledgeRawStore: KnowledgeRawRepository;
   knowledgeStore: KnowledgeRepository;
   projectStore: ProjectRegistryRepository;
@@ -56,6 +60,7 @@ export class SessionDataLayer {
   private summaryStore: SummaryIndexStore | null = null;
   private observationStore: ObservationStore | null = null;
   private durableMemoryStore: DurableMemoryStore | null = null;
+  private evidenceAtomStore: EvidenceAtomStore | null = null;
   private knowledgeRawStore: KnowledgeRawStore | null = null;
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private projectStore: ProjectRegistryStore | null = null;
@@ -82,6 +87,7 @@ export class SessionDataLayer {
       this.summaryStore &&
       this.observationStore &&
       this.durableMemoryStore &&
+      this.evidenceAtomStore &&
       this.knowledgeRawStore &&
       this.knowledgeStore &&
       this.projectStore &&
@@ -110,6 +116,7 @@ export class SessionDataLayer {
     this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
     this.observationStore = new ObservationStore(agentDataDir, config.agentId);
     this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
+    this.evidenceAtomStore = new EvidenceAtomStore(agentDataDir, config.agentId);
     this.knowledgeRawStore = new KnowledgeRawStore(agentDataDir, sessionId);
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
@@ -126,6 +133,7 @@ export class SessionDataLayer {
     await this.summaryStore.init();
     await this.observationStore.init();
     await this.durableMemoryStore.init();
+    await this.evidenceAtomStore.init();
     await this.knowledgeRawStore.init();
     await this.knowledgeStore.init();
     await this.projectStore.init();
@@ -146,7 +154,7 @@ export class SessionDataLayer {
   }
 
   getStores(): SessionDataStores {
-    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.knowledgeRawStore || !this.knowledgeStore || !this.projectStore) {
+    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.evidenceAtomStore || !this.knowledgeRawStore || !this.knowledgeStore || !this.projectStore) {
       throw new Error("SessionDataLayer stores are not initialized");
     }
     return {
@@ -154,6 +162,7 @@ export class SessionDataLayer {
       summaryStore: this.summaryStore,
       observationStore: this.observationStore,
       durableMemoryStore: this.durableMemoryStore,
+      evidenceAtomStore: this.evidenceAtomStore,
       knowledgeRawStore: this.knowledgeRawStore,
       knowledgeStore: this.knowledgeStore,
       projectStore: this.projectStore,
@@ -184,6 +193,14 @@ export class SessionDataLayer {
       this.runtimeMirrorDirty = true;
     }
     return added;
+  }
+
+  async upsertEvidenceAtoms(entries: EvidenceAtomEntry[]): Promise<void> {
+    if (entries.length === 0) {
+      return;
+    }
+    await this.getStores().evidenceAtomStore.upsertMany(entries);
+    this.runtimeMirrorDirty = true;
   }
 
   async writeNavigationSnapshot(snapshot: string): Promise<string | null> {
@@ -268,6 +285,12 @@ export class SessionDataLayer {
         removed.push(`durable_memories:${count}`);
       }
     }
+    if (this.evidenceAtomStore) {
+      const count = await this.evidenceAtomStore.removeSession(sessionId);
+      if (count > 0) {
+        removed.push(`evidence_atoms:${count}`);
+      }
+    }
     if (this.projectStore) {
       const projects = this.projectStore.getAll().map((project) => ({
         ...project,
@@ -344,13 +367,14 @@ export class SessionDataLayer {
   }
 
   async mirrorRuntimeState(): Promise<void> {
-    if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore) {
+    if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore || !this.evidenceAtomStore) {
       return;
     }
     const messages = this.rawStore.getAll();
     const summaries = this.summaryStore.getAllSummaries();
     const memories = this.durableMemoryStore.getAll();
-    const signature = this.buildRuntimeMirrorSignature(messages, summaries, memories);
+    const atoms = this.evidenceAtomStore.getAll();
+    const signature = this.buildRuntimeMirrorSignature(messages, summaries, memories, atoms);
     if (!this.runtimeMirrorDirty && this.runtimeMirrorSignature === signature) {
       return;
     }
@@ -358,6 +382,7 @@ export class SessionDataLayer {
       messages,
       summaries,
       memories,
+      atoms,
     });
     this.runtimeMirrorSignature = signature;
     this.runtimeMirrorDirty = false;
@@ -437,10 +462,12 @@ export class SessionDataLayer {
     messages: RawMessage[],
     summaries: SummaryEntry[],
     memories: DurableMemoryEntry[],
+    atoms: EvidenceAtomEntry[],
   ): string {
     const lastMessage = messages[messages.length - 1];
     const lastSummary = summaries[summaries.length - 1];
     const lastMemory = memories[memories.length - 1];
+    const lastAtom = atoms[atoms.length - 1];
     const compactedMessages = messages.reduce((count, message) => count + (message.compacted ? 1 : 0), 0);
     const activeMemories = memories.reduce((count, memory) => count + (memory.recordStatus === "active" ? 1 : 0), 0);
     return [
@@ -455,6 +482,9 @@ export class SessionDataLayer {
       activeMemories,
       lastMemory?.id ?? "",
       lastMemory?.createdAt ?? "",
+      atoms.length,
+      lastAtom?.id ?? "",
+      lastAtom?.createdAt ?? "",
     ].join("|");
   }
 
@@ -522,6 +552,7 @@ export class SessionDataLayer {
     this.summaryStore = null;
     this.observationStore = null;
     this.durableMemoryStore = null;
+    this.evidenceAtomStore = null;
     this.knowledgeRawStore = null;
     this.knowledgeStore = null;
     this.projectStore = null;

@@ -54,6 +54,14 @@ export interface EvidenceBinding {
   sourceMessageCount?: number;
 }
 
+export interface SourceSpanRef {
+  messageId: string;
+  role?: MessageRole;
+  charStart?: number;
+  charEnd?: number;
+  quoteHash?: string;
+}
+
 export interface RawMessageRepository {
   init(): Promise<void>;
   append(message: RawMessage): Promise<void>;
@@ -151,6 +159,7 @@ export interface SummaryEntry {
   sourceSequenceMin?: number;
   sourceSequenceMax?: number;
   sourceBinding?: EvidenceBinding;
+  sourceRefs?: SourceSpanRef[];
   sourceSummaryIds?: string[];
   parentSummaryId?: string;
   parentSummaryIds?: string[];
@@ -161,6 +170,27 @@ export interface SummaryEntry {
   createdAt: string;
   sourceHash?: string;
   sourceMessageCount?: number;
+  coverage?: {
+    sourceTokenEstimate: number;
+    summaryTokenEstimate: number;
+    compressionRatio: number;
+  };
+  quality?: {
+    confidence: number;
+    sourceTraceComplete: boolean;
+    unresolvedConflicts: number;
+    needsHumanReview: boolean;
+    generatedBy?: string;
+  };
+  openQuestions?: string[];
+  conflicts?: string[];
+  candidateAtomPreviews?: string[];
+  sectionChunks?: Array<{
+    id: string;
+    section: string;
+    text: string;
+    tokenCount: number;
+  }>;
 }
 
 export interface SummaryRepository {
@@ -181,6 +211,59 @@ export interface SummaryRepository {
   search(query: string, options?: { sessionId?: string }): SummaryEntry[];
   getTotalTokens(options?: { sessionId?: string }): number;
   attachParent(parentSummaryId: string, childSummaryIds: string[]): Promise<void>;
+}
+
+export type EvidenceAtomType =
+  | "constraint"
+  | "decision"
+  | "exact_fact"
+  | "blocker"
+  | "next_step"
+  | "entity";
+export type EvidenceAtomStatus =
+  | "candidate"
+  | "accepted"
+  | "conflicted"
+  | "superseded"
+  | "expired";
+
+export interface EvidenceAtomEntry {
+  id: string;
+  eventId?: string;
+  sessionId: string;
+  agentId?: string;
+  projectId?: string;
+  topicId?: string;
+  recordStatus?: RecordStatus;
+  atomStatus?: EvidenceAtomStatus;
+  type: EvidenceAtomType;
+  text: string;
+  retrievalText: string;
+  tags: string[];
+  confidence: number;
+  importance: number;
+  stability: number;
+  sourceTraceComplete: boolean;
+  sourceSummaryId: string;
+  sourceBinding?: EvidenceBinding;
+  sourceMessageIds?: string[];
+  startTurn: number;
+  endTurn: number;
+  sourceHash?: string;
+  sourceMessageCount?: number;
+  validFrom?: string;
+  validUntil?: string;
+  conflictGroupId?: string;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EvidenceAtomRepository {
+  init(): Promise<void>;
+  upsertMany(entries: EvidenceAtomEntry[]): Promise<void>;
+  getAll(options?: { sessionId?: string }): EvidenceAtomEntry[];
+  search(query: string, options?: { sessionId?: string; limit?: number }): EvidenceAtomEntry[];
+  removeSession(sessionId: string): Promise<number>;
 }
 
 export interface ProjectRecord {
@@ -557,6 +640,9 @@ export interface SummaryResult {
   keyEntities?: string[];
   exactFacts: string[];
   promotionIntent?: PromotionIntent;
+  openQuestions?: string[];
+  conflicts?: string[];
+  candidateAtomPreviews?: string[];
 }
 
 export interface CompactionCandidate {

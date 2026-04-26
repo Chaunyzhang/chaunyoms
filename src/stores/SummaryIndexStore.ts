@@ -299,6 +299,7 @@ export class SummaryIndexStore implements SummaryRepository {
         ...(entry.parentSummaryId ? [entry.parentSummaryId] : []),
       ])],
       sourceMessageIds: [...new Set(entry.sourceMessageIds ?? [])],
+      sourceRefs: Array.isArray(entry.sourceRefs) ? entry.sourceRefs : [],
       sourceBinding: entry.sourceBinding,
       summaryLevel: entry.summaryLevel ?? 1,
       nodeKind: entry.nodeKind ?? (entry.sourceSummaryIds && entry.sourceSummaryIds.length > 0 ? "branch" : "leaf"),
@@ -312,6 +313,12 @@ export class SummaryIndexStore implements SummaryRepository {
       exactFacts: Array.isArray(entry.exactFacts) ? entry.exactFacts : [],
       promotionIntent: entry.promotionIntent ?? "candidate",
       keywords: Array.isArray(entry.keywords) ? entry.keywords : [],
+      openQuestions: Array.isArray(entry.openQuestions) ? entry.openQuestions : [],
+      conflicts: Array.isArray(entry.conflicts) ? entry.conflicts : [],
+      candidateAtomPreviews: Array.isArray(entry.candidateAtomPreviews) ? entry.candidateAtomPreviews : [],
+      sectionChunks: Array.isArray(entry.sectionChunks) ? entry.sectionChunks : [],
+      coverage: entry.coverage,
+      quality: entry.quality,
     };
 
     const childSummaryIds = normalized.childSummaryIds ?? [];

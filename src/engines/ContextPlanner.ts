@@ -218,6 +218,10 @@ export class ContextPlanner {
     if (item.summaryId) {
       return `${source}:summary:${item.summaryId}`;
     }
+    const atomId = item.metadata?.atomId;
+    if (typeof atomId === "string" && atomId.trim().length > 0) {
+      return `${source}:atom:${atomId}`;
+    }
     const metadataId = item.metadata?.id ?? item.metadata?.docId ?? item.metadata?.memoryId;
     if (typeof metadataId === "string" && metadataId.trim().length > 0) {
       return `${source}:${metadataId}`;
@@ -232,6 +236,10 @@ export class ContextPlanner {
     const item = candidate.item;
     if (item.summaryId) {
       return `summary:${item.summaryId}`;
+    }
+    const atomId = item.metadata?.atomId;
+    if (typeof atomId === "string" && atomId.trim()) {
+      return `atom:${atomId}`;
     }
     const sourceSummaryId = item.metadata?.sourceSummaryId;
     if (typeof sourceSummaryId === "string" && sourceSummaryId.trim()) {

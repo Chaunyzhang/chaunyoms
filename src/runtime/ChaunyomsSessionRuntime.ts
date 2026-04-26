@@ -9,6 +9,7 @@ import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
 import { BackgroundOrganizerEngine } from "../engines/BackgroundOrganizerEngine";
+import { EvidenceAtomEngine } from "../engines/EvidenceAtomEngine";
 import {
   SessionDataLayer,
   SessionDataStores,
@@ -119,6 +120,7 @@ export interface OmsRuntimeStatus {
     observations: number;
     durableMemories: number;
     activeDurableMemories: number;
+    evidenceAtoms: number;
     knowledgeRawItems: number;
     pendingKnowledgeRawItems: number;
     projects: number;
@@ -262,6 +264,7 @@ export class ChaunyomsSessionRuntime {
   private compactionEngine: CompactionEngine;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
+  private readonly evidenceAtomEngine = new EvidenceAtomEngine();
   private llmCaller: LlmCaller | null;
   private lastCompactionDiagnostics: CompactionDiagnostics | null = null;
   private navigationSnapshotPending = false;
@@ -336,9 +339,7 @@ export class ChaunyomsSessionRuntime {
       extractionEngine: this.extractionEngine,
       ensureSession: this.ensureSession.bind(this),
       appendRawMessages: this.sessionData.appendRawMessages.bind(this.sessionData),
-      appendObservation: this.sessionData.appendObservation.bind(this.sessionData),
       persistDurableMemories: this.persistDurableMemories.bind(this),
-      writeDurableMemoryArtifacts: this.sessionData.writeDurableMemoryArtifacts.bind(this.sessionData),
     });
     this.compactionCoordinator = new CompactionCoordinator({
       logger: this.logger,
@@ -356,6 +357,7 @@ export class ChaunyomsSessionRuntime {
         this.lastCompactionDiagnostics = value;
       },
       onBarrierCompacted: async (entry, context, summaryStore) => {
+        await this.persistEvidenceAtomsForSummary(entry);
         await this.knowledgeMaintenance.enqueueSummaryForKnowledge(entry, context);
         await this.rollUpSummaryTree(summaryStore, context);
       },
@@ -389,6 +391,10 @@ export class ChaunyomsSessionRuntime {
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
+    if (payload.role === "tool") {
+      return { ingested: false };
+    }
+
     const { rawStore, durableMemoryStore } = await this.ensureSession(payload.sessionId, payload.config);
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
     const message: RawMessage = {
@@ -570,6 +576,7 @@ export class ChaunyomsSessionRuntime {
     }
     const entry = compaction.summary;
 
+    await this.persistEvidenceAtomsForSummary(entry);
     await this.knowledgeMaintenance.enqueueSummaryForKnowledge(entry, context);
     await this.rollUpSummaryTree(summaryStore, context);
     await this.writeNavigationArtifactsIfPending(
@@ -997,6 +1004,27 @@ export class ChaunyomsSessionRuntime {
       }
       this.navigationSnapshotPending = true;
       await this.sessionData.appendSummaryArtifact(rollup);
+    }
+  }
+
+  private async persistEvidenceAtomsForSummary(summary: SummaryEntry): Promise<void> {
+    const summaryLevel = summary.summaryLevel ?? 1;
+    const nodeKind = summary.nodeKind ?? "leaf";
+    if (summaryLevel > 1 || nodeKind !== "leaf") {
+      return;
+    }
+    const atoms = this.evidenceAtomEngine.fromSummary(summary);
+    if (atoms.length === 0) {
+      return;
+    }
+    await this.sessionData.upsertEvidenceAtoms(atoms);
+    try {
+      await this.sessionData.getRuntimeStore().recordEvidenceAtoms(atoms);
+    } catch (error) {
+      this.logger.warn("evidence_atom_runtime_record_failed", {
+        summaryId: summary.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

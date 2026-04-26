@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
 import { ContextPlanner } from "../engines/ContextPlanner";
+import { EvidenceAtomEngine } from "../engines/EvidenceAtomEngine";
 import { DurableMemoryEntry, RawMessage, SummaryEntry } from "../types";
 
 function assert(condition: unknown, message: string): void {
@@ -90,15 +91,18 @@ async function main(): Promise<void> {
       sourceIds: ["m-1"],
     }];
 
-    await store.mirror({ messages, summaries, memories });
+    const atoms = new EvidenceAtomEngine().fromSummary(summaries[0]);
+    await store.mirror({ messages, summaries, memories, atoms });
     assert(store.isEnabled(), "SQLite runtime store should be enabled under Node 24");
     const initialStatus = store.getStatus();
+    assert(initialStatus.counts.evidenceAtoms === 1, "SQLite runtime mirror should include evidence atoms");
     assert(initialStatus.ftsStatus === "lazy_not_initialized", "FTS should be reported as lazy before first FTS-backed query");
     assert(store.grepMessages("15432", { sessionId: "s-1" }).length === 1, "grep should find raw source message");
     const ftsStatus = store.getStatus();
     assert(ftsStatus.ftsReady === true && ftsStatus.ftsStatus === "ready", "FTS should report ready after grep initializes it");
     assert(store.expand("summary", "summary-1").messages.length === 2, "expand should follow summary source edges to raw messages");
     assert(store.trace("memory", "memory-1").some((edge) => edge.targetId === "m-1"), "trace should expose memory source edge");
+    assert(store.trace("evidence_atom", atoms[0].id).some((edge) => edge.targetId === "m-1"), "trace should expose evidence atom source edge");
     assert(store.replay({ sessionId: "s-1", startTurn: 1, endTurn: 1 }).length === 2, "replay should return turn messages");
 
     const planner = new ContextPlanner();

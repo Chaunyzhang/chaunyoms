@@ -7,7 +7,6 @@ import {
   ContextItem,
   DurableMemoryEntry,
   DurableMemoryRepository,
-  ObservationEntry,
   RawMessage,
   RawMessageRepository,
 } from "../types";
@@ -19,12 +18,10 @@ interface RuntimeIngressDependencies {
   extractionEngine: MemoryExtractionEngine;
   ensureSession: (sessionId: string, config: IngestPayload["config"]) => Promise<SessionDataStores>;
   appendRawMessages: (messages: RawMessage[]) => Promise<void>;
-  appendObservation: (entry: ObservationEntry) => Promise<void>;
   persistDurableMemories: (
     durableMemoryStore: DurableMemoryRepository,
     entries: DurableMemoryEntry[],
   ) => Promise<void>;
-  writeDurableMemoryArtifacts: () => Promise<void>;
 }
 
 export class RuntimeIngressService {
@@ -39,7 +36,7 @@ export class RuntimeIngressService {
       return { importedMessages: 0 };
     }
 
-    const { rawStore, observationStore, durableMemoryStore } = await this.deps.ensureSession(sessionId, config);
+    const { rawStore, durableMemoryStore } = await this.deps.ensureSession(sessionId, config);
     const inspectedMessages = runtimeMessages.map((message) => ({
       message,
       decision: this.deps.runtimeIngress.inspect(message),
@@ -62,7 +59,6 @@ export class RuntimeIngressService {
     }
 
     const rawCandidates = normalizedMessages.filter((message) => message.storageTarget === "raw_message");
-    const observationCandidates = normalizedMessages.filter((message) => message.storageTarget === "observation");
 
     const existingMessages = rawStore
       .getAll()
@@ -75,16 +71,10 @@ export class RuntimeIngressService {
         })
         .filter((value): value is string => Boolean(value)),
     );
-    const existingObservationSourceKeys = new Set(
-      observationStore.getAll().map((item) => item.sourceKey),
-    );
-
     const overlap = this.findRuntimeOverlap(existingMessages, rawCandidates);
     const pendingRawMessages = rawCandidates
       .slice(overlap)
       .filter((message) => !existingSourceKeys.has(message.sourceKey));
-    const pendingObservationMessages = observationCandidates
-      .filter((message) => !existingObservationSourceKeys.has(message.sourceKey));
 
     let importedMessages = 0;
     let currentTurn = existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
@@ -119,38 +109,6 @@ export class RuntimeIngressService {
 
     await this.deps.appendRawMessages(rawMessagesToImport);
     await this.deps.persistDurableMemories(durableMemoryStore, durableMemoryEntriesToImport);
-
-    for (let index = 0; index < pendingObservationMessages.length; index += 1) {
-      const message = pendingObservationMessages[index];
-      const observation: ObservationEntry = {
-        id: message.id ?? `observation-${this.buildRuntimeMessageId(sessionId, message.role, message.text, 0, index)}`,
-        sessionId,
-        agentId: config.agentId,
-        role: message.role,
-        classification:
-          typeof message.metadata?.runtimeClassification === "string"
-            ? String(message.metadata.runtimeClassification)
-            : "tool_output",
-        content: message.text,
-        sourceKey: message.sourceKey,
-        createdAt: this.resolveRuntimeTimestamp(message.timestamp),
-        tokenCount: estimateTokens(message.text),
-        metadata: {
-          ...(message.metadata ?? {}),
-          importedFromRuntimeMessages: true,
-          importedSourceKey: message.sourceKey,
-          runtimeIndex: index,
-        },
-      };
-      await this.deps.appendObservation(observation);
-      await this.deps.persistDurableMemories(
-        durableMemoryStore,
-        this.deps.extractionEngine.extractFromObservation(observation),
-      );
-      await this.deps.writeDurableMemoryArtifacts();
-      existingObservationSourceKeys.add(message.sourceKey);
-      importedMessages += 1;
-    }
 
     return { importedMessages };
   }

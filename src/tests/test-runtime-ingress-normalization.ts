@@ -80,6 +80,17 @@ function main(): void {
 
   assert(realUserMention.persist, "expected ordinary user discussion of the tag to survive");
 
+  const toolOutput = ingress.inspect({
+    sourceKey: "tool-output-1",
+    role: "tool",
+    content: "stdout: config.json contains enableTools=false",
+    text: "stdout: config.json contains enableTools=false",
+  });
+
+  assert(!toolOutput.persist, "expected substantive tool output to remain scratch-only");
+  assert(toolOutput.classification === "tool_output", "expected dropped tool payload to keep tool_output classification");
+  assert(toolOutput.reason === "tool_output_scratch_only_not_persisted", "expected explicit scratch-only reason");
+
   console.log("test-runtime-ingress-normalization passed");
 }
 

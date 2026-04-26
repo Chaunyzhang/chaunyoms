@@ -1,9 +1,9 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
-import { getOpenClawConfigPath } from "./HostPathResolver";
+import { getOpenClawConfigPath, getOpenClawHomeDir } from "./HostPathResolver";
 import { HostRecord, isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
 
 export interface ToolConfigResult {
@@ -72,6 +72,8 @@ interface OpenClawPayloadLike extends Record<string, unknown> {
   tokenBudget?: unknown;
   turn?: Record<string, unknown>;
   turnNumber?: unknown;
+  cwd?: unknown;
+  workspaceDir?: unknown;
 }
 
 export class OpenClawPayloadAdapter {
@@ -557,13 +559,170 @@ export class OpenClawPayloadAdapter {
       payload?.session?.agentId ??
       this.getApi()?.agent?.id ??
       this.getApi()?.runtime?.agent?.id ??
-      this.getApi()?.context?.agent?.id ??
+      this.getApi()?.context?.agent?.id;
+
+    const directAgentId = typeof direct === "string" && direct.trim().length > 0
+      ? direct.trim()
+      : null;
+    if (directAgentId && directAgentId !== DEFAULT_BRIDGE_CONFIG.agentId) {
+      return directAgentId;
+    }
+
+    const inferredFromSession = this.resolveAgentIdFromOpenClawSessionOwner(
+      payload,
+      currentConfig,
+    );
+    if (inferredFromSession) {
+      return inferredFromSession;
+    }
+
+    const inferredFromWorkspace = this.resolveAgentIdFromOpenClawWorkspaceOwner(
+      payload,
+    );
+    if (inferredFromWorkspace) {
+      return inferredFromWorkspace;
+    }
+
+    if (directAgentId) {
+      return directAgentId;
+    }
+
+    const fallback =
       currentConfig.agentId ??
       DEFAULT_BRIDGE_CONFIG.agentId;
 
-    return typeof direct === "string" && direct.trim().length > 0
-      ? direct.trim()
+    return typeof fallback === "string" && fallback.trim().length > 0
+      ? fallback.trim()
       : DEFAULT_BRIDGE_CONFIG.agentId;
+  }
+
+  private resolveAgentIdFromOpenClawSessionOwner(
+    payload: OpenClawPayloadLike,
+    currentConfig: BridgeConfig,
+  ): string | null {
+    const sessionId = this.resolveSessionId(payload, currentConfig);
+    if (
+      sessionId === DEFAULT_BRIDGE_CONFIG.sessionId ||
+      sessionId.includes("/") ||
+      sessionId.includes("\\") ||
+      path.basename(sessionId) !== sessionId
+    ) {
+      return null;
+    }
+
+    const agentsDir = path.join(getOpenClawHomeDir(), "agents");
+    if (!existsSync(agentsDir)) {
+      return null;
+    }
+
+    try {
+      for (const entry of readdirSync(agentsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+        if (this.agentRegistryContainsSession(agentsDir, entry.name, sessionId)) {
+          return entry.name;
+        }
+        const sessionPath = path.join(
+          agentsDir,
+          entry.name,
+          "sessions",
+          `${sessionId}.jsonl`,
+        );
+        if (existsSync(sessionPath)) {
+          return entry.name;
+        }
+      }
+    } catch (error) {
+      this.getLogger().warn("agent_id_session_owner_lookup_failed", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return null;
+  }
+
+  private agentRegistryContainsSession(
+    agentsDir: string,
+    agentId: string,
+    sessionId: string,
+  ): boolean {
+    const registryPath = path.join(agentsDir, agentId, "sessions", "sessions.json");
+    if (!existsSync(registryPath)) {
+      return false;
+    }
+    try {
+      const registry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<
+        string,
+        { sessionId?: unknown }
+      >;
+      return Object.values(registry).some((entry) => entry?.sessionId === sessionId);
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveAgentIdFromOpenClawWorkspaceOwner(
+    payload: OpenClawPayloadLike,
+  ): string | null {
+    const workspace = this.resolveWorkspaceCandidate(payload);
+    if (!workspace) {
+      return null;
+    }
+
+    try {
+      const config = JSON.parse(readFileSync(getOpenClawConfigPath(), "utf8")) as {
+        agents?: {
+          list?: Array<{ id?: unknown; workspace?: unknown }>;
+        };
+      };
+      const workspacePath = path.resolve(workspace);
+      const agents = Array.isArray(config.agents?.list) ? config.agents.list : [];
+      for (const agent of agents) {
+        if (
+          typeof agent.id === "string" &&
+          agent.id.trim().length > 0 &&
+          typeof agent.workspace === "string" &&
+          path.resolve(agent.workspace) === workspacePath
+        ) {
+          return agent.id.trim();
+        }
+      }
+    } catch (error) {
+      this.getLogger().warn("agent_id_workspace_owner_lookup_failed", {
+        workspace,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return null;
+  }
+
+  private resolveWorkspaceCandidate(payload: OpenClawPayloadLike): string | null {
+    const context = isHostRecord(payload.context) ? payload.context : {};
+    const runtime = this.getApi()?.runtime;
+    const apiContext = this.getApi()?.context;
+    const candidates = [
+      payload.workspaceDir,
+      payload.cwd,
+      context.workspaceDir,
+      context.workspace,
+      context.cwd,
+      runtime?.workspaceDir,
+      runtime?.workspace,
+      runtime?.cwd,
+      apiContext?.workspaceDir,
+      apiContext?.workspace,
+      apiContext?.cwd,
+      process.cwd(),
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
+    }
+    return null;
   }
 
   private resolveMessageId(payload: OpenClawPayloadLike): string {
