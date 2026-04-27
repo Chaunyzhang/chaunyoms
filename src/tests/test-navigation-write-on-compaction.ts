@@ -57,6 +57,7 @@ async function main(): Promise<void> {
       summaryMaxOutputTokens: 120,
       strictCompaction: true,
       compactionBarrierEnabled: true,
+      agentVaultMirrorEnabled: true,
     },
     createRuntimeLayerDependencies(),
   );
@@ -77,6 +78,7 @@ async function main(): Promise<void> {
     summaryMaxOutputTokens: 120,
     strictCompaction: true,
     compactionBarrierEnabled: true,
+    agentVaultMirrorEnabled: true,
   };
 
   await runtime.bootstrap({

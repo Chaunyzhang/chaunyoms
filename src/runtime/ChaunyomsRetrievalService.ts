@@ -76,6 +76,12 @@ interface RetrievalBudgetPlan {
   };
 }
 
+interface RecallTextDiagnostics {
+  retrievalBudget?: RetrievalBudgetPlan;
+  persistentEvidenceAtomHitCount?: number;
+  transientEvidenceAtomHitCount?: number;
+}
+
 export interface RetrievalLayerDependencies {
   fixedPrefixProvider: FixedPrefixProvider;
 }
@@ -308,11 +314,22 @@ export class ChaunyomsRetrievalService {
       const planned = this.planRecallItems(query, atomResult, retrievalBudget);
       timings.planMs = Date.now() - planStartedAt;
       const evidenceGate = this.evaluateEvidenceGate(query, planned.items, atomResult);
+      const persistentEvidenceAtomHitCount = atomResult.items.filter((item) =>
+        item.metadata?.persistentEvidenceAtom === true,
+      ).length;
+      const transientEvidenceAtomHitCount = atomResult.items.filter((item) =>
+        (item.metadata?.evidenceAtom === true || typeof item.metadata?.atomId === "string") &&
+        item.metadata?.persistentEvidenceAtom !== true,
+      ).length;
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
       const presentation = this.resolveRecallPresentationOptions(args);
       timings.totalMs = Date.now() - startedAt;
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate) }],
+        content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate, {
+          retrievalBudget,
+          persistentEvidenceAtomHitCount,
+          transientEvidenceAtomHitCount,
+        }) }],
         details: {
           ok: true,
           route: decision.route,
@@ -323,7 +340,8 @@ export class ChaunyomsRetrievalService {
           retrievalHitType: atomResult.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
           recallStrategy: atomResult.strategy ?? "summary_navigation",
           rawCandidateCount: atomResult.rawCandidateCount ?? 0,
-          persistentEvidenceAtomHitCount: atomResult.items.filter((item) => item.metadata?.persistentEvidenceAtom === true).length,
+          persistentEvidenceAtomHitCount,
+          transientEvidenceAtomHitCount,
           evidenceGate,
           rawFtsHintCount: rawFtsHints.length,
           autoRecall: true,
@@ -629,6 +647,32 @@ export class ChaunyomsRetrievalService {
     return this.jsonToolResponse("oms_restore", result, result.ok);
   }
 
+  async executeOmsMigrateJsonToSqlite(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.migrateJsonToSqlite(context);
+    return this.jsonToolResponse("oms_migrate_json_to_sqlite", result, Boolean(result.ok));
+  }
+
+  async executeOmsVerifyMigration(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.verifyMigration(context);
+    return this.jsonToolResponse("oms_verify_migration", result, Boolean(result.ok));
+  }
+
+  async executeOmsExportJsonBackup(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const label = this.getStringArg(args, "label");
+    const result = await this.runtime.exportJsonBackup(context, label);
+    return this.jsonToolResponse("oms_export_json_backup", result, Boolean(result.ok));
+  }
+
+  async executeOmsCleanupLegacyJson(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const apply = this.getBooleanArg(args, "apply", false);
+    const result = await this.runtime.cleanupLegacyJson(context, apply);
+    return this.jsonToolResponse("oms_cleanup_legacy_json", result, Boolean(result.ok));
+  }
+
   async executeOmsWipeSession(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const apply = this.getBooleanArg(args, "apply", false);
@@ -751,6 +795,29 @@ export class ChaunyomsRetrievalService {
       note: this.getStringArg(args, "note") || undefined,
     });
     return this.jsonToolResponse("oms_knowledge_review", result, result.ok);
+  }
+
+  async executeOmsBackfillAtoms(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const apply = this.getBooleanArg(args, "apply", false);
+    const scope = this.getScopeArg(args);
+    const limit = this.getNumberArg(args, "limit", 200);
+    const result = await this.runtime.backfillEvidenceAtoms(context, { apply, scope, limit });
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `Atom backfill ${result.apply ? "applied" : "dry-run"} (${result.scope} scope).`,
+          `Summaries: total=${result.totalSummaries}, eligible=${result.eligibleSummaries}, skippedExisting=${result.skippedExistingSummaries}, skippedNoAtoms=${result.skippedNoAtomSummaries}.`,
+          `Atoms: existing=${result.existingAtoms}, generated=${result.generatedAtoms}, written=${result.writtenAtoms}.`,
+          result.sourceSummaryIds.length > 0
+            ? `Source summaries: ${result.sourceSummaryIds.slice(0, 20).join(", ")}${result.sourceSummaryIds.length > 20 ? " ..." : ""}`
+            : "Source summaries: none.",
+          ...result.warnings,
+        ].filter(Boolean).join("\n"),
+      }],
+      details: { tool: "oms_backfill_atoms", ...result },
+    };
   }
 
   private attachDiagnostics(
@@ -1761,6 +1828,7 @@ export class ChaunyomsRetrievalService {
       includeFullTrace: false,
     },
     evidenceGate?: EvidenceGateResult,
+    diagnostics: RecallTextDiagnostics = {},
   ): string {
     if (items.length === 0) {
       if (answerCandidates.length === 0) {
@@ -1786,6 +1854,15 @@ export class ChaunyomsRetrievalService {
           evidenceGate.targetIds.length > 0 ? `Trace targets: ${evidenceGate.targetIds.join(", ")}` : "",
           "",
         ].filter((line) => line.length > 0).join("\n")
+      : "";
+    const budget = diagnostics.retrievalBudget
+      ? [
+          "Retrieval budget:",
+          `- total=${diagnostics.retrievalBudget.total}, atom=${diagnostics.retrievalBudget.atom}, summary=${diagnostics.retrievalBudget.summary}, raw=${diagnostics.retrievalBudget.raw}`,
+          `- per item: atom=${diagnostics.retrievalBudget.perItem.atom}, summary=${diagnostics.retrievalBudget.perItem.summary}, raw=${diagnostics.retrievalBudget.perItem.raw}`,
+          `- persistent atoms=${diagnostics.persistentEvidenceAtomHitCount ?? 0}, transient atoms=${diagnostics.transientEvidenceAtomHitCount ?? 0}`,
+          "",
+        ].join("\n")
       : "";
     const summaryItems = items.filter((item) => item.kind === "summary");
     const messageItems = items
@@ -1839,6 +1916,7 @@ export class ChaunyomsRetrievalService {
       "",
       answers,
       gate,
+      budget,
       localMatchText,
       messages,
       omitted,

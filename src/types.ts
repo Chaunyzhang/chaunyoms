@@ -65,6 +65,8 @@ export interface SourceSpanRef {
 export interface RawMessageRepository {
   init(): Promise<void>;
   append(message: RawMessage): Promise<void>;
+  appendMany?(messages: RawMessage[]): Promise<void>;
+  removeSession?(sessionId: string): Promise<number>;
   getAll(options?: RawMessageQuery): RawMessage[];
   getByRange(startTurn: number, endTurn: number, options?: RawMessageQuery): RawMessage[];
   getByIds(ids: string[], options?: RawMessageQuery): RawMessage[];
@@ -92,6 +94,7 @@ export interface ObservationEntry {
 export interface ObservationRepository {
   init(): Promise<void>;
   append(entry: ObservationEntry): Promise<void>;
+  removeSession?(sessionId: string): Promise<number>;
   getAll(): ObservationEntry[];
   count(): number;
 }
@@ -123,6 +126,7 @@ export interface DurableMemoryRepository {
   init(): Promise<void>;
   addEntries(entries: DurableMemoryEntry[]): Promise<number>;
   replaceAll(entries: DurableMemoryEntry[]): Promise<void>;
+  removeSession?(sessionId: string): Promise<number>;
   search(query: string, limit?: number): DurableMemoryEntry[];
   getAll(): DurableMemoryEntry[];
   count(): number;
@@ -197,6 +201,7 @@ export interface SummaryRepository {
   init(): Promise<void>;
   addSummary(entry: SummaryEntry): Promise<boolean>;
   upsertSummary(entry: SummaryEntry): Promise<void>;
+  removeSession?(sessionId: string): Promise<number>;
   getAllSummaries(options?: { sessionId?: string }): SummaryEntry[];
   getActiveSummaries(options?: { sessionId?: string }): SummaryEntry[];
   getRootSummaries(options?: { sessionId?: string }): SummaryEntry[];
@@ -302,6 +307,7 @@ export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "i
 export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
+export type JsonPersistenceMode = "primary" | "backup" | "off";
 
 export interface KnowledgePromotionDraft {
   shouldWrite: boolean;
@@ -692,6 +698,13 @@ export interface BridgeConfig {
   runtimeCaptureEnabled: boolean;
   durableMemoryEnabled: boolean;
   autoRecallEnabled: boolean;
+  agentVaultMirrorEnabled: boolean;
+  summaryMarkdownMirrorEnabled: boolean;
+  durableMarkdownMirrorEnabled: boolean;
+  transcriptMirrorEnabled: boolean;
+  knowledgeMarkdownEnabled: boolean;
+  sqlitePrimaryEnabled: boolean;
+  jsonPersistenceMode: JsonPersistenceMode;
   knowledgePromotionEnabled: boolean;
   knowledgePromotionManualReviewEnabled: boolean;
   knowledgeIntakeMode: KnowledgeIntakeMode;

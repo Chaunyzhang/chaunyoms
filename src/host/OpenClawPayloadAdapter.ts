@@ -368,6 +368,69 @@ export class OpenClawPayloadAdapter {
       baseConfig.knowledgeIntakeUserOverridePatterns,
     );
 
+    const agentVaultMirrorEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.agentVaultMirrorEnabled,
+        pluginConfig.enableAgentVaultMirror,
+        this.inverseBoolean(pluginConfig.disableAgentVaultMirror),
+      ],
+      baseConfig.agentVaultMirrorEnabled,
+    );
+
+    const summaryMarkdownMirrorEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.summaryMarkdownMirrorEnabled,
+        pluginConfig.enableSummaryMarkdownMirror,
+        this.inverseBoolean(pluginConfig.disableSummaryMarkdownMirror),
+      ],
+      baseConfig.summaryMarkdownMirrorEnabled,
+    );
+
+    const durableMarkdownMirrorEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.durableMarkdownMirrorEnabled,
+        pluginConfig.enableDurableMarkdownMirror,
+        this.inverseBoolean(pluginConfig.disableDurableMarkdownMirror),
+      ],
+      baseConfig.durableMarkdownMirrorEnabled,
+    );
+
+    const transcriptMirrorEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.transcriptMirrorEnabled,
+        pluginConfig.enableTranscriptMirror,
+        this.inverseBoolean(pluginConfig.disableTranscriptMirror),
+      ],
+      baseConfig.transcriptMirrorEnabled,
+    );
+
+    const knowledgeMarkdownEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.knowledgeMarkdownEnabled,
+        pluginConfig.enableKnowledgeMarkdown,
+        this.inverseBoolean(pluginConfig.disableKnowledgeMarkdown),
+      ],
+      baseConfig.knowledgeMarkdownEnabled,
+    );
+
+    const sqlitePrimaryEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.sqlitePrimaryEnabled,
+        pluginConfig.enableSqlitePrimary,
+        this.inverseBoolean(pluginConfig.disableSqlitePrimary),
+      ],
+      baseConfig.sqlitePrimaryEnabled,
+    );
+
+    const jsonPersistenceMode = this.resolveStringEnum(
+      [
+        pluginConfig.jsonPersistenceMode,
+        pluginConfig.legacyJsonPersistenceMode,
+      ],
+      ["primary", "backup", "off"],
+      baseConfig.jsonPersistenceMode,
+    ) as BridgeConfig["jsonPersistenceMode"];
+
     const sqliteJournalMode = this.resolveStringEnum(
       [
         pluginConfig.sqliteJournalMode,
@@ -450,6 +513,13 @@ export class OpenClawPayloadAdapter {
       runtimeCaptureEnabled,
       durableMemoryEnabled,
       autoRecallEnabled,
+      agentVaultMirrorEnabled,
+      summaryMarkdownMirrorEnabled,
+      durableMarkdownMirrorEnabled,
+      transcriptMirrorEnabled,
+      knowledgeMarkdownEnabled,
+      sqlitePrimaryEnabled,
+      jsonPersistenceMode,
       knowledgePromotionEnabled,
       knowledgePromotionManualReviewEnabled,
       knowledgeIntakeMode,

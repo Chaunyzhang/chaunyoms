@@ -91,13 +91,42 @@ export const pluginConfigSchema = {
       type: "boolean",
       description: "Allow automatic source recall when the route requires historical detail.",
     },
+    agentVaultMirrorEnabled: {
+      type: "boolean",
+      description: "Enable legacy AgentVault human-readable Markdown mirrors. Disabled by default; SQLite and KnowledgeMarkdownStore remain the runtime source paths.",
+    },
+    summaryMarkdownMirrorEnabled: {
+      type: "boolean",
+      description: "Write per-summary AgentVault Markdown files when agentVaultMirrorEnabled is also true. Disabled by default.",
+    },
+    durableMarkdownMirrorEnabled: {
+      type: "boolean",
+      description: "Write durable-memory AgentVault Markdown mirror files when agentVaultMirrorEnabled is also true. Disabled by default.",
+    },
+    transcriptMirrorEnabled: {
+      type: "boolean",
+      description: "Write transcript AgentVault Markdown mirrors when agentVaultMirrorEnabled is also true. Disabled by default.",
+    },
+    knowledgeMarkdownEnabled: {
+      type: "boolean",
+      description: "Keep the curated KnowledgeMarkdownStore enabled as the default human-readable knowledge layer. Enabled by default.",
+    },
+    sqlitePrimaryEnabled: {
+      type: "boolean",
+      description: "Use SQLite-backed repositories as the primary runtime ledger. Enabled by default for the production shape.",
+    },
+    jsonPersistenceMode: {
+      type: "string",
+      enum: ["primary", "backup", "off"],
+      description: "Controls legacy JSON/JSONL store writes. primary keeps old hot-path JSON stores, backup is explicit snapshot/export only, off disables JSON as a runtime store.",
+    },
     knowledgePromotionEnabled: {
       type: "boolean",
       description: "Enable promotion from accepted knowledge raw into the unified knowledge store. Disabled by default.",
     },
     knowledgePromotionManualReviewEnabled: {
       type: "boolean",
-      description: "Require accepted knowledge raw candidates to wait in a scored manual review queue before Markdown promotion. Default false, so automatic promotion behavior is preserved.",
+      description: "Require accepted knowledge raw candidates to wait in a scored manual review queue before Markdown promotion. Default true, so enabling knowledge promotion stays review-first unless explicitly relaxed.",
     },
     knowledgeIntakeMode: {
       type: "string",

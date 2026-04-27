@@ -31,6 +31,7 @@ async function main(): Promise<void> {
     strictCompaction: true,
     compactionBarrierEnabled: true,
     knowledgePromotionEnabled: true,
+    knowledgePromotionManualReviewEnabled: false,
   };
 
   await mkdir(path.join(config.workspaceDir, "memory"), { recursive: true });

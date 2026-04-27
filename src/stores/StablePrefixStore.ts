@@ -26,9 +26,9 @@ export interface RouteHit {
 export class StablePrefixStore {
   private static readonly NAVIGATION_RETENTION_ROUNDS = 30;
   private static readonly KNOWLEDGE_REFERENCE_RE =
-    /(knowledge[- ]?base|docs?|documentation|reference|manual|guide|playbook|spec|specification|api|readme|markdown|\.md\b|adr|rfc|architecture|design docs?|知识库|文档|资料|说明|手册|教程|规范|接口文档|架构|设计文档)/i;
+    /(knowledge[- ]?base|docs?|documentation|reference|manual|guide|playbook|spec|specification|api|readme|markdown|\.md\b|adr|rfc|architecture|design docs?|\u77e5\u8bc6\u5e93|\u6587\u6863|\u8d44\u6599|\u8bf4\u660e|\u624b\u518c|\u6559\u7a0b|\u89c4\u8303|\u63a5\u53e3\u6587\u6863|\u67b6\u6784|\u8bbe\u8ba1\u6587\u6863)/i;
   private static readonly REFERENCE_LOOKUP_RE =
-    /(look up|lookup|search|find|read|check|consult|open|review|refer|查|找|看|翻|参考|根据)/i;
+    /(look up|lookup|search|find|read|check|consult|open|review|refer|\u67e5|\u641c|\u627e|\u770b|\u8bfb|\u7ffb|\u53c2\u8003|\u6839\u636e)/i;
 
   async getKnowledgeBaseHit(
     sharedDataDir: string,

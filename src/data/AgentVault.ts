@@ -43,7 +43,12 @@ export class AgentVault {
 
   async writeNavigation(snapshot: string): Promise<string> {
     const paths = await this.ensureLayout();
-    await writeFile(paths.navigationPath, ensureMarkdownText(snapshot), "utf8");
+    const content = ensureMarkdownText(snapshot);
+    const existing = await this.readUtf8OrEmpty(paths.navigationPath);
+    if (existing === content) {
+      return paths.navigationPath;
+    }
+    await writeFile(paths.navigationPath, content, "utf8");
     return paths.navigationPath;
   }
 

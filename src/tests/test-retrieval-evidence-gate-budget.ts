@@ -31,6 +31,17 @@ function main(): void {
       answerCandidates: RecallResult["answerCandidates"],
       presentation: { maxItems: number; maxCharsPerItem: number; includeFullTrace: boolean },
       evidenceGate: { status: string; reason: string; atomHitCount: number; usableAtomCount: number; verifiedTraceCount: number; recommendedAction: string; nextActionHint?: string; targetIds: string[] },
+      diagnostics?: {
+        retrievalBudget?: {
+          total: number;
+          atom: number;
+          summary: number;
+          raw: number;
+          perItem: { atom: number; summary: number; raw: number };
+        };
+        persistentEvidenceAtomHitCount?: number;
+        transientEvidenceAtomHitCount?: number;
+      },
     ): string;
   };
   service.contextPlanner = new ContextPlanner();
@@ -149,9 +160,21 @@ function main(): void {
     recommendedAction: gate.recommendedAction,
     nextActionHint: "Answer from the selected evidence atoms.",
     targetIds: gate.targetIds,
+  }, {
+    retrievalBudget: {
+      total: 900,
+      atom: 250,
+      summary: 300,
+      raw: 300,
+      perItem: { atom: 180, summary: 260, raw: 260 },
+    },
+    persistentEvidenceAtomHitCount: 1,
+    transientEvidenceAtomHitCount: 0,
   });
   assert(text.includes("Trace targets:") && text.includes("atom:atom-1"), "expected formatted recall text to expose trace targets");
   assert(text.includes("Next action hint:"), "expected formatted recall text to expose next action hint");
+  assert(text.includes("Retrieval budget:"), "expected formatted recall text to expose retrieval budget");
+  assert(text.includes("persistent atoms=1, transient atoms=0"), "expected formatted recall text to expose atom storage shape");
 
   console.log("test-retrieval-evidence-gate-budget passed");
 }

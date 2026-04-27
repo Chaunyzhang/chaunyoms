@@ -138,7 +138,8 @@ async function main(): Promise<void> {
 
     const session2Config = { ...config, sessionId: "session-2" };
     const stores2 = await runtime.getSessionStores({ sessionId: "session-2", config: session2Config });
-    assert(stores2.knowledgeRawStore.getAll().length === 0, "expected knowledge raw store cache to be session-bound");
+    assert(stores2.knowledgeRawStore.getAll().length === 1, "expected knowledge raw queue to be agent-bound across sessions");
+    assert(stores2.knowledgeRawStore.getAll()[0].id === "knowledge-raw-s1", "expected session-2 to see same-agent pending knowledge raw");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -69,6 +69,7 @@ export interface RuntimeTableCounts {
   summaries: number;
   evidenceAtoms: number;
   memories: number;
+  runtimeRecords: number;
   assets: number;
   sourceEdges: number;
   contextRuns: number;
@@ -84,6 +85,16 @@ export interface RuntimeStoreStatus {
   experimentalAdapter: boolean;
   journalMode: "delete" | "wal";
   counts: RuntimeTableCounts;
+}
+
+export interface RuntimeRecordEntry<T extends Record<string, unknown> = Record<string, unknown>> {
+  kind: string;
+  id: string;
+  sessionId?: string;
+  agentId?: string;
+  createdAt: string;
+  updatedAt: string;
+  payload: T;
 }
 
 export interface RuntimeIntegrityReport extends RuntimeStoreStatus {
@@ -1287,6 +1298,10 @@ export class SQLiteRuntimeStore {
         `DELETE FROM memories WHERE ${args.whereColumn} = ?`,
         args.target,
       );
+      deleted.runtime_records = this.deleteBySql(
+        `DELETE FROM runtime_records WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
       this.db?.exec("COMMIT");
       transactionStarted = false;
       return deleted;
@@ -1502,6 +1517,19 @@ export class SQLiteRuntimeStore {
         payload_json TEXT NOT NULL DEFAULT '{}'
       );
       CREATE INDEX IF NOT EXISTS idx_candidates_run ON retrieval_candidates(context_run_id, status);
+
+      CREATE TABLE IF NOT EXISTS runtime_records (
+        kind TEXT NOT NULL,
+        id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY(kind, id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_records_kind_session ON runtime_records(kind, session_id);
+      CREATE INDEX IF NOT EXISTS idx_runtime_records_kind_agent ON runtime_records(kind, agent_id);
     `);
 
     // FTS is deliberately lazy. Exact/LIKE search remains canonical today, so
@@ -2062,6 +2090,7 @@ export class SQLiteRuntimeStore {
       summaries: this.countTable("summaries"),
       evidenceAtoms: this.countTable("evidence_atoms"),
       memories: this.countTable("memories"),
+      runtimeRecords: this.countTable("runtime_records"),
       assets: this.countTable("assets"),
       sourceEdges: this.countTable("source_edges"),
       contextRuns: this.countTable("context_runs"),
@@ -2075,6 +2104,7 @@ export class SQLiteRuntimeStore {
       summaries: 0,
       evidenceAtoms: 0,
       memories: 0,
+      runtimeRecords: 0,
       assets: 0,
       sourceEdges: 0,
       contextRuns: 0,
@@ -2329,6 +2359,180 @@ export class SQLiteRuntimeStore {
         }
       }
       throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listRawMessages(options: { sessionId?: string } = {}): RawMessage[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT * FROM messages
+        WHERE (? IS NULL OR session_id = ?)
+        ORDER BY sequence ASC, turn_number ASC, created_at ASC
+      `).all(options.sessionId ?? null, options.sessionId ?? null)
+        .map((row) => this.rowToMessage(row)) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listSummaries(options: { sessionId?: string } = {}): SummaryEntry[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT payload_json FROM summaries
+        WHERE (? IS NULL OR session_id = ?)
+        ORDER BY summary_level ASC, start_turn ASC, end_turn ASC, created_at ASC
+      `).all(options.sessionId ?? null, options.sessionId ?? null)
+        .map((row) => this.parseObject(row.payload_json) as unknown as SummaryEntry) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listMemories(options: { sessionId?: string } = {}): DurableMemoryEntry[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT payload_json FROM memories
+        WHERE (? IS NULL OR session_id = ?)
+        ORDER BY created_at DESC
+      `).all(options.sessionId ?? null, options.sessionId ?? null)
+        .map((row) => this.parseObject(row.payload_json) as unknown as DurableMemoryEntry) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async replaceMemories(memories: DurableMemoryEntry[]): Promise<boolean> {
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'memory'").run();
+      this.db?.prepare("DELETE FROM memories").run();
+      for (const memory of memories) {
+        this.upsertMemory(memory);
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return true;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original failure.
+        }
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listEvidenceAtoms(options: { sessionId?: string } = {}): EvidenceAtomEntry[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT payload_json FROM evidence_atoms
+        WHERE (? IS NULL OR session_id = ?)
+        ORDER BY session_id ASC, start_turn ASC, type ASC, id ASC
+      `).all(options.sessionId ?? null, options.sessionId ?? null)
+        .map((row) => this.parseObject(row.payload_json) as unknown as EvidenceAtomEntry) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async upsertRuntimeRecord<T extends Record<string, unknown>>(entry: RuntimeRecordEntry<T>): Promise<boolean> {
+    await this.init();
+    if (!this.openDatabase()) {
+      return false;
+    }
+    try {
+      const now = new Date().toISOString();
+      this.prepare(`
+        INSERT INTO runtime_records (
+          kind, id, session_id, agent_id, created_at, updated_at, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(kind, id) DO UPDATE SET
+          session_id=excluded.session_id,
+          agent_id=excluded.agent_id,
+          updated_at=excluded.updated_at,
+          payload_json=excluded.payload_json
+      `)?.run(
+        entry.kind,
+        entry.id,
+        entry.sessionId ?? null,
+        entry.agentId ?? null,
+        entry.createdAt || now,
+        entry.updatedAt || now,
+        this.stringify(entry.payload),
+      );
+      return true;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listRuntimeRecords<T extends Record<string, unknown> = Record<string, unknown>>(
+    kind: string,
+    options: { sessionId?: string; agentId?: string } = {},
+  ): RuntimeRecordEntry<T>[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT kind, id, session_id, agent_id, created_at, updated_at, payload_json
+        FROM runtime_records
+        WHERE kind = ?
+          AND (? IS NULL OR session_id = ?)
+          AND (? IS NULL OR agent_id = ?)
+        ORDER BY updated_at DESC, created_at DESC
+      `).all(kind, options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null)
+        .map((row) => ({
+          kind: String(row.kind ?? kind),
+          id: String(row.id ?? ""),
+          sessionId: typeof row.session_id === "string" ? row.session_id : undefined,
+          agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
+          createdAt: String(row.created_at ?? ""),
+          updatedAt: String(row.updated_at ?? ""),
+          payload: this.parseObject(row.payload_json) as T,
+        })) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  async deleteRuntimeRecords(kind: string, options: { sessionId?: string; agentId?: string } = {}): Promise<number> {
+    await this.init();
+    if (!this.openDatabase()) {
+      return 0;
+    }
+    try {
+      this.prepare(`
+        DELETE FROM runtime_records
+        WHERE kind = ?
+          AND (? IS NULL OR session_id = ?)
+          AND (? IS NULL OR agent_id = ?)
+      `)?.run(kind, options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null);
+      return this.getSingleNumber("SELECT changes() AS count");
     } finally {
       this.closeDatabase();
     }

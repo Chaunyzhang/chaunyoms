@@ -5,6 +5,10 @@ import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { SessionDataStores } from "../data/SessionDataLayer";
 import { KnowledgeIntakeGate } from "../engines/KnowledgeIntakeGate";
 import { KnowledgeCandidateScorer } from "../engines/KnowledgeCandidateScorer";
+import {
+  detectKnowledgeIntentPhrase,
+  isPromoteKnowledgeIntent,
+} from "../utils/knowledgeIntent";
 
 interface KnowledgeMaintenanceDependencies {
   logger: LoggerLike;
@@ -22,8 +26,6 @@ export class KnowledgeMaintenanceService {
     config: BridgeConfig;
     summaryModel?: string;
   }>();
-  private static readonly DEFAULT_KNOWLEDGE_OVERRIDE_RE =
-    /(甯垜璁颁竴涓媩璁颁綇杩欎釜|璁颁竴涓嬭繖涓獆鏀捐繘鐭ヨ瘑搴搢鎵旇繘鐭ヨ瘑搴搢鍔犲叆鐭ヨ瘑搴搢鍐欒繘鐭ヨ瘑搴搢鍔犲叆wiki|鍐欒繘wiki|娌夋穩杩涚煡璇嗗簱|remember this|remember this for later|save this to knowledge|put this in (?:the )?knowledge base|add this to wiki|store this in (?:the )?knowledge base)/i;
 
   constructor(private readonly deps: KnowledgeMaintenanceDependencies) {}
 
@@ -268,7 +270,10 @@ export class KnowledgeMaintenanceService {
       if (!normalized) {
         continue;
       }
-      if (KnowledgeMaintenanceService.DEFAULT_KNOWLEDGE_OVERRIDE_RE.test(normalized)) {
+      if (isPromoteKnowledgeIntent(message.metadata?.knowledgeIntent)) {
+        return "explicit_user_knowledge_intent";
+      }
+      if (detectKnowledgeIntentPhrase(normalized)) {
         return "explicit_user_knowledge_override";
       }
       const lower = normalized.toLowerCase();

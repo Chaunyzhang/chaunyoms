@@ -11,11 +11,13 @@ import {
   RawMessageRepository,
 } from "../types";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
+import { KnowledgeIntentClassifier } from "../engines/KnowledgeIntentClassifier";
 import { SessionDataStores } from "../data/SessionDataLayer";
 
 interface RuntimeIngressDependencies {
   runtimeIngress: RuntimeMessageIngress;
   extractionEngine: MemoryExtractionEngine;
+  knowledgeIntentClassifier: KnowledgeIntentClassifier;
   ensureSession: (sessionId: string, config: IngestPayload["config"]) => Promise<SessionDataStores>;
   appendRawMessages: (messages: RawMessage[]) => Promise<void>;
   persistDurableMemories: (
@@ -84,6 +86,9 @@ export class RuntimeIngressService {
     for (let index = 0; index < pendingRawMessages.length; index += 1) {
       const message = pendingRawMessages[index];
       currentTurn = this.resolveRuntimeTurnNumber(currentTurn, message.role);
+      const knowledgeIntent = message.role === "user"
+        ? await this.deps.knowledgeIntentClassifier.classifyUserMessage(message.text, config)
+        : null;
       const rawMessage: RawMessage = {
         id: message.id ?? this.buildRuntimeMessageId(sessionId, message.role, message.text, currentTurn, overlap + index),
         sessionId,
@@ -99,6 +104,7 @@ export class RuntimeIngressService {
           importedFromRuntimeMessages: true,
           importedSourceKey: message.sourceKey,
           runtimeIndex: overlap + index,
+          ...(knowledgeIntent ? { knowledgeIntent } : {}),
         },
       };
       rawMessagesToImport.push(rawMessage);

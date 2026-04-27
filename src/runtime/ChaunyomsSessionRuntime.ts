@@ -5,6 +5,7 @@ import { ContextPlannerResult } from "../engines/ContextPlanner";
 import { CompactionEngine } from "../engines/CompactionEngine";
 import { KnowledgeIntakeGate } from "../engines/KnowledgeIntakeGate";
 import { KnowledgeCandidateScorer } from "../engines/KnowledgeCandidateScorer";
+import { KnowledgeIntentClassifier } from "../engines/KnowledgeIntentClassifier";
 import { KnowledgePromotionEngine } from "../engines/KnowledgePromotionEngine";
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { SummaryHierarchyEngine } from "../engines/SummaryHierarchyEngine";
@@ -23,6 +24,7 @@ import {
   ContextViewRepository,
   DurableMemoryRepository,
   DurableMemoryEntry,
+  EvidenceAtomEntry,
   FixedPrefixProvider,
   HostFixedContextProvider,
   LlmCaller,
@@ -143,6 +145,8 @@ export interface OmsRuntimeStatus {
     | "semanticCandidateLimit"
     | "emergencyBrake"
     | "sqliteJournalMode"
+    | "sqlitePrimaryEnabled"
+    | "jsonPersistenceMode"
   >;
   runtimeStore: ReturnType<SQLiteRuntimeStore["getStatus"]>;
   lastCompactionDiagnostics: CompactionDiagnostics | null;
@@ -225,6 +229,22 @@ export interface OmsKnowledgeReviewResult {
   reason?: string;
 }
 
+export interface OmsAtomBackfillResult {
+  ok: boolean;
+  apply: boolean;
+  scope: "agent" | "session";
+  limit: number;
+  totalSummaries: number;
+  eligibleSummaries: number;
+  skippedExistingSummaries: number;
+  skippedNoAtomSummaries: number;
+  generatedAtoms: number;
+  existingAtoms: number;
+  writtenAtoms: number;
+  sourceSummaryIds: string[];
+  warnings: string[];
+}
+
 export interface OmsWipeResult {
   ok: boolean;
   scope: "session" | "agent";
@@ -262,6 +282,7 @@ export class ChaunyomsSessionRuntime {
   private backgroundOrganizerEngine: BackgroundOrganizerEngine;
   private sharedDataBootstrap: SharedDataBootstrap;
   private compactionEngine: CompactionEngine;
+  private knowledgeIntentClassifier: KnowledgeIntentClassifier;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
   private readonly evidenceAtomEngine = new EvidenceAtomEngine();
@@ -291,6 +312,7 @@ export class ChaunyomsSessionRuntime {
     this.assembler = new ContextAssembler(this.contextViewStore, this.fixedPrefixProvider);
     this.sharedDataBootstrap = new SharedDataBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
+    this.knowledgeIntentClassifier = new KnowledgeIntentClassifier(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
     this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
@@ -302,6 +324,7 @@ export class ChaunyomsSessionRuntime {
     this.llmCaller = llmCaller;
     this.sharedDataBootstrap = new SharedDataBootstrap(this.logger);
     this.compactionEngine = new CompactionEngine(llmCaller, this.logger);
+    this.knowledgeIntentClassifier = new KnowledgeIntentClassifier(llmCaller, this.logger);
     this.knowledgePromotionEngine = new KnowledgePromotionEngine(llmCaller, this.logger);
     this.summaryHierarchyEngine = new SummaryHierarchyEngine(llmCaller, this.logger);
     this.backgroundOrganizerEngine = new BackgroundOrganizerEngine(this.logger);
@@ -337,6 +360,7 @@ export class ChaunyomsSessionRuntime {
     this.runtimeIngressService = new RuntimeIngressService({
       runtimeIngress: this.runtimeIngress,
       extractionEngine: this.extractionEngine,
+      knowledgeIntentClassifier: this.knowledgeIntentClassifier,
       ensureSession: this.ensureSession.bind(this),
       appendRawMessages: this.sessionData.appendRawMessages.bind(this.sessionData),
       persistDurableMemories: this.persistDurableMemories.bind(this),
@@ -397,6 +421,9 @@ export class ChaunyomsSessionRuntime {
 
     const { rawStore, durableMemoryStore } = await this.ensureSession(payload.sessionId, payload.config);
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
+    const knowledgeIntent = payload.role === "user"
+      ? await this.knowledgeIntentClassifier.classifyUserMessage(payload.content, payload.config)
+      : null;
     const message: RawMessage = {
       id: payload.id,
       sessionId: payload.sessionId,
@@ -407,7 +434,10 @@ export class ChaunyomsSessionRuntime {
       createdAt: new Date().toISOString(),
       tokenCount: estimateTokens(payload.content),
       compacted: false,
-      metadata: payload.metadata,
+      metadata: {
+        ...(payload.metadata ?? {}),
+        ...(knowledgeIntent ? { knowledgeIntent } : {}),
+      },
     };
     await this.sessionData.appendRawMessage(message);
     await this.persistDurableMemories(
@@ -757,6 +787,32 @@ export class ChaunyomsSessionRuntime {
     return await this.omsAdmin.restore(context, backupDirInput, apply);
   }
 
+  async verifyMigration(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.verifyMigration(context);
+  }
+
+  async exportJsonBackup(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    label = "",
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.exportJsonBackup(context, label);
+  }
+
+  async cleanupLegacyJson(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    apply = false,
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.cleanupLegacyJson(context, apply);
+  }
+
+  async migrateJsonToSqlite(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.migrateJsonToSqlite(context);
+  }
+
   async curateKnowledge(
     context: Pick<LifecycleContext, "sessionId" | "config">,
     apply = false,
@@ -797,6 +853,77 @@ export class ChaunyomsSessionRuntime {
       ...args,
       onApprove: () => this.knowledgeMaintenance.schedule(context),
     });
+  }
+
+  async backfillEvidenceAtoms(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: {
+      apply?: boolean;
+      scope?: "agent" | "session";
+      limit?: number;
+    } = {},
+  ): Promise<OmsAtomBackfillResult> {
+    const stores = await this.ensureSession(context.sessionId, context.config);
+    const scope = options.scope ?? "agent";
+    const limit = Math.max(1, Math.min(options.limit ?? 200, 1000));
+    const scopedQuery = scope === "session" ? { sessionId: context.sessionId } : undefined;
+    const summaries = stores.summaryStore.getAllSummaries(scopedQuery);
+    const existingAtoms = stores.evidenceAtomStore.getAll(scopedQuery);
+    const existingSummaryIds = new Set(existingAtoms.map((atom) => atom.sourceSummaryId));
+    const sourceSummaryIds: string[] = [];
+    let eligibleSummaries = 0;
+    let skippedExistingSummaries = 0;
+    let skippedNoAtomSummaries = 0;
+    const atoms: EvidenceAtomEntry[] = [];
+
+    for (const summary of summaries) {
+      if ((summary.summaryLevel ?? 1) > 1 || (summary.nodeKind ?? "leaf") !== "leaf") {
+        continue;
+      }
+      if (summary.recordStatus && summary.recordStatus !== "active") {
+        continue;
+      }
+      if (existingSummaryIds.has(summary.id)) {
+        skippedExistingSummaries += 1;
+        continue;
+      }
+      if (sourceSummaryIds.length >= limit) {
+        break;
+      }
+      const summaryAtoms = this.evidenceAtomEngine.fromSummary(summary);
+      if (summaryAtoms.length === 0) {
+        skippedNoAtomSummaries += 1;
+        continue;
+      }
+      eligibleSummaries += 1;
+      sourceSummaryIds.push(summary.id);
+      atoms.push(...summaryAtoms);
+    }
+
+    let writtenAtoms = 0;
+    if (options.apply && atoms.length > 0) {
+      await this.sessionData.upsertEvidenceAtoms(atoms);
+      await this.sessionData.getRuntimeStore().recordEvidenceAtoms(atoms);
+      writtenAtoms = atoms.length;
+    }
+
+    return {
+      ok: true,
+      apply: options.apply === true,
+      scope,
+      limit,
+      totalSummaries: summaries.length,
+      eligibleSummaries,
+      skippedExistingSummaries,
+      skippedNoAtomSummaries,
+      generatedAtoms: atoms.length,
+      existingAtoms: existingAtoms.length,
+      writtenAtoms,
+      sourceSummaryIds,
+      warnings: options.apply
+        ? []
+        : ["Dry run only. Pass apply=true to persist generated evidence atoms."],
+    };
   }
 
   async wipeSession(

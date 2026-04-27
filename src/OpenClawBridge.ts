@@ -321,6 +321,54 @@ export class OpenClawBridge {
     );
 
     register(
+      "oms_migrate_json_to_sqlite",
+      "Explicit final-shape migration check for SQLite-first mode. It does not implicitly import legacy JSON on the hot path; use export/verify tools for controlled transitions.",
+      {
+        type: "object",
+        properties: {},
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsMigrateJsonToSqlite(args),
+    );
+
+    register(
+      "oms_verify_migration",
+      "Compare repository counts with the SQLite runtime ledger to verify SQLite-first storage consistency.",
+      {
+        type: "object",
+        properties: {},
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsVerifyMigration(args),
+    );
+
+    register(
+      "oms_export_json_backup",
+      "Export the SQLite-first runtime repositories to a JSON backup folder. This is an explicit archival/export path, not hot-path persistence.",
+      {
+        type: "object",
+        properties: {
+          label: { type: "string", description: "Optional backup label suffix." },
+        },
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsExportJsonBackup(args),
+    );
+
+    register(
+      "oms_cleanup_legacy_json",
+      "Dry-run or remove legacy JSON/JSONL hot-path files after SQLite-first verification. Defaults to dry-run.",
+      {
+        type: "object",
+        properties: {
+          apply: { type: "boolean", description: "When true, delete matching legacy JSON files. Defaults to false." },
+        },
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsCleanupLegacyJson(args),
+    );
+
+    register(
       "oms_wipe_session",
       "Dry-run or apply a session-scoped data wipe. Removes session runtime files and SQLite ledger rows while preserving shared Markdown knowledge assets.",
       {
@@ -901,6 +949,22 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsKnowledgeReview(args),
+    );
+
+    register(
+      "oms_backfill_atoms",
+      "Explicit migration tool for backfilling persistent evidence atoms from existing level-1 leaf summaries. Dry-run by default; pass apply=true to write.",
+      {
+        type: "object",
+        properties: {
+          apply: { type: "boolean", description: "When true, persist generated evidence atoms. Defaults to false for dry-run." },
+          scope: { type: "string", enum: ["agent", "session"], description: "Backfill agent-wide or only the current session. Defaults to agent." },
+          limit: { type: "number", description: "Maximum source summaries to backfill in one run. Default 200, max 1000." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsBackfillAtoms(args),
     );
 
     register(

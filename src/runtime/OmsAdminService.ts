@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
@@ -96,6 +96,8 @@ export class OmsAdminService {
         semanticCandidateLimit: context.config.semanticCandidateLimit,
         emergencyBrake: context.config.emergencyBrake,
         sqliteJournalMode: context.config.sqliteJournalMode,
+        sqlitePrimaryEnabled: context.config.sqlitePrimaryEnabled,
+        jsonPersistenceMode: context.config.jsonPersistenceMode,
       },
       runtimeStore: this.deps.sessionData.getRuntimeStore().getStatus(),
       lastCompactionDiagnostics: this.deps.getLastCompactionDiagnostics() as OmsRuntimeStatus["lastCompactionDiagnostics"],
@@ -177,6 +179,125 @@ export class OmsAdminService {
     const manifestPath = path.join(backupDir, "manifest.json");
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
     return { ok: true, backupDir, manifestPath, copied, skipped };
+  }
+
+  async verifyMigration(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<Record<string, unknown>> {
+    const stores = await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const runtimeStatus = this.deps.sessionData.getRuntimeStore().getStatus();
+    const rawMessages = stores.rawStore.getAll();
+    const summaries = stores.summaryStore.getAllSummaries();
+    const memories = stores.durableMemoryStore.getAll();
+    const atoms = stores.evidenceAtomStore.getAll();
+    const comparisons = {
+      messages: { repository: rawMessages.length, sqlite: runtimeStatus.counts.messages },
+      summaries: { repository: summaries.length, sqlite: runtimeStatus.counts.summaries },
+      memories: { repository: memories.length, sqlite: runtimeStatus.counts.memories },
+      evidenceAtoms: { repository: atoms.length, sqlite: runtimeStatus.counts.evidenceAtoms },
+    };
+    const mismatches = Object.entries(comparisons)
+      .filter(([, value]) => value.repository !== value.sqlite)
+      .map(([key, value]) => `${key}: repository=${value.repository} sqlite=${value.sqlite}`);
+    return {
+      ok: runtimeStatus.enabled && mismatches.length === 0,
+      mode: context.config.sqlitePrimaryEnabled ? "sqlite_primary" : "legacy_json_primary",
+      jsonPersistenceMode: context.config.jsonPersistenceMode,
+      comparisons,
+      runtimeStore: runtimeStatus,
+      errors: mismatches,
+      warnings: context.config.sqlitePrimaryEnabled
+        ? []
+        : ["sqlitePrimaryEnabled=false: verification compared the legacy repository mirror against SQLite, not a SQLite primary repository."],
+    };
+  }
+
+  async exportJsonBackup(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    label = "",
+  ): Promise<Record<string, unknown>> {
+    const stores = await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const safeLabel = label.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const exportDir = path.join(context.config.dataDir, "backups", `sqlite-json-export-${stamp}${safeLabel ? `-${safeLabel}` : ""}`);
+    await mkdir(exportDir, { recursive: true });
+    const files = {
+      raw: path.join(exportDir, "raw-messages.json"),
+      summaries: path.join(exportDir, "summaries.json"),
+      durableMemories: path.join(exportDir, "durable-memories.json"),
+      evidenceAtoms: path.join(exportDir, "evidence-atoms.json"),
+      observations: path.join(exportDir, "observations.json"),
+      projects: path.join(exportDir, "projects.json"),
+      knowledgeRaw: path.join(exportDir, "knowledge-raw.json"),
+    };
+    await writeFile(files.raw, JSON.stringify(stores.rawStore.getAll(), null, 2), "utf8");
+    await writeFile(files.summaries, JSON.stringify(stores.summaryStore.getAllSummaries(), null, 2), "utf8");
+    await writeFile(files.durableMemories, JSON.stringify(stores.durableMemoryStore.getAll(), null, 2), "utf8");
+    await writeFile(files.evidenceAtoms, JSON.stringify(stores.evidenceAtomStore.getAll(), null, 2), "utf8");
+    await writeFile(files.observations, JSON.stringify(stores.observationStore.getAll(), null, 2), "utf8");
+    await writeFile(files.projects, JSON.stringify(stores.projectStore.getAll(), null, 2), "utf8");
+    await writeFile(files.knowledgeRaw, JSON.stringify(stores.knowledgeRawStore.getAll(), null, 2), "utf8");
+    await writeFile(path.join(exportDir, "manifest.json"), JSON.stringify({
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+      agentId: context.config.agentId,
+      sessionId: context.sessionId,
+      source: "sqlite_primary_export",
+      files,
+    }, null, 2), "utf8");
+    return { ok: true, exportDir, files };
+  }
+
+  async cleanupLegacyJson(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    apply = false,
+  ): Promise<Record<string, unknown>> {
+    await this.deps.ensureSession(context.sessionId, context.config);
+    const agentDir = path.join(context.config.dataDir, "agents", context.config.agentId);
+    const patterns = [
+      /\.raw\.jsonl$/i,
+      /\.summaries\.json$/i,
+      /\.observations\.jsonl$/i,
+      /\.durable-memory\.json$/i,
+      /\.knowledge-raw\.json$/i,
+      /\.evidence-atoms\.json$/i,
+      /^project-registry\.json$/i,
+    ];
+    const entries = await this.listDirectory(agentDir);
+    const candidates = entries
+      .filter((entry) => patterns.some((pattern) => pattern.test(path.basename(entry))))
+      .map((entry) => path.join(agentDir, entry));
+    const removed: string[] = [];
+    if (apply) {
+      for (const candidate of candidates) {
+        await rm(candidate, { force: true, recursive: false });
+        removed.push(candidate);
+      }
+    }
+    return {
+      ok: true,
+      apply,
+      agentDir,
+      candidates,
+      removed,
+      warnings: apply
+        ? ["Legacy JSON hot-path files removed. SQLite remains the runtime source of truth."]
+        : ["Dry run only. Re-run with apply=true after exporting a backup if you want to delete legacy JSON files."],
+    };
+  }
+
+  async migrateJsonToSqlite(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<Record<string, unknown>> {
+    const verification = await this.verifyMigration(context);
+    return {
+      ok: verification.ok,
+      mode: "sqlite_first_final_shape",
+      imported: 0,
+      verification,
+      warnings: [
+        "Final-shape P2 no longer performs implicit legacy JSON import on the hot path.",
+        "Use oms_export_json_backup before cleanup if you need an archival copy; legacy data adaptation is intentionally not automatic.",
+      ],
+    };
   }
 
   async restore(
@@ -494,6 +615,18 @@ export class OmsAdminService {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code === "ENOENT") {
         return false;
+      }
+      throw error;
+    }
+  }
+
+  private async listDirectory(dir: string): Promise<string[]> {
+    try {
+      return await readdir(dir);
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException;
+      if (nodeError.code === "ENOENT") {
+        return [];
       }
       throw error;
     }
