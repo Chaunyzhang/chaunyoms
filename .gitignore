@@ -11,6 +11,7 @@ Thumbs.db
 .omx/
 docs/*
 !docs/knowledge-intent-ingress-plan.md
+!docs/oms-foundation-substrate-plan.md
 !docs/productization-roadmap.md
 scripts/*
 !scripts/run-compiled-tests.cjs
