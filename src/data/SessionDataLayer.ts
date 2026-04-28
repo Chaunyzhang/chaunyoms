@@ -428,6 +428,7 @@ export class SessionDataLayer {
     totalBudget: number;
     intent: string;
     plan: ContextPlannerResult;
+    metadata?: Record<string, unknown>;
   }): void {
     if (!this.runtimeStore) {
       return;

@@ -4,10 +4,12 @@
     "kind": "recall_disabled",
     "query": "find the exact retry parameter from earlier",
     "expectedTextIncludes": [
-      "Source recall is currently disabled"
+      "Source recall is required",
+      "refuses to answer from unsupported memory or summary hints"
     ],
     "expectedDetails": {
-      "autoRecallReason": "auto_recall_disabled"
+      "autoRecallReason": "auto_recall_disabled",
+      "retrievalHitType": "insufficient_source_evidence"
     }
   },
   {

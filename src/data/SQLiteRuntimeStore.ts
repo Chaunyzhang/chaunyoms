@@ -520,6 +520,7 @@ export class SQLiteRuntimeStore {
     totalBudget: number;
     intent: string;
     plan: ContextPlannerResult;
+    metadata?: Record<string, unknown>;
   }): void {
     if (!this.openDatabase()) {
       return;
@@ -545,7 +546,11 @@ export class SQLiteRuntimeStore {
       args.plan.selectedTokens,
       args.plan.selected.length,
       args.plan.rejected.length,
-      this.stringify({ candidateCount: args.plan.candidateCount, budget: args.plan.budget }),
+      this.stringify({
+        candidateCount: args.plan.candidateCount,
+        budget: args.plan.budget,
+        ...(args.metadata ?? {}),
+      }),
       );
 
       this.db?.prepare("DELETE FROM retrieval_candidates WHERE context_run_id = ?").run(args.plan.runId);
@@ -590,9 +595,43 @@ export class SQLiteRuntimeStore {
         this.stringify({}),
         );
       }
+      for (const step of this.readProgressivePlannerSteps(args.metadata)) {
+        index += 1;
+        insert?.run(
+          `${args.plan.runId}:planner-step:${index}:${String(step.stepIndex ?? index)}`,
+          args.plan.runId,
+          "llm_planner",
+          "scheduler",
+          "planner_step",
+          typeof step.plannerRunId === "string"
+            ? `${step.plannerRunId}:step:${String(step.stepIndex ?? index)}`
+            : `${args.plan.runId}:step:${String(step.stepIndex ?? index)}`,
+          step.stopTriggered === true ? "selected" : "rejected",
+          Number.isFinite(Number(step.candidatesFound)) ? Number(step.candidatesFound) : 0,
+          Number.isFinite(Number(step.budgetTokens)) ? Number(step.budgetTokens) : 0,
+          this.stringify([
+            `planner_layer:${String(step.layer ?? "")}`,
+            `planner_action:${String(step.action ?? "")}`,
+            String(step.reason ?? ""),
+            ...(Array.isArray(step.rejectedReasons)
+              ? step.rejectedReasons.filter((item): item is string => typeof item === "string")
+              : []),
+          ].filter(Boolean)),
+          step.stopTriggered === true ? null : String(step.stopReason ?? "progressive_step_not_terminal"),
+          this.stringify(step),
+        );
+      }
     } finally {
       this.closeDatabase();
     }
+  }
+
+  private readProgressivePlannerSteps(metadata?: Record<string, unknown>): Array<Record<string, unknown>> {
+    const steps = metadata?.progressiveRetrievalSteps;
+    return Array.isArray(steps)
+      ? steps.filter((step): step is Record<string, unknown> =>
+        Boolean(step) && typeof step === "object" && !Array.isArray(step))
+      : [];
   }
 
   grepMessages(query: string, options: { sessionId?: string; limit?: number; contextTurns?: number } = {}): OmsGrepHit[] {

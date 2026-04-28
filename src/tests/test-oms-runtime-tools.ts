@@ -180,6 +180,22 @@ async function main(): Promise<void> {
     }) as { details?: Record<string, unknown> } | undefined;
     assert(Array.isArray(why?.details?.matches), "oms_why_recalled should return candidate matches");
 
+    const plannerDebug = await tools.get("oms_planner_debug")?.execute("tool-planner-debug", {
+      sessionId: config.sessionId,
+      config,
+      query: "刚才那个端口是多少",
+      retrievalStrength: "strict",
+    }) as { details?: Record<string, unknown> } | undefined;
+    const planner = plannerDebug?.details?.planner as Record<string, unknown> | null | undefined;
+    const plannerIntent = plannerDebug?.details?.plannerIntent;
+    const plannerValidation = planner && typeof planner === "object"
+      ? planner.validation as Record<string, unknown> | undefined
+      : undefined;
+    assert(plannerDebug?.details?.tool === "oms_planner_debug", "oms_planner_debug should identify the tool");
+    assert(plannerDebug?.details?.selectedPlan === "planner", "oms_planner_debug should show planner selected for strict source-sensitive query");
+    assert(plannerIntent === "history_trace" || plannerIntent === "precision_fact", "oms_planner_debug should classify strict Chinese exact recall");
+    assert(plannerValidation?.accepted === true, "oms_planner_debug should expose accepted PlanValidator result");
+
     const backup = await tools.get("oms_backup")?.execute("tool-8", {
       sessionId: config.sessionId,
       config,
@@ -253,6 +269,7 @@ async function main(): Promise<void> {
     assert(tools.has("oms_wipe_agent"), "oms_wipe_agent should be registered");
     assert(tools.has("oms_inspect_context"), "oms_inspect_context should be registered");
     assert(tools.has("oms_why_recalled"), "oms_why_recalled should be registered");
+    assert(tools.has("oms_planner_debug"), "oms_planner_debug should be registered");
     assert(tools.has("oms_asset_sync"), "oms_asset_sync should be registered");
     assert(tools.has("oms_asset_reindex"), "oms_asset_reindex should be registered");
     assert(tools.has("oms_asset_verify"), "oms_asset_verify should be registered");

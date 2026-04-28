@@ -1,4 +1,8 @@
-import { ContextPlanner } from "../engines/ContextPlanner";
+import { ContextPlanner, ContextPlannerResult } from "../engines/ContextPlanner";
+import { LLMPlanner } from "../planner/LLMPlanner";
+import { PlanValidator } from "../planner/PlanValidator";
+import { RetrievalRuntime } from "../retrieval/RetrievalRuntime";
+import { RetrievalVerifier, RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
 import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
@@ -8,6 +12,7 @@ import {
   EvidenceAtomEntry,
   FixedPrefixProvider,
   MemoryItemEntry,
+  ProgressiveRetrievalStepRecord,
   ProjectRecord,
   RecallResult,
   RetrievalDecision,
@@ -78,6 +83,20 @@ interface RecallTextDiagnostics {
   retrievalBudget?: RetrievalBudgetPlan;
   persistentEvidenceAtomHitCount?: number;
   transientEvidenceAtomHitCount?: number;
+  retrievalVerification?: RetrievalVerificationResult;
+}
+
+interface PlannerAuditContext {
+  query: string;
+  decision: RetrievalDecision;
+  planned?: {
+    plan: ContextPlannerResult;
+    items: ContextItem[];
+  };
+  recallResult?: RecallResult;
+  retrievalVerification?: RetrievalVerificationResult;
+  evidenceGate?: EvidenceGateResult;
+  timings?: Record<string, number>;
 }
 
 export interface RetrievalLayerDependencies {
@@ -88,6 +107,10 @@ export class ChaunyomsRetrievalService {
   private readonly contextPlanner = new ContextPlanner();
   private readonly recallResolver = new RecallResolver();
   private readonly retrievalRouter = new MemoryRetrievalRouter();
+  private readonly llmPlanner = new LLMPlanner(() => this.runtime.getLlmCaller());
+  private readonly planValidator = new PlanValidator();
+  private readonly retrievalRuntime = new RetrievalRuntime();
+  private readonly retrievalVerifier = new RetrievalVerifier();
   private readonly fixedPrefixProvider: FixedPrefixProvider;
 
   constructor(
@@ -188,6 +211,18 @@ export class ChaunyomsRetrievalService {
     const scope = this.getScopeArg(args);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
+    if (this.isPlannerValidationBlocked(decision)) {
+      await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_planner_blocked", {
+        validationBlocked: true,
+      });
+      return this.attachDiagnostics(
+        this.buildPlannerValidationBlockedResponse(query, decision),
+        query,
+        context,
+        decision,
+        this.emptySemanticExpansion(null),
+      );
+    }
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
     const emptyExpansion = this.emptySemanticExpansion(matchedProject);
@@ -204,6 +239,9 @@ export class ChaunyomsRetrievalService {
       )
       : [];
     if ((decision.requiresSourceRecall || decision.route === "summary_tree") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
+      await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_source_recall_disabled", {
+        sourceRecallDisabled: true,
+      });
       return this.attachDiagnostics(
         this.buildRecallDisabledResponse(query, memoryItemHits, context, decision),
         query,
@@ -215,6 +253,9 @@ export class ChaunyomsRetrievalService {
 
     if (decision.route === "project_registry") {
       const project = this.matchProject(query, projectStore.getAll());
+      await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_project_registry", {
+        matchedProjectId: project?.id ?? decision.matchedProjectId ?? null,
+      });
       return this.attachDiagnostics(
         this.buildProjectRegistryResult(project, decision, query),
         query,
@@ -224,7 +265,14 @@ export class ChaunyomsRetrievalService {
       );
     }
 
-    if (decision.route === "memory_item" && memoryItemHits.length > 0) {
+    if (
+      decision.route === "memory_item" &&
+      memoryItemHits.length > 0 &&
+      !this.isHardSourceTraceRequired(context)
+    ) {
+      await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_memory_item", {
+        memoryItemHitCount: memoryItemHits.length,
+      });
       return this.attachDiagnostics({
         content: [{ type: "text", text: this.formatMemoryItemText(query, memoryItemHits) }],
         details: {
@@ -249,6 +297,9 @@ export class ChaunyomsRetrievalService {
 
     if (this.shouldAutoRecall(decision, context)) {
       if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
+        await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_source_recall_disabled", {
+          sourceRecallDisabled: true,
+        });
         return this.attachDiagnostics(
           this.buildRecallDisabledResponse(query, memoryItemHits, context, decision),
           query,
@@ -298,6 +349,13 @@ export class ChaunyomsRetrievalService {
       const planned = this.planRecallItems(query, atomResult, retrievalBudget);
       timings.planMs = Date.now() - planStartedAt;
       const evidenceGate = this.evaluateEvidenceGate(query, planned.items, atomResult);
+      const retrievalVerification = this.retrievalVerifier.verify({
+        retrievalStrength,
+        items: planned.items,
+        sourceTrace: atomResult.sourceTrace,
+        answerCandidates: atomResult.answerCandidates,
+        recallResult: atomResult,
+      });
       const persistentEvidenceAtomHitCount = atomResult.items.filter((item) =>
         item.metadata?.persistentEvidenceAtom === true,
       ).length;
@@ -305,14 +363,54 @@ export class ChaunyomsRetrievalService {
         (item.metadata?.evidenceAtom === true || typeof item.metadata?.atomId === "string") &&
         item.metadata?.persistentEvidenceAtom !== true,
       ).length;
-      await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
+      const progressiveRetrievalSteps = this.buildProgressiveRetrievalSteps({
+        query,
+        decision,
+        planned,
+        recallResult: atomResult,
+        retrievalVerification,
+        evidenceGate,
+        timings,
+      });
+      await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget, {
+        planner: decision.planner ?? null,
+        plannerRunId: decision.planner?.runId ?? null,
+        plannerIntent: decision.planner?.intent.primary ?? null,
+        selectedPlan: decision.planner?.selectedPlan ?? "deterministic",
+        sourceTraceRequired: this.isSourceTraceRequired(decision, context),
+        retrievalVerification,
+        evidenceGate,
+        progressiveRetrievalSteps,
+      });
       const presentation = this.resolveRecallPresentationOptions(args, context.config.retrievalStrength);
       timings.totalMs = Date.now() - startedAt;
+      if (this.isRetrievalVerifierBlocked(retrievalVerification)) {
+        return this.attachDiagnostics(
+          this.buildRetrievalVerifierBlockedResponse(
+            query,
+            decision,
+            atomResult,
+            retrievalVerification,
+            evidenceGate,
+            {
+              retrievalBudget,
+              persistentEvidenceAtomHitCount,
+              transientEvidenceAtomHitCount,
+            },
+            progressiveRetrievalSteps,
+          ),
+          query,
+          context,
+          decision,
+          emptyExpansion,
+        );
+      }
       return this.attachDiagnostics({
         content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate, {
           retrievalBudget,
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
+          retrievalVerification,
         }) }],
         details: {
           ok: true,
@@ -327,6 +425,8 @@ export class ChaunyomsRetrievalService {
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
           evidenceGate,
+          retrievalVerification,
+          progressiveRetrievalSteps,
           rawFtsHintCount: rawFtsHints.length,
           autoRecall: true,
           autoRecallReason: this.explainAutoRecall(decision, context),
@@ -349,6 +449,9 @@ export class ChaunyomsRetrievalService {
     }
 
     if (decision.route === "knowledge") {
+      await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_knowledge_export_only", {
+        markdownHotPath: false,
+      });
       return this.attachDiagnostics({
         content: [{
           type: "text",
@@ -378,6 +481,9 @@ export class ChaunyomsRetrievalService {
     }
 
     const recentTail = rawStore.getRecentTail(3, { sessionId: context.sessionId });
+    await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_recent_tail", {
+      recentTailCount: recentTail.length,
+    });
     return this.attachDiagnostics({
       content: [{ type: "text", text: this.formatRecentTailText(query, recentTail) }],
       details: {
@@ -641,6 +747,8 @@ export class ChaunyomsRetrievalService {
               memoryItemEnabled: true,
               autoRecallEnabled: context.config.configPreset !== "safe",
               retrievalStrength: context.config.retrievalStrength,
+              llmPlannerMode: context.config.llmPlannerMode,
+              plannerDebugEnabled: context.config.plannerDebugEnabled,
               knowledgePromotionEnabled: false,
               knowledgePromotionManualReviewEnabled: true,
               kbCandidateEnabled: true,
@@ -888,6 +996,52 @@ export class ChaunyomsRetrievalService {
     };
   }
 
+  async executeOmsPlannerDebug(args: unknown): Promise<ToolResponse> {
+    const resolvedContext = this.resolveContext(args);
+    const retrievalStrength = this.resolveRetrievalStrength(args, resolvedContext.config.retrievalStrength);
+    const context: LifecycleContext = {
+      ...resolvedContext,
+      config: {
+        ...resolvedContext.config,
+        retrievalStrength,
+      },
+    };
+    const query = this.getQuery(args);
+    const { decision } = await this.resolveRetrievalDecision(query, context);
+    const planner = decision.planner ?? null;
+    const details = {
+      ok: Boolean(planner),
+      query,
+      route: decision.route,
+      routePlan: decision.routePlan,
+      layerScores: decision.layerScores ?? [],
+      planner,
+      plannerIntent: planner?.intent.primary ?? null,
+      routerRoute: planner?.deterministicRoute ?? decision.route,
+      selectedPlan: planner?.selectedPlan ?? "deterministic",
+      reason: planner?.selectedPlan === "planner"
+        ? decision.explanation
+        : planner?.fallback?.reason ?? decision.explanation,
+    };
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `Planner debug for: ${query || "-"}`,
+          `plannerIntent: ${String(details.plannerIntent ?? "-")}`,
+          `routerRoute: ${String(details.routerRoute)}`,
+          `selectedPlan: ${details.selectedPlan}`,
+          `routePlan: ${details.routePlan.join(" -> ")}`,
+          `reason: ${details.reason}`,
+          planner?.validation.violations.length
+            ? `violations: ${planner.validation.violations.map((violation) => `${violation.severity}:${violation.code}`).join(", ")}`
+            : "violations: none",
+        ].join("\n"),
+      }],
+      details: { tool: "oms_planner_debug", ...details },
+    };
+  }
+
   async executeOmsKnowledgeCurate(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const apply = this.getBooleanArg(args, "apply", false);
@@ -1026,7 +1180,7 @@ export class ChaunyomsRetrievalService {
       apiPrompt: null,
       autoRecallEnabled: context.config.autoRecallEnabled,
       retrievalStrength: context.config.retrievalStrength,
-      sourceTraceRequired: context.config.retrievalStrength === "strict" || context.config.retrievalStrength === "forensic",
+      sourceTraceRequired: this.isSourceTraceRequired(decision, context),
       evidencePresentation: context.config.retrievalStrength === "forensic"
         ? "show_source_trace"
         : context.config.retrievalStrength === "strict"
@@ -1037,6 +1191,13 @@ export class ChaunyomsRetrievalService {
       configWarnings,
       semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
       semanticCandidateLimit: context.config.semanticCandidateLimit,
+      llmPlannerMode: context.config.llmPlannerMode,
+      plannerDebugEnabled: context.config.plannerDebugEnabled,
+      planner: decision.planner ?? null,
+      plannerIntent: decision.planner?.intent.primary ?? null,
+      plannerActivationMode: decision.planner?.activationMode ?? null,
+      plannerSelectedPlan: decision.planner?.selectedPlan ?? "deterministic",
+      plannerValidation: decision.planner?.validation ?? null,
       embeddingsReady: false,
       candidateExpansionMode:
         context.config.semanticCandidateExpansionEnabled
@@ -1821,6 +1982,10 @@ export class ChaunyomsRetrievalService {
     if (!run) {
       return "No ContextPlanner run has been recorded yet. Run assemble or memory_retrieve first.";
     }
+    const metadata = this.isRecord(run.metadata) ? run.metadata : {};
+    const progressiveSteps = Array.isArray(metadata.progressiveRetrievalSteps)
+      ? metadata.progressiveRetrievalSteps as Array<Record<string, unknown>>
+      : [];
     const selected = Array.isArray(details.selected) ? details.selected as Array<Record<string, unknown>> : [];
     const rejected = Array.isArray(details.rejected) ? details.rejected as Array<Record<string, unknown>> : [];
     const lines = [
@@ -1828,6 +1993,11 @@ export class ChaunyomsRetrievalService {
       `Intent: ${String(run.intent ?? "")}`,
       `Budget: selected ${Number(run.selectedTokens ?? 0)} / total ${Number(run.totalBudget ?? 0)} tokens`,
       `Selected: ${selected.length}; Rejected: ${rejected.length}`,
+      progressiveSteps.length > 0 ? `Planner run: ${String(metadata.plannerRunId ?? "-")} intent=${String(metadata.plannerIntent ?? "-")} selectedPlan=${String(metadata.selectedPlan ?? "-")}` : "",
+      progressiveSteps.length > 0 ? "Progressive planner steps:" : "",
+      ...progressiveSteps.slice(0, 12).map((step, index) =>
+        `${index + 1}. ${String(step.layer ?? "-")}/${String(step.action ?? "-")} candidates=${Number(step.candidatesFound ?? 0)} selected=${Number(step.selectedCount ?? 0)} verified=${Number(step.sourceVerifiedCount ?? 0)} stop=${String(step.stopTriggered ?? false)} reason=${String(step.reason ?? step.stopReason ?? "")}`),
+      ...(progressiveSteps.length > 12 ? [`... ${progressiveSteps.length - 12} more planner step(s)`] : []),
       "",
       "Selected candidates:",
       ...selected.slice(0, 12).map((candidate, index) =>
@@ -1851,20 +2021,280 @@ export class ChaunyomsRetrievalService {
       String(details.explanation ?? ""),
       "",
     ];
+    const latestRun = this.isRecord(details.latestRun) ? details.latestRun : undefined;
+    const latestMetadata = this.isRecord(latestRun?.metadata) ? latestRun.metadata : undefined;
+    const progressiveSteps = Array.isArray(latestMetadata?.progressiveRetrievalSteps)
+      ? latestMetadata.progressiveRetrievalSteps as Array<Record<string, unknown>>
+      : [];
     if (matches.length === 0) {
-      return [...header, "No matching candidate audit rows were found."].join("\n");
+      return [
+        ...header,
+        progressiveSteps.length > 0 ? `Planner run: ${String(latestMetadata?.plannerRunId ?? "-")}` : "",
+        ...progressiveSteps.slice(0, 6).map((step, index) =>
+          `Planner step ${index + 1}: ${String(step.layer ?? "-")}/${String(step.action ?? "-")} candidates=${Number(step.candidatesFound ?? 0)} verified=${Number(step.sourceVerifiedCount ?? 0)} stop=${String(step.stopTriggered ?? false)}`),
+        "No matching candidate audit rows were found.",
+      ].filter((line) => line.length > 0).join("\n");
     }
     return [
       ...header,
+      progressiveSteps.length > 0 ? `Planner run: ${String(latestMetadata?.plannerRunId ?? "-")}` : "",
+      ...progressiveSteps.slice(0, 6).map((step, index) =>
+        `Planner step ${index + 1}: ${String(step.layer ?? "-")}/${String(step.action ?? "-")} candidates=${Number(step.candidatesFound ?? 0)} verified=${Number(step.sourceVerifiedCount ?? 0)} stop=${String(step.stopTriggered ?? false)}`),
       ...matches.map((candidate, index) =>
         `${index + 1}. ${candidate.status} ${candidate.source}/${candidate.authority} ${candidate.targetKind}:${candidate.targetId ?? "-"} score=${candidate.score} tokens=${candidate.tokenCount} reasons=${this.formatReasonList(candidate.reasons)}${candidate.rejectedReason ? ` rejected=${candidate.rejectedReason}` : ""}`),
-    ].join("\n");
+    ].filter((line) => line.length > 0).join("\n");
   }
 
   private formatReasonList(value: unknown): string {
     return Array.isArray(value)
       ? value.filter((item): item is string => typeof item === "string").join(",")
       : "";
+  }
+
+  private isPlannerValidationBlocked(decision: RetrievalDecision): boolean {
+    return decision.planner?.validation.accepted === false &&
+      decision.planner.validation.fallbackRoute === "safe_no_answer";
+  }
+
+  private buildPlannerValidationBlockedResponse(
+    query: string,
+    decision: RetrievalDecision,
+  ): ToolResponse {
+    const violations = decision.planner?.validation.violations ?? [];
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `PlanValidator blocked retrieval for: ${query}`,
+          "The planner produced a hard-boundary violation, so OMS refused to execute the unsafe plan or fall back to an unsupported answer.",
+          violations.length > 0
+            ? `Violations: ${violations.map((violation) => `${violation.severity}:${violation.code}`).join(", ")}`
+            : "Violations: unknown",
+        ].join("\n"),
+      }],
+      details: {
+        ok: false,
+        route: decision.route,
+        query,
+        retrievalHitType: "planner_validation_blocked",
+        evidencePresentation: "no_answer",
+        hitCount: 0,
+        blockedBy: "PlanValidator",
+        planner: decision.planner ?? null,
+        routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
+        explanation: decision.explanation,
+        fallbackTrace: [{
+          from: decision.route,
+          to: "none",
+          reason: "plan_validator_safe_no_answer",
+        }],
+      },
+    };
+  }
+
+  private isRetrievalVerifierBlocked(result: RetrievalVerificationResult): boolean {
+    return (result.sourceTraceRequired || result.fullRawTraceRequired) && result.status !== "sufficient";
+  }
+
+  private buildRetrievalVerifierBlockedResponse(
+    query: string,
+    decision: RetrievalDecision,
+    recallResult: RecallResult,
+    retrievalVerification: RetrievalVerificationResult,
+    evidenceGate: EvidenceGateResult,
+    diagnostics: {
+      retrievalBudget: RetrievalBudgetPlan;
+      persistentEvidenceAtomHitCount: number;
+      transientEvidenceAtomHitCount: number;
+    },
+    progressiveRetrievalSteps: ProgressiveRetrievalStepRecord[],
+  ): ToolResponse {
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `Retrieval verifier blocked final answer for: ${query}`,
+          `Status: ${retrievalVerification.status}; action: ${retrievalVerification.recommendedAction}`,
+          `Reason: ${retrievalVerification.reason}`,
+          "No unsupported MemoryItem, summary, or trace-only content is returned as a final fact.",
+        ].join("\n"),
+      }],
+      details: {
+        ok: true,
+        route: decision.route,
+        retrievalLabel: this.describeRetrievalRoute(decision),
+        query,
+        hitCount: 0,
+        blockedHitCount: recallResult.items.length,
+        retrievalHitType: "insufficient_source_evidence",
+        evidencePresentation: "no_answer",
+        autoRecall: true,
+        autoRecallReason: "retrieval_verifier_requires_source_evidence",
+        routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
+        explanation: decision.explanation,
+        evidenceGate,
+        retrievalVerification,
+        sourceTrace: this.compactSourceTrace(recallResult.sourceTrace),
+        answerCandidates: this.compactAnswerCandidates(recallResult.answerCandidates ?? [], {
+          maxItems: 3,
+          maxCharsPerItem: 200,
+          includeFullTrace: false,
+        }),
+        retrievalBudget: diagnostics.retrievalBudget,
+        persistentEvidenceAtomHitCount: diagnostics.persistentEvidenceAtomHitCount,
+        transientEvidenceAtomHitCount: diagnostics.transientEvidenceAtomHitCount,
+        progressiveRetrievalSteps,
+        fallbackTrace: [{
+          from: decision.route,
+          to: "none",
+          reason: "retrieval_verifier_insufficient_source_evidence",
+        }],
+      },
+    };
+  }
+
+  private buildProgressiveRetrievalSteps(args: PlannerAuditContext): ProgressiveRetrievalStepRecord[] {
+    const planner = args.decision.planner;
+    if (!planner || planner.routeSteps.length === 0) {
+      return [];
+    }
+    const selected = args.planned?.plan.selected ?? [];
+    const rejected = args.planned?.plan.rejected ?? [];
+    const sourceTrace = args.recallResult?.sourceTrace ?? [];
+    const verifiedTraceCount = sourceTrace.filter((trace) => trace.verified).length;
+    const terminalIndex = this.resolveTerminalPlannerStepIndex(planner.routeSteps, args.retrievalVerification);
+    return planner.routeSteps.map((step, index) => {
+      const layerSelected = selected.filter((candidate) => this.candidateMatchesPlannerLayer(candidate.source, step.layer));
+      const layerRejected = rejected.filter((candidate) => this.candidateMatchesPlannerLayer(candidate.source, step.layer));
+      const isRawStep = step.layer === "raw_sources";
+      const candidatesFound = isRawStep
+        ? Math.max(sourceTrace.length, args.recallResult?.rawCandidateCount ?? 0)
+        : layerSelected.length + layerRejected.length;
+      const stopTriggered = index === terminalIndex;
+      return {
+        plannerRunId: planner.runId,
+        stepIndex: index,
+        layer: step.layer,
+        action: step.action,
+        query: args.query,
+        candidatesFound,
+        selectedCount: isRawStep ? sourceTrace.length : layerSelected.length,
+        rejectedCount: layerRejected.length,
+        rejectedReasons: [...new Set(layerRejected.map((candidate) => candidate.rejectedReason))],
+        sourceVerifiedCount: isRawStep
+          ? verifiedTraceCount
+          : layerSelected.filter((candidate) => candidate.authority === "raw_evidence" || candidate.authority === "source_backed_summary").length,
+        latencyMs: this.estimateStepLatencyMs(step.action, args.timings),
+        stopTriggered,
+        stopReason: stopTriggered
+          ? this.resolvePlannerStopReason(args.retrievalVerification, args.evidenceGate, step.stopIf)
+          : step.stopIf,
+        reason: step.reason,
+        stopIf: step.stopIf,
+        budgetTokens: step.budgetTokens,
+      };
+    });
+  }
+
+  private resolveTerminalPlannerStepIndex(
+    steps: Array<{ action: string; layer: string }>,
+    verification?: RetrievalVerificationResult,
+  ): number {
+    if (!verification) {
+      return Math.max(steps.length - 1, 0);
+    }
+    if (verification.status === "sufficient") {
+      const verifyIndex = steps.findIndex((step) => step.action === "verify");
+      if (verifyIndex >= 0) {
+        return verifyIndex;
+      }
+      const rawIndex = steps.findIndex((step) => step.layer === "raw_sources");
+      return rawIndex >= 0 ? rawIndex : Math.max(steps.length - 1, 0);
+    }
+    return Math.max(steps.length - 1, 0);
+  }
+
+  private resolvePlannerStopReason(
+    verification?: RetrievalVerificationResult,
+    evidenceGate?: EvidenceGateResult,
+    stopIf?: string,
+  ): string {
+    if (verification) {
+      return `retrieval_verifier:${verification.status}:${verification.recommendedAction}`;
+    }
+    if (evidenceGate) {
+      return `evidence_gate:${evidenceGate.status}:${evidenceGate.recommendedAction}`;
+    }
+    return stopIf ?? "route_exhausted";
+  }
+
+  private estimateStepLatencyMs(action: string, timings?: Record<string, number>): number {
+    if (!timings) {
+      return 0;
+    }
+    if (action === "verify") {
+      return 0;
+    }
+    if (action === "expand") {
+      return Number(timings.resolveMs ?? 0);
+    }
+    return Number(timings.planMs ?? 0);
+  }
+
+  private candidateMatchesPlannerLayer(source: string, layer: string): boolean {
+    switch (layer) {
+      case "recent_tail":
+        return source === "recent_tail";
+      case "memory_items":
+        return source === "active_memory";
+      case "base_summaries":
+        return source === "summary_context";
+      case "raw_sources":
+        return source === "raw_exact_search";
+      case "knowledge_export_index":
+        return source === "reviewed_asset";
+      case "project_registry":
+        return source === "active_memory";
+      default:
+        return false;
+    }
+  }
+
+  private async recordPlannerAuditOnly(
+    context: Pick<LifecycleContext, "sessionId" | "config" | "totalBudget">,
+    query: string,
+    decision: RetrievalDecision,
+    intent: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> {
+    if (!decision.planner) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const plan: ContextPlannerResult = {
+      runId: `context-${decision.planner.runId}`,
+      createdAt: now,
+      selected: [],
+      rejected: [],
+      selectedTokens: 0,
+      candidateCount: decision.planner.routeSteps.length,
+      budget: 0,
+    };
+    const progressiveRetrievalSteps = this.buildProgressiveRetrievalSteps({
+      query,
+      decision,
+    });
+    await this.runtime.recordRetrievalPlan(context, intent, plan, 0, {
+      planner: decision.planner,
+      plannerRunId: decision.planner.runId,
+      plannerIntent: decision.planner.intent.primary,
+      selectedPlan: decision.planner.selectedPlan,
+      sourceTraceRequired: decision.planner.sourceTraceRequired,
+      progressiveRetrievalSteps,
+      ...extra,
+    });
   }
 
   private async resolveRetrievalDecision(
@@ -1884,7 +2314,7 @@ export class ChaunyomsRetrievalService {
       )
       : [];
     const hasKnowledgeHits = false;
-    const decision = this.retrievalRouter.decide(query, {
+    const routeContext = {
       hasKnowledgeHits,
       hasKnowledgeRawHint: false,
       hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
@@ -1895,6 +2325,42 @@ export class ChaunyomsRetrievalService {
       referencesCurrentWork: this.referencesCurrentWork(query),
       matchedProjectId: matchedProject?.id,
       matchedProjectTitle: matchedProject?.title,
+    };
+    const deterministicDecision = this.retrievalRouter.decide(query, routeContext);
+    const plannerResult = await this.llmPlanner.plan({
+      query,
+      deterministicDecision,
+      signals: {
+        retrievalStrength: context.config.retrievalStrength,
+        llmPlannerMode: context.config.llmPlannerMode,
+        hasLlmCaller: Boolean(this.runtime.getLlmCaller()),
+        hasCompactedHistory: routeContext.hasCompactedHistory,
+        hasProjectRegistry: routeContext.hasProjectRegistry,
+        hasMemoryItemHits: routeContext.hasMemoryItemHits,
+        hasKnowledgeHits: routeContext.hasKnowledgeHits,
+        hasKnowledgeRawHint: routeContext.hasKnowledgeRawHint,
+        recentAssistantUncertainty: routeContext.recentAssistantUncertainty,
+        queryComplexity: routeContext.queryComplexity,
+        referencesCurrentWork: routeContext.referencesCurrentWork,
+        matchedProjectId: routeContext.matchedProjectId,
+        matchedProjectTitle: routeContext.matchedProjectTitle,
+        autoRecallEnabled: context.config.autoRecallEnabled,
+        emergencyBrake: context.config.emergencyBrake,
+        memoryItemEnabled: context.config.memoryItemEnabled,
+        totalBudget: context.totalBudget,
+        llmPlannerModel: context.config.llmPlannerModel,
+      },
+    });
+    const validation = this.planValidator.validate(plannerResult.plan);
+    const usePlanner =
+      context.config.llmPlannerMode === "auto" &&
+      plannerResult.plan.activation.mode === "llm_planner" &&
+      validation.accepted;
+    const decision = this.retrievalRuntime.decisionFromPlan({
+      plan: plannerResult.plan,
+      validation,
+      deterministicDecision,
+      usePlanner,
     });
     return {
       decision,
@@ -2002,6 +2468,15 @@ export class ChaunyomsRetrievalService {
           "",
         ].join("\n")
       : "";
+    const verifier = diagnostics.retrievalVerification
+      ? [
+          "Retrieval verifier:",
+          `- status=${diagnostics.retrievalVerification.status}, action=${diagnostics.retrievalVerification.recommendedAction}`,
+          `- sourceTraceStatus=${diagnostics.retrievalVerification.sourceTraceStatus}, verifiedTrace=${diagnostics.retrievalVerification.verifiedTraceCount}, completeRawTrace=${diagnostics.retrievalVerification.completeRawTraceCount}`,
+          `- reason=${diagnostics.retrievalVerification.reason}`,
+          "",
+        ].join("\n")
+      : "";
     const summaryItems = items.filter((item) => item.kind === "summary");
     const messageItems = items
       .filter((item) => item.kind !== "summary")
@@ -2055,6 +2530,7 @@ export class ChaunyomsRetrievalService {
       answers,
       gate,
       budget,
+      verifier,
       localMatchText,
       messages,
       omitted,
@@ -2427,6 +2903,43 @@ export class ChaunyomsRetrievalService {
     context: LifecycleContext,
     decision: RetrievalDecision,
   ): ToolResponse {
+    if (this.isSourceTraceRequired(decision, context)) {
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `Source recall is required for: ${query}`,
+            context.config.emergencyBrake
+              ? "Emergency brake is enabled, so OMS refuses to answer from unsupported memory or summary hints."
+              : "Automatic source recall is disabled, so OMS refuses to answer from unsupported memory or summary hints.",
+          ].join("\n"),
+        }],
+        details: {
+          ok: true,
+          route: decision.route,
+          retrievalLabel: this.describeRetrievalRoute(decision),
+          query,
+          hitCount: 0,
+          blockedHitCount: memoryItemHits.length,
+          memoryItemHitCount: memoryItemHits.length,
+          topRecordType: null,
+          retrievalHitType: "insufficient_source_evidence",
+          evidencePresentation: "no_answer",
+          autoRecall: false,
+          autoRecallReason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
+          emergencyBrake: context.config.emergencyBrake,
+          autoRecallEnabled: context.config.autoRecallEnabled,
+          routePlan: decision.routePlan,
+          layerScores: decision.layerScores ?? [],
+          explanation: decision.explanation,
+          fallbackTrace: [{
+            from: decision.route,
+            to: "none",
+            reason: "source_trace_required_but_recall_disabled",
+          }],
+        },
+      };
+    }
     const text = memoryItemHits.length > 0
       ? `${this.formatMemoryItemText(query, memoryItemHits)}\n\nSource recall is currently disabled by safety policy.`
       : `Source recall is currently disabled${context.config.emergencyBrake ? " because emergency brake is enabled" : " by configuration"}.`;
@@ -2531,7 +3044,18 @@ export class ChaunyomsRetrievalService {
     if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
       return false;
     }
-    return decision.requiresSourceRecall || decision.route === "summary_tree";
+    return this.isSourceTraceRequired(decision, context) || decision.requiresSourceRecall || decision.route === "summary_tree";
+  }
+
+  private isSourceTraceRequired(decision: RetrievalDecision, context: LifecycleContext): boolean {
+    return decision.planner?.sourceTraceRequired === true ||
+      context.config.retrievalStrength === "strict" ||
+      context.config.retrievalStrength === "forensic";
+  }
+
+  private isHardSourceTraceRequired(context: LifecycleContext): boolean {
+    return context.config.retrievalStrength === "strict" ||
+      context.config.retrievalStrength === "forensic";
   }
 
   private explainAutoRecall(decision: RetrievalDecision, context: LifecycleContext): string | null {

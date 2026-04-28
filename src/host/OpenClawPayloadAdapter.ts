@@ -445,6 +445,25 @@ export class OpenClawPayloadAdapter {
       baseConfig.retrievalStrength,
     ) as BridgeConfig["retrievalStrength"];
 
+    const llmPlannerMode = this.resolveStringEnum(
+      [
+        pluginConfig.llmPlannerMode,
+        pluginConfig.plannerMode,
+        pluginConfig.retrievalPlannerMode,
+      ],
+      ["off", "shadow", "auto"],
+      baseConfig.llmPlannerMode,
+    ) as BridgeConfig["llmPlannerMode"];
+
+    const plannerDebugEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.plannerDebugEnabled,
+        pluginConfig.llmPlannerDebugEnabled,
+        pluginConfig.enablePlannerDebug,
+      ],
+      baseConfig.plannerDebugEnabled,
+    );
+
     const kbPromotionMode = this.resolveStringEnum(
       [
         pluginConfig.kbPromotionMode,
@@ -551,6 +570,16 @@ export class OpenClawPayloadAdapter {
       transcriptMirrorEnabled,
       knowledgeMarkdownEnabled,
       retrievalStrength,
+      llmPlannerMode,
+      plannerDebugEnabled,
+      llmPlannerModel:
+        typeof pluginConfig.llmPlannerModel === "string" &&
+        pluginConfig.llmPlannerModel.trim().length > 0
+          ? pluginConfig.llmPlannerModel
+          : typeof pluginConfig.plannerModel === "string" &&
+              pluginConfig.plannerModel.trim().length > 0
+            ? pluginConfig.plannerModel
+            : baseConfig.llmPlannerModel,
       knowledgePromotionEnabled,
       knowledgePromotionManualReviewEnabled,
       knowledgeIntakeMode,
@@ -1423,6 +1452,9 @@ export class OpenClawPayloadAdapter {
       !Number.isInteger(config.semanticCandidateLimit)
     ) {
       errors.push("semanticCandidateLimit must be a non-negative integer");
+    }
+    if (!["off", "shadow", "auto"].includes(config.llmPlannerMode)) {
+      errors.push("llmPlannerMode must be off, shadow, or auto");
     }
     if (!["delete", "wal"].includes(config.sqliteJournalMode)) {
       errors.push("sqliteJournalMode must be either delete or wal");

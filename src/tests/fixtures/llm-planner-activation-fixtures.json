@@ -1,0 +1,128 @@
+[
+  {
+    "name": "casual bypass stays cheap",
+    "query": "hello there",
+    "expectedMode": "bypass",
+    "expectedIntent": "casual",
+    "expectSourceTraceRequired": false,
+    "expectedTriggers": ["low_risk_recent_context"]
+  },
+  {
+    "name": "explicit tool uses deterministic fast path",
+    "query": "oms_status",
+    "expectedMode": "deterministic_fast_path",
+    "expectedIntent": "debug_runtime",
+    "expectSourceTraceRequired": false,
+    "expectedTriggers": ["explicit_tool_or_id_lookup"]
+  },
+  {
+    "name": "retrieval off disables planner recall",
+    "query": "刚才那个端口是多少",
+    "retrievalStrength": "off",
+    "expectedMode": "bypass",
+    "expectedTriggers": ["retrieval_off"],
+    "skipPlan": true
+  },
+  {
+    "name": "Chinese exact earlier port needs source trace",
+    "query": "刚才那个端口是多少",
+    "signals": { "hasCompactedHistory": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["base_summaries", "raw_sources"],
+    "expectedTriggers": ["precision_fact_signal", "implicit_history_reference"]
+  },
+  {
+    "name": "Shadow mode does not invoke LLM caller",
+    "query": "刚才那个端口是多少",
+    "retrievalStrength": "strict",
+    "plannerMode": "shadow",
+    "hasLlmCaller": true,
+    "signals": { "hasCompactedHistory": true },
+    "expectedMode": "llm_planner",
+    "expectedLlmInvoked": false,
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedFallbackFrom": "not_required",
+    "expectedLayers": ["base_summaries", "raw_sources"],
+    "expectedTriggers": ["strict_requires_evidence_planning", "precision_fact_signal", "implicit_history_reference"]
+  },
+  {
+    "name": "Chinese earlier path uses summaries then raw source",
+    "query": "前面不是说过那个路径吗",
+    "signals": { "hasCompactedHistory": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["base_summaries", "raw_sources"],
+    "expectedTriggers": ["implicit_history_reference"]
+  },
+  {
+    "name": "Current blocker asks project registry",
+    "query": "现在我们卡在哪",
+    "signals": { "hasProjectRegistry": true, "referencesCurrentWork": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "blocker",
+    "expectSourceTraceRequired": false,
+    "expectedLayers": ["project_registry", "recent_tail"],
+    "expectedTriggers": ["current_work_or_project_state"]
+  },
+  {
+    "name": "Project next step asks project state",
+    "query": "这个项目下一步干啥",
+    "signals": { "hasProjectRegistry": true, "referencesCurrentWork": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "next_step",
+    "expectSourceTraceRequired": false,
+    "expectedLayers": ["project_registry", "recent_tail"],
+    "expectedTriggers": ["current_work_or_project_state"]
+  },
+  {
+    "name": "Remember changed config needs trace",
+    "query": "你记不记得我之前改过哪个配置",
+    "signals": { "hasCompactedHistory": true, "hasMemoryItemHits": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["memory_items", "base_summaries", "raw_sources"],
+    "expectedTriggers": ["precision_fact_signal", "implicit_history_reference"]
+  },
+  {
+    "name": "Conflict with earlier fact triggers planner",
+    "query": "这个为什么和之前不一样",
+    "signals": { "hasCompactedHistory": true, "hasMemoryItemHits": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["memory_items", "base_summaries", "raw_sources"],
+    "expectedTriggers": ["implicit_history_reference", "conflict_or_supersede_risk"]
+  },
+  {
+    "name": "Durable correction becomes write candidate only",
+    "query": "以后别再这样",
+    "expectedMode": "llm_planner",
+    "expectedIntent": "memory_write_candidate",
+    "expectSourceTraceRequired": false,
+    "expectedMemoryWriteAllowed": true,
+    "expectedTriggers": ["possible_memory_write"]
+  },
+  {
+    "name": "Strict document execution is architecture reasoning",
+    "query": "按文档严格执行，把项目打磨到最终形态",
+    "signals": { "queryComplexity": "high" },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "architecture_reasoning",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["raw_sources"],
+    "expectedTriggers": ["high_constraint_document_or_final_shape_request", "high_query_complexity"]
+  },
+  {
+    "name": "OMS issue question is runtime debug",
+    "query": "这是不是 OMS 的问题",
+    "expectedMode": "llm_planner",
+    "expectedIntent": "debug_runtime",
+    "expectSourceTraceRequired": false,
+    "expectedTriggers": ["runtime_debug_or_root_cause_question"]
+  }
+]

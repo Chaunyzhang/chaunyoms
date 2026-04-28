@@ -1209,6 +1209,21 @@ export class OpenClawBridge {
     );
 
     register(
+      "oms_planner_debug",
+      "Explain the on-demand LLMPlanner decision, deterministic-router fallback, selected plan, validation result, and route plan for a query.",
+      {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The user query to plan/debug." },
+          retrievalStrength: { type: "string", enum: ["off", "light", "auto", "strict", "forensic"], description: "Optional retrieval strength override." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsPlannerDebug(args),
+    );
+
+    register(
       "oms_knowledge_curate",
       "Inspect Markdown knowledge asset governance: duplicate canonical keys, missing provenance, draft/superseded counts. Advisory by default.",
       {

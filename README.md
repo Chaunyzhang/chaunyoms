@@ -20,7 +20,7 @@
 
 SQLite owns runtime truth: Source/raw messages, BaseSummary, MemoryItem, source edges, asset indexes, context-run audit logs, and retrieval candidates. `MEMORY.md`, daily notes, `DREAMS.md`, and Obsidian/knowledge Markdown are human-readable exports or migration/debug artifacts only; they are not scanned on every turn and do not feed authoritative recall. Runtime retrieval is source-first, MemoryItem/BaseSummary-backed, and always gated by ContextPlanner budget/authority rules.
 
-Use `memory_retrieve` as the primary OMS entrypoint and the OpenClaw-compatible `memory_search` / `memory_get` facades when the host expects native memory tools. Use `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, and `oms_why_recalled` when you need setup guidance, evidence, operations, or explainability.
+Use `memory_retrieve` as the primary OMS entrypoint and the OpenClaw-compatible `memory_search` / `memory_get` facades when the host expects native memory tools. Use `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, `oms_why_recalled`, and `oms_planner_debug` when you need setup guidance, evidence, operations, or explainability.
 
 ---
 
@@ -54,6 +54,20 @@ International MiniMax base URL: `https://api.minimax.io/v1`; China-region base U
 ## Runtime retrieval and SQLite tuning
 
 `memory_retrieve` now keeps one ordered path: SQLite raw search narrows history candidates, source edges expand/trace evidence, and ContextPlanner is the final budget/authority gate. Context assembly also reads recent tail, active memory, summary context, and context-run audit data from SQLite first. JSON/JSONL stores are current-write mirrors and operational sidecars only; legacy schema migration is no longer part of the hot startup path. FTS/BM25 is only a fast clue finder; it does not become a separate authority layer, and DAG/source edges remain provenance infrastructure rather than a competing recall router.
+
+LLMPlanner is the on-demand scheduling brain for ambiguous, source-sensitive, cross-layer, or memory-write-risk retrieval. It classifies intent, plans progressive layers, proposes context budgets and stop conditions, then hands execution to the existing router/runtime/ContextPlanner stack. PlanValidator and RetrievalVerifier keep the hard boundaries: Markdown is never a runtime fact source, tool output is never Source, strict requires verified source evidence, and forensic requires complete raw trace.
+
+Planner controls:
+
+```json
+{
+  "llmPlannerMode": "auto",
+  "plannerDebugEnabled": false,
+  "llmPlannerModel": "optional-host-model-name"
+}
+```
+
+Use `llmPlannerMode: "off"` for deterministic-only operation, `"shadow"` to keep deterministic selection while recording planner diagnostics, and `"auto"` to let accepted planner plans become the retrieval schedule. Use `oms_planner_debug` to compare planner intent, deterministic route, selected plan, validation, fallback, and route steps for a query.
 
 SQLite defaults to conservative rollback journaling:
 

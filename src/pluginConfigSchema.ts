@@ -126,6 +126,19 @@ export const pluginConfigSchema = {
       enum: ["off", "light", "auto", "strict", "forensic"],
       description: "Single retrieval policy knob. Controls recall depth, source-trace requirements, and evidence presentation.",
     },
+    llmPlannerMode: {
+      type: "string",
+      enum: ["off", "shadow", "auto"],
+      description: "On-demand LLMPlanner mode. auto makes the planner the retrieval scheduling backbone when ambiguity/risk warrants it; shadow records planner intent without selecting it; off uses deterministic routing only.",
+    },
+    plannerDebugEnabled: {
+      type: "boolean",
+      description: "Expose additional planner diagnostics for oms_planner_debug and retrieval envelopes.",
+    },
+    llmPlannerModel: {
+      type: "string",
+      description: "Optional model name for the LLMPlanner scheduling call. Omitted to use the host default.",
+    },
     kbCandidateEnabled: {
       type: "boolean",
       description: "Allow ChaunyOMS to create governed knowledge-base candidates. Candidate creation is separate from Markdown writes.",

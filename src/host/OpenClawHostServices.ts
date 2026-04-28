@@ -59,6 +59,8 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   knowledgeIntakeUserOverridePatterns: [],
   semanticCandidateExpansionEnabled: true,
   semanticCandidateLimit: 5,
+  llmPlannerMode: "auto",
+  plannerDebugEnabled: false,
   emergencyBrake: false,
   sqliteJournalMode: "delete",
 };

@@ -339,6 +339,10 @@ export class ChaunyomsSessionRuntime {
     return this.config;
   }
 
+  getLlmCaller(): LlmCaller | null {
+    return this.llmCaller;
+  }
+
   private initializeServices(): void {
     this.omsAdmin = new OmsAdminService({
       sessionData: this.sessionData,
@@ -777,6 +781,7 @@ export class ChaunyomsSessionRuntime {
     intent: string,
     plan: ContextPlannerResult,
     totalBudget?: number,
+    metadata?: Record<string, unknown>,
   ): Promise<void> {
     await this.ensureSession(context.sessionId, context.config);
     this.sessionData.recordContextPlan({
@@ -785,6 +790,7 @@ export class ChaunyomsSessionRuntime {
       totalBudget: totalBudget ?? ("totalBudget" in context ? context.totalBudget : plan.budget),
       intent,
       plan,
+      metadata,
     });
   }
 

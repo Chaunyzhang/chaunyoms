@@ -23,7 +23,21 @@
 
 SQLite owns runtime truth: raw messages, summaries, source_edges, memories, asset index, context_runs, and retrieval_candidates. Markdown owns human-readable assets. For factual history, this agent's raw ledger has priority; reviewed knowledge is advisory; ContextPlanner is the only gate that decides what enters context.
 
-Primary path: `memory_retrieve`. Setup/evidence/ops path: `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, `oms_why_recalled`.
+Primary path: `memory_retrieve`. Setup/evidence/ops path: `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, `oms_why_recalled`, `oms_planner_debug`.
+
+LLMPlanner 现在是按需启动的调度大脑，归在 Planner / Retrieval / Context Assembly 子项下。它负责识别意图、规划渐进式检索层、分配上下文预算和停止条件；但它不能直接认定事实。PlanValidator / RetrievalVerifier 会守住硬边界：Markdown 不能成为运行期事实源，tool output 不能冒充 Source，strict 必须有 verified source，forensic 必须有完整 raw trace。
+
+Planner 配置：
+
+```json
+{
+  "llmPlannerMode": "auto",
+  "plannerDebugEnabled": false,
+  "llmPlannerModel": "optional-host-model-name"
+}
+```
+
+`off` 表示只走 deterministic；`shadow` 表示保留 deterministic 选择但记录 planner 诊断；`auto` 表示通过 Validator 的 planner plan 可以成为实际检索调度。用 `oms_planner_debug` 可以看 intent、routerRoute、selectedPlan、validation、fallback 和 route steps。
 
 ---
 

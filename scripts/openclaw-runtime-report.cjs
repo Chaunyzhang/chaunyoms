@@ -58,9 +58,11 @@ function stripBom(content) {
 }
 
 function resolveDataDir(config) {
-  const dataDir = config?.plugins?.entries?.chaunyoms?.config?.dataDir;
+  const dataDir =
+    config?.plugins?.entries?.oms?.config?.dataDir ??
+    config?.plugins?.entries?.chaunyoms?.config?.dataDir;
   if (typeof dataDir !== "string" || !dataDir.trim()) {
-    throw new Error("ChaunyOMS dataDir is missing from ~/.openclaw/openclaw.json");
+    throw new Error("ChaunyOMS dataDir is missing from ~/.openclaw/openclaw.json (expected plugins.entries.oms.config.dataDir or legacy plugins.entries.chaunyoms.config.dataDir)");
   }
   return dataDir;
 }

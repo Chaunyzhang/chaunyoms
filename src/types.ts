@@ -308,6 +308,7 @@ export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
 export type RetrievalStrength = "off" | "light" | "auto" | "strict" | "forensic";
+export type LlmPlannerMode = "off" | "shadow" | "auto";
 export type KbPromotionMode =
   | "manual"
   | "assisted"
@@ -805,6 +806,9 @@ export interface BridgeConfig {
   knowledgeIntakeUserOverridePatterns: string[];
   semanticCandidateExpansionEnabled: boolean;
   semanticCandidateLimit: number;
+  llmPlannerMode: LlmPlannerMode;
+  plannerDebugEnabled: boolean;
+  llmPlannerModel?: string;
   emergencyBrake: boolean;
   sqliteJournalMode: "delete" | "wal";
 }
@@ -817,6 +821,25 @@ export interface RecallResult {
   answerCandidates?: AnswerCandidate[];
   strategy?: "raw_first" | "summary_navigation";
   rawCandidateCount?: number;
+}
+
+export interface ProgressiveRetrievalStepRecord {
+  plannerRunId: string;
+  stepIndex: number;
+  layer: string;
+  action: string;
+  reason?: string;
+  stopIf?: string;
+  budgetTokens?: number;
+  query: string;
+  candidatesFound: number;
+  selectedCount: number;
+  rejectedCount: number;
+  rejectedReasons: string[];
+  sourceVerifiedCount: number;
+  latencyMs: number;
+  stopTriggered: boolean;
+  stopReason?: string;
 }
 
 export interface DagTraversalStep {
@@ -891,6 +914,43 @@ export interface RetrievalDecision {
   matchedProjectId?: string;
   matchedProjectTitle?: string;
   layerScores?: RetrievalLayerScore[];
+  planner?: {
+    runId: string;
+    activationMode: string;
+    llmInvoked: boolean;
+    selectedPlan: "planner" | "deterministic";
+    intent: {
+      primary: string;
+      confidence: number;
+      ambiguity: string[];
+    };
+    validation: {
+      accepted: boolean;
+      repaired: boolean;
+      fallbackRoute?: string;
+      violations: Array<{
+        code: string;
+        severity: string;
+        message: string;
+        repair?: string;
+      }>;
+    };
+    routeSteps: Array<{
+      layer: string;
+      action: string;
+      reason: string;
+      stopIf?: string;
+      budgetTokens?: number;
+    }>;
+    stopCondition: string;
+    sourceTraceRequired: boolean;
+    fallback?: {
+      reason: string;
+      from: string;
+    };
+    deterministicRoute: RetrievalRoute;
+    deterministicRoutePlan: RetrievalRoute[];
+  };
 }
 
 export interface RetrievalLayerScore {
