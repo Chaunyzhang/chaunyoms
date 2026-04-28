@@ -137,6 +137,7 @@ async function main(): Promise<void> {
 
   const stores = await runtime.getSessionStores({ sessionId: config.sessionId, config });
   const summaries = stores.summaryStore.getAllSummaries({ sessionId: config.sessionId });
+  const runtimeStatus = (await runtime.getRuntimeStore({ sessionId: config.sessionId, config })).getStatus();
   const branchCount = summaries.filter((entry) => entry.nodeKind === "branch").length;
   const leafCount = summaries.filter((entry) => entry.nodeKind !== "branch").length;
   const recallText = String(retrievalResult.content[0]?.text ?? "");
@@ -151,7 +152,7 @@ async function main(): Promise<void> {
     branchCount,
     leafCount,
     rawMessageCount: stores.rawStore.getAll({ sessionId: config.sessionId }).length,
-    durableMemoryCount: stores.durableMemoryStore.count(),
+    memoryItemCount: runtimeStatus.counts.memoryItems,
     recallHitCount: Number(retrievalResult.details.hitCount ?? 0),
     compactionTriggered: summaries.length > 0,
     retrievalHitType: retrievalResult.details.retrievalHitType,

@@ -7,8 +7,8 @@ const STRUCTURE_DOC = `# ChaunyOMS Shared Data Structure
 
 This directory stores runtime-managed shared data for ChaunyOMS.
 
-- knowledge-base/: unified knowledge corpus, including raw user files and AI-promoted knowledge
-- shared-cognition/: shared cognition injected at runtime
+- knowledge-base/: human-readable export corpus; it is mirrored into SQLite for runtime lookup and is not scanned on the hot path
+- global-principles/: shared principles that may be injected at runtime; do not put project knowledge or private preferences here
 - plugin-cache/: runtime cache for plugin-local generated support files
 `;
 
@@ -20,13 +20,13 @@ export class SharedDataBootstrap {
 
     await Promise.all([
       this.ensureDir(path.join(sharedDataDir, "knowledge-base")),
-      this.ensureDir(path.join(sharedDataDir, "shared-cognition")),
+      this.ensureDir(path.join(sharedDataDir, "global-principles")),
       this.ensureDir(path.join(sharedDataDir, "plugin-cache")),
     ]);
 
     await Promise.all([
       this.ensureFile(path.join(sharedDataDir, "STRUCTURE.md"), STRUCTURE_DOC),
-      this.ensureFile(path.join(sharedDataDir, "shared-cognition", "COGNITION.md"), "# Shared Cognition\n\n"),
+      this.ensureFile(path.join(sharedDataDir, "global-principles", "PRINCIPLES.md"), "# Global Principles\n\n"),
       this.ensureFile(path.join(sharedDataDir, "knowledge-base", "topic-index.json"), "{\n  \"topics\": []\n}\n"),
     ]);
   }

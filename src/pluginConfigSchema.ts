@@ -83,9 +83,9 @@ export const pluginConfigSchema = {
       type: "boolean",
       description: "Enable runtime message capture from host payloads.",
     },
-    durableMemoryEnabled: {
+    memoryItemEnabled: {
       type: "boolean",
-      description: "Enable durable memory extraction and persistence.",
+      description: "Enable MemoryItem extraction and persistence.",
     },
     autoRecallEnabled: {
       type: "boolean",
@@ -93,15 +93,15 @@ export const pluginConfigSchema = {
     },
     agentVaultMirrorEnabled: {
       type: "boolean",
-      description: "Enable legacy AgentVault human-readable Markdown mirrors. Disabled by default; SQLite and KnowledgeMarkdownStore remain the runtime source paths.",
+      description: "Enable optional AgentVault human-readable Markdown mirrors. Disabled by default; SQLite and KnowledgeMarkdownStore remain the runtime source paths.",
     },
     summaryMarkdownMirrorEnabled: {
       type: "boolean",
       description: "Write per-summary AgentVault Markdown files when agentVaultMirrorEnabled is also true. Disabled by default.",
     },
-    durableMarkdownMirrorEnabled: {
+    memoryItemMarkdownMirrorEnabled: {
       type: "boolean",
-      description: "Write durable-memory AgentVault Markdown mirror files when agentVaultMirrorEnabled is also true. Disabled by default.",
+      description: "Write MemoryItem AgentVault Markdown mirror files when agentVaultMirrorEnabled is also true. Disabled by default.",
     },
     transcriptMirrorEnabled: {
       type: "boolean",
@@ -111,14 +111,32 @@ export const pluginConfigSchema = {
       type: "boolean",
       description: "Keep the curated KnowledgeMarkdownStore enabled as the default human-readable knowledge layer. Enabled by default.",
     },
-    sqlitePrimaryEnabled: {
-      type: "boolean",
-      description: "Use SQLite-backed repositories as the primary runtime ledger. Enabled by default for the production shape.",
-    },
-    jsonPersistenceMode: {
+    retrievalStrength: {
       type: "string",
-      enum: ["primary", "backup", "off"],
-      description: "Controls legacy JSON/JSONL store writes. primary keeps old hot-path JSON stores, backup is explicit snapshot/export only, off disables JSON as a runtime store.",
+      enum: ["off", "light", "auto", "strict", "forensic"],
+      description: "Single retrieval policy knob. Controls recall depth, source-trace requirements, and evidence presentation.",
+    },
+    kbCandidateEnabled: {
+      type: "boolean",
+      description: "Allow ChaunyOMS to create governed knowledge-base candidates. Candidate creation is separate from Markdown writes.",
+    },
+    kbWriteEnabled: {
+      type: "boolean",
+      description: "Allow ChaunyOMS to write eligible knowledge to the human-readable flat vault. Disabled by default.",
+    },
+    kbPromotionMode: {
+      type: "string",
+      enum: ["manual", "assisted", "conservative_auto", "balanced_auto", "aggressive_auto"],
+      description: "Knowledge-vault promotion mode. manual/assisted are recommended defaults.",
+    },
+    kbPromotionStrictness: {
+      type: "string",
+      enum: ["low", "medium", "high"],
+      description: "Screening strictness for knowledge-vault promotion candidates.",
+    },
+    kbExportEnabled: {
+      type: "boolean",
+      description: "Enable explicit flat-vault Markdown export. Markdown remains a human-facing output, not an AI runtime fact source.",
     },
     knowledgePromotionEnabled: {
       type: "boolean",
@@ -163,7 +181,7 @@ export const pluginConfigSchema = {
     },
     emergencyBrake: {
       type: "boolean",
-      description: "Emergency stop: disables runtime capture, durable writes, auto recall, and knowledge promotion.",
+      description: "Emergency stop: disables runtime capture, MemoryItem writes, auto recall, and knowledge promotion.",
     },
     sqliteJournalMode: {
       type: "string",

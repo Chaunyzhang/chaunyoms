@@ -22,8 +22,8 @@ import {
   ContextItem,
   DagIntegrityReport,
   ContextViewRepository,
-  DurableMemoryRepository,
-  DurableMemoryEntry,
+  MemoryItemDraftRepository,
+  MemoryItemDraftEntry,
   EvidenceAtomEntry,
   FixedPrefixProvider,
   HostFixedContextProvider,
@@ -120,8 +120,8 @@ export interface OmsRuntimeStatus {
     summaries: number;
     summaryTokens: number;
     observations: number;
-    durableMemories: number;
-    activeDurableMemories: number;
+    memoryItemDrafts: number;
+    activeMemoryItemDrafts: number;
     evidenceAtoms: number;
     knowledgeRawItems: number;
     pendingKnowledgeRawItems: number;
@@ -137,16 +137,20 @@ export interface OmsRuntimeStatus {
     | "strictCompaction"
     | "compactionBarrierEnabled"
     | "runtimeCaptureEnabled"
-    | "durableMemoryEnabled"
+    | "memoryItemEnabled"
     | "autoRecallEnabled"
     | "knowledgePromotionEnabled"
     | "knowledgePromotionManualReviewEnabled"
+    | "retrievalStrength"
+    | "kbCandidateEnabled"
+    | "kbWriteEnabled"
+    | "kbPromotionMode"
+    | "kbPromotionStrictness"
+    | "kbExportEnabled"
     | "semanticCandidateExpansionEnabled"
     | "semanticCandidateLimit"
     | "emergencyBrake"
     | "sqliteJournalMode"
-    | "sqlitePrimaryEnabled"
-    | "jsonPersistenceMode"
   >;
   runtimeStore: ReturnType<SQLiteRuntimeStore["getStatus"]>;
   lastCompactionDiagnostics: CompactionDiagnostics | null;
@@ -363,7 +367,7 @@ export class ChaunyomsSessionRuntime {
       knowledgeIntentClassifier: this.knowledgeIntentClassifier,
       ensureSession: this.ensureSession.bind(this),
       appendRawMessages: this.sessionData.appendRawMessages.bind(this.sessionData),
-      persistDurableMemories: this.persistDurableMemories.bind(this),
+      persistMemoryItemDrafts: this.persistMemoryItemDrafts.bind(this),
     });
     this.compactionCoordinator = new CompactionCoordinator({
       logger: this.logger,
@@ -372,7 +376,7 @@ export class ChaunyomsSessionRuntime {
       hostFixedContextProvider: this.hostFixedContextProvider,
       compactionEngine: this.compactionEngine,
       getConfig: () => this.config,
-      getDurableMemoryStore: () => this.getActiveStores().durableMemoryStore,
+      getMemoryItemDraftStore: () => this.getActiveStores().memoryItemDraftStore,
       setNavigationSnapshotPending: () => {
         this.navigationSnapshotPending = true;
       },
@@ -415,36 +419,66 @@ export class ChaunyomsSessionRuntime {
   }
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
-    if (payload.role === "tool") {
+    const { rawStore, memoryItemDraftStore } = await this.ensureSession(payload.sessionId, payload.config);
+    const ingressDecision = this.runtimeIngress.inspect({
+      id: payload.id,
+      sourceKey: payload.id,
+      role: payload.role,
+      content: payload.content,
+      text: payload.content,
+      metadata: payload.metadata,
+    });
+    if (ingressDecision.storageTarget === "observation") {
+      await this.sessionData.appendObservation({
+        id: `observation-${payload.id}`,
+        sessionId: payload.sessionId,
+        agentId: payload.config.agentId,
+        role: payload.role,
+        classification: ingressDecision.classification,
+        content: ingressDecision.normalizedText,
+        sourceKey: payload.id,
+        createdAt: new Date().toISOString(),
+        tokenCount: estimateTokens(ingressDecision.normalizedText),
+        metadata: {
+          ...(payload.metadata ?? {}),
+          reason: ingressDecision.reason,
+          sourceBoundary: "runtime_event_not_source",
+        },
+      });
       return { ingested: false };
     }
 
-    const { rawStore, durableMemoryStore } = await this.ensureSession(payload.sessionId, payload.config);
+    if (!ingressDecision.persist || ingressDecision.storageTarget !== "raw_message") {
+      return { ingested: false };
+    }
+
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
     const knowledgeIntent = payload.role === "user"
-      ? await this.knowledgeIntentClassifier.classifyUserMessage(payload.content, payload.config)
+      ? await this.knowledgeIntentClassifier.classifyUserMessage(ingressDecision.normalizedText, payload.config)
       : null;
     const message: RawMessage = {
       id: payload.id,
       sessionId: payload.sessionId,
       agentId: payload.config.agentId,
       role: payload.role,
-      content: payload.content,
+      content: ingressDecision.normalizedText,
       turnNumber,
       createdAt: new Date().toISOString(),
-      tokenCount: estimateTokens(payload.content),
+      tokenCount: estimateTokens(ingressDecision.normalizedText),
       compacted: false,
       metadata: {
         ...(payload.metadata ?? {}),
+        ingressClassification: ingressDecision.classification,
+        ingressReason: ingressDecision.reason,
         ...(knowledgeIntent ? { knowledgeIntent } : {}),
       },
     };
     await this.sessionData.appendRawMessage(message);
-    await this.persistDurableMemories(
-      durableMemoryStore,
+    await this.persistMemoryItemDrafts(
+      memoryItemDraftStore,
       this.extractionEngine.extractFromRawMessage(message),
     );
-    await this.sessionData.writeDurableMemoryArtifacts();
+    await this.sessionData.writeMemoryItemArtifacts();
     return { ingested: true };
   }
 
@@ -476,7 +510,7 @@ export class ChaunyomsSessionRuntime {
     const assembleOptions = {
       includeStablePrefix: !this.config.emergencyBrake,
       includeSummaries: !this.config.emergencyBrake,
-      includeDurableMemory: !this.config.emergencyBrake,
+      includeMemoryItems: !this.config.emergencyBrake,
       activeQuery,
       sessionId: context.sessionId,
     };
@@ -527,7 +561,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async compact(context: LifecycleContext): Promise<CompactResult> {
-    const { rawStore, summaryStore, durableMemoryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, memoryItemDraftStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -613,11 +647,11 @@ export class ChaunyomsSessionRuntime {
       context,
       rawStore,
       summaryStore,
-      durableMemoryStore,
+      memoryItemDraftStore,
       true,
     );
     await this.backgroundOrganizerEngine.run(
-      durableMemoryStore,
+      memoryItemDraftStore,
       summaryStore,
       this.getActiveStores().projectStore,
       this.config.agentId,
@@ -665,7 +699,7 @@ export class ChaunyomsSessionRuntime {
   }
 
   async afterTurn(context: LifecycleContext): Promise<AfterTurnResult> {
-    const { rawStore, summaryStore, observationStore, durableMemoryStore } = await this.ensureSession(
+    const { rawStore, summaryStore, observationStore, memoryItemDraftStore } = await this.ensureSession(
       context.sessionId,
       context.config,
     );
@@ -688,14 +722,14 @@ export class ChaunyomsSessionRuntime {
       summaryCount: summaryStore.getAllSummaries().length,
       summaryTokens: summaryStore.getTotalTokens(),
       observationCount: observationStore.count(),
-      durableMemoryCount: durableMemoryStore.count(),
+      memoryItemCount: this.sessionData.getRuntimeStore().getStatus().counts.memoryItems,
       unifiedKnowledgeDir: this.config.knowledgePromotionEnabled ? knowledgeStore.getBaseDir() : null,
       contextItems: this.contextViewStore.getItems().length,
       importedMessages: synced.importedMessages,
       strictCompaction: this.config.strictCompaction,
       compactionBarrierEnabled: this.config.compactionBarrierEnabled,
       runtimeCaptureEnabled: this.config.runtimeCaptureEnabled,
-      durableMemoryEnabled: this.config.durableMemoryEnabled,
+      memoryItemEnabled: this.config.memoryItemEnabled,
       autoRecallEnabled: this.config.autoRecallEnabled,
       knowledgePromotionEnabled: this.config.knowledgePromotionEnabled,
       configPreset: this.config.configPreset,
@@ -711,12 +745,12 @@ export class ChaunyomsSessionRuntime {
       context,
       rawStore,
       summaryStore,
-      durableMemoryStore,
+      memoryItemDraftStore,
       false,
     );
-    await this.updateProjectRegistry(context, rawStore, summaryStore, durableMemoryStore);
+    await this.updateProjectRegistry(context, rawStore, summaryStore);
     await this.backgroundOrganizerEngine.run(
-      durableMemoryStore,
+      memoryItemDraftStore,
       summaryStore,
       this.getActiveStores().projectStore,
       this.config.agentId,
@@ -777,6 +811,28 @@ export class ChaunyomsSessionRuntime {
 
   async backup(context: Pick<LifecycleContext, "sessionId" | "config">, label = ""): Promise<OmsBackupResult> {
     return await this.omsAdmin.backup(context, label);
+  }
+
+  async exportAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { agentId?: string; label?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.exportAgentCapsule(context, options);
+  }
+
+  async verifyAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    capsulePath: string,
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.verifyAgentCapsule(context, capsulePath);
+  }
+
+  async importAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    capsulePath: string,
+    apply = false,
+  ): Promise<Record<string, unknown>> {
+    return await this.omsAdmin.importAgentCapsule(context, capsulePath, apply);
   }
 
   async restore(
@@ -994,14 +1050,14 @@ export class ChaunyomsSessionRuntime {
     return await this.runtimeIngressService.syncRuntimeMessages(sessionId, config, runtimeMessages);
   }
 
-  private async persistDurableMemories(
-    durableMemoryStore: DurableMemoryRepository,
-    entries: DurableMemoryEntry[],
+  private async persistMemoryItemDrafts(
+    memoryItemDraftStore: MemoryItemDraftRepository,
+    entries: MemoryItemDraftEntry[],
   ): Promise<void> {
-    if (!this.config.durableMemoryEnabled || this.config.emergencyBrake || entries.length === 0) {
+    if (!this.config.memoryItemEnabled || this.config.emergencyBrake || entries.length === 0) {
       return;
     }
-    await this.sessionData.addDurableEntries(entries);
+    await this.sessionData.addMemoryItemDraftEntries(entries);
   }
 
   private resolveNextTurnNumber(
@@ -1077,7 +1133,7 @@ export class ChaunyomsSessionRuntime {
     context: LifecycleContext,
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
-    durableMemoryStore: DurableMemoryRepository,
+    memoryItemDraftStore: MemoryItemDraftRepository,
     compactionTriggeredThisStep: boolean,
   ): Promise<void> {
     if (this.config.emergencyBrake) {
@@ -1099,14 +1155,14 @@ export class ChaunyomsSessionRuntime {
         filePath: navigationWrite.filePath,
       });
     }
-    if (this.config.durableMemoryEnabled) {
+    if (this.config.memoryItemEnabled) {
       const projectStateMemory = this.extractionEngine.buildProjectStateMemory(
         context.sessionId,
         new Date().toISOString(),
         navigationSnapshot,
       );
-      await this.persistDurableMemories(durableMemoryStore, [projectStateMemory]);
-      await this.sessionData.writeDurableMemoryArtifacts();
+      await this.persistMemoryItemDrafts(memoryItemDraftStore, [projectStateMemory]);
+      await this.sessionData.writeMemoryItemArtifacts();
     }
     await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
     this.navigationSnapshotPending = false;
@@ -1159,7 +1215,6 @@ export class ChaunyomsSessionRuntime {
     context: LifecycleContext,
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
-    durableMemoryStore: DurableMemoryRepository,
   ): Promise<void> {
     const snapshot = buildProjectStateSnapshot(rawStore, summaryStore);
     let identity = deriveProjectIdentityFromSnapshot(
@@ -1182,15 +1237,14 @@ export class ChaunyomsSessionRuntime {
       projectSummaries = activeSummaries.filter((entry) => entry.projectId === identity.projectId);
     }
 
-    let projectMemories = durableMemoryStore
-      .getAll()
-      .filter((entry) => entry.recordStatus === "active" && entry.projectId === identity.projectId)
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    const memoryItems = this.sessionData.getRuntimeStore().listMemoryItems({ agentId: this.config.agentId });
+    let projectMemories = memoryItems
+      .filter((entry) => entry.status === "active" && entry.projectId === identity.projectId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
     if (projectMemories.length === 0) {
-      projectMemories = durableMemoryStore
-        .getAll()
-        .filter((entry) => entry.recordStatus === "active")
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+      projectMemories = memoryItems
+        .filter((entry) => entry.status === "active")
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
     }
 
     await this.sessionData.upsertProjectRecord({

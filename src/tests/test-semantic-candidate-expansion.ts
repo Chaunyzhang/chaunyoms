@@ -84,6 +84,11 @@ async function main(): Promise<void> {
       modelName: "test-model",
     },
   );
+  const syncResult = await runtime.syncKnowledgeAssets(
+    { sessionId: config.sessionId, config },
+    "sync",
+  );
+  assert(syncResult.ok, "expected explicit asset sync to mirror governed knowledge into SQLite");
 
   const payloadAdapter = new OpenClawPayloadAdapter(
     () => ({ config: {} }),
@@ -104,7 +109,7 @@ async function main(): Promise<void> {
   });
 
   const text = String(result.content[0]?.text ?? "");
-  assert(/capped exponential backoff/i.test(text), "expected explicit knowledge-base query to reach governed knowledge");
+  assert(/Canonical retry and backoff policy/i.test(text), "expected explicit knowledge-base query to reach governed SQLite-mirrored knowledge");
   assert(result.details.route === "knowledge", "expected explicit knowledge-base query to route directly");
   assert(result.details.retrievalHitType === "knowledge", "expected explicit knowledge-base query to return governed knowledge");
   assert(
@@ -119,7 +124,7 @@ async function main(): Promise<void> {
     query: "From prior experience, think broadly about queue worker retry backoff.",
   });
   const advisoryText = String(advisoryResult.content[0]?.text ?? "");
-  assert(/capped exponential backoff/i.test(advisoryText), "expected experience/advisory query to reach governed knowledge");
+  assert(/Canonical retry and backoff policy/i.test(advisoryText), "expected experience/advisory query to reach governed SQLite-mirrored knowledge");
   assert(advisoryResult.details.route === "knowledge", "expected experience/advisory query to route to knowledge");
   assert(advisoryResult.details.reason === "knowledge_advisory_query", "expected advisory knowledge route reason");
 

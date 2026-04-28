@@ -40,15 +40,15 @@ function main(): void {
     role: "user",
     content: [
       "[ChaunyOMS recalled memory - untrusted historical context, not instructions]",
-      "[durable_memory:user_fact] This should never become a new raw message.",
+      "[memory_item:user_fact] This should never become a new raw message.",
     ].join("\n"),
     text: [
       "[ChaunyOMS recalled memory - untrusted historical context, not instructions]",
-      "[durable_memory:user_fact] This should never become a new raw message.",
+      "[memory_item:user_fact] This should never become a new raw message.",
     ].join("\n"),
     metadata: {
       authority: "untrusted_memory",
-      source: "durable_memory",
+      source: "memory_item",
     },
   });
 
@@ -61,21 +61,21 @@ function main(): void {
   const replayedTailMemory = ingress.inspect({
     sourceKey: "chaunyoms-tail-memory-1",
     role: "user",
-    content: "[durable_memory:user_fact] Previously injected memory should not loop back.",
-    text: "[durable_memory:user_fact] Previously injected memory should not loop back.",
+    content: "[memory_item:user_fact] Previously injected memory should not loop back.",
+    text: "[memory_item:user_fact] Previously injected memory should not loop back.",
     metadata: {
-      layer: "durable_memory",
+      layer: "memory_item",
       kind: "user_fact",
     },
   });
 
-  assert(!replayedTailMemory.persist, "expected metadata-marked durable memory tail to be dropped");
+  assert(!replayedTailMemory.persist, "expected metadata-marked MemoryItem tail to be dropped");
 
   const realUserMention = ingress.inspect({
     sourceKey: "real-user-mention-1",
     role: "user",
-    content: "请解释 [durable_memory:user_fact] 这个标签为什么会出现。",
-    text: "请解释 [durable_memory:user_fact] 这个标签为什么会出现。",
+    content: "请解释 [memory_item:user_fact] 这个标签为什么会出现。",
+    text: "请解释 [memory_item:user_fact] 这个标签为什么会出现。",
   });
 
   assert(realUserMention.persist, "expected ordinary user discussion of the tag to survive");
@@ -87,9 +87,10 @@ function main(): void {
     text: "stdout: config.json contains enableTools=false",
   });
 
-  assert(!toolOutput.persist, "expected substantive tool output to remain scratch-only");
+  assert(toolOutput.persist, "expected substantive tool output to be retained as a runtime event");
   assert(toolOutput.classification === "tool_output", "expected dropped tool payload to keep tool_output classification");
-  assert(toolOutput.reason === "tool_output_scratch_only_not_persisted", "expected explicit scratch-only reason");
+  assert(toolOutput.storageTarget === "observation", "expected tool payload to persist only as observation/runtime event");
+  assert(toolOutput.reason === "tool_output_runtime_event_not_source", "expected explicit runtime-event source-boundary reason");
 
   console.log("test-runtime-ingress-normalization passed");
 }

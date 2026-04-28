@@ -1,6 +1,6 @@
 ﻿import { createHash } from "node:crypto";
 
-import { ObservationEntry, DurableMemoryEntry, RawMessage } from "../types";
+import { ObservationEntry, MemoryItemDraftEntry, RawMessage } from "../types";
 import {
   buildStableEventId,
   deriveProjectIdentityFromMessages,
@@ -37,7 +37,7 @@ const FACT_UPDATE_RE = /\b(?:current|latest|now|updated|correction|corrected|ove
 const FACT_UPDATE_ZH_RE = /(?:当前|现在|最新|更新为|修正|改为|新值)/;
 
 export class MemoryExtractionEngine {
-  extractFromRawMessage(message: RawMessage): DurableMemoryEntry[] {
+  extractFromRawMessage(message: RawMessage): MemoryItemDraftEntry[] {
     if (!message.content.trim()) {
       return [];
     }
@@ -74,7 +74,7 @@ export class MemoryExtractionEngine {
     return [];
   }
 
-  extractFromObservation(observation: ObservationEntry): DurableMemoryEntry[] {
+  extractFromObservation(observation: ObservationEntry): MemoryItemDraftEntry[] {
     if (observation.classification !== "tool_output") {
       return [];
     }
@@ -106,7 +106,7 @@ export class MemoryExtractionEngine {
     sessionId: string,
     createdAt: string,
     snapshot: string,
-  ): DurableMemoryEntry {
+  ): MemoryItemDraftEntry {
     const identity = deriveProjectIdentityFromText([snapshot], sessionId);
     return {
       id: `memory-${this.hash(`${sessionId}|snapshot|${snapshot}`)}`,
@@ -129,14 +129,14 @@ export class MemoryExtractionEngine {
 
   private extract(
     sourceMessage: RawMessage,
-    kind: DurableMemoryEntry["kind"],
+    kind: MemoryItemDraftEntry["kind"],
     content: string,
     createdAt: string,
-    sourceType: DurableMemoryEntry["sourceType"],
+    sourceType: MemoryItemDraftEntry["sourceType"],
     sourceIds: string[],
     baseTags: string[],
     patterns: RegExp[],
-  ): DurableMemoryEntry[] {
+  ): MemoryItemDraftEntry[] {
     const segments = this.toSegments(content)
       .filter((segment) => segment.length >= 12)
       .filter((segment) => !this.isLowSignal(segment))
@@ -178,7 +178,7 @@ export class MemoryExtractionEngine {
     });
   }
 
-  private classifyToolObservation(content: string): DurableMemoryEntry["kind"] {
+  private classifyToolObservation(content: string): MemoryItemDraftEntry["kind"] {
     if (/\b(?:error|exception|failed|failure|warning|stderr|traceback)\b/i.test(content)) {
       return "diagnostic";
     }

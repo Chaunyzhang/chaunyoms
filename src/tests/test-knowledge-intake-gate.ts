@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   const gate = new KnowledgeIntakeGate();
 
   const accepted = gate.decide(buildSummary(), DEFAULT_BRIDGE_CONFIG);
-  assert(accepted.accepted === true, "expected durable promoted leaf summary to enter knowledge raw");
+  assert(accepted.accepted === true, "expected memoryItem promoted leaf summary to enter knowledge raw");
 
   const navigationOnly = gate.decide(buildSummary({
     promotionIntent: "navigation_only",

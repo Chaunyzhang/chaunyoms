@@ -25,10 +25,6 @@ export interface RouteHit {
 
 export class StablePrefixStore {
   private static readonly NAVIGATION_RETENTION_ROUNDS = 30;
-  private static readonly KNOWLEDGE_REFERENCE_RE =
-    /(knowledge[- ]?base|docs?|documentation|reference|manual|guide|playbook|spec|specification|api|readme|markdown|\.md\b|adr|rfc|architecture|design docs?|\u77e5\u8bc6\u5e93|\u6587\u6863|\u8d44\u6599|\u8bf4\u660e|\u624b\u518c|\u6559\u7a0b|\u89c4\u8303|\u63a5\u53e3\u6587\u6863|\u67b6\u6784|\u8bbe\u8ba1\u6587\u6863)/i;
-  private static readonly REFERENCE_LOOKUP_RE =
-    /(look up|lookup|search|find|read|check|consult|open|review|refer|\u67e5|\u641c|\u627e|\u770b|\u8bfb|\u7ffb|\u53c2\u8003|\u6839\u636e)/i;
 
   async getKnowledgeBaseHit(
     sharedDataDir: string,
@@ -172,71 +168,32 @@ export class StablePrefixStore {
     };
 
     pushIfFits(
-      "shared_cognition",
-      await this.readSharedCognition(sharedDataDir),
+      "global_principles",
+      await this.readGlobalPrinciples(sharedDataDir),
       {
-        layer: "shared_cognition",
+        layer: "global_principles",
       },
     );
     pushIfFits("navigation", await this.readNavigation(workspaceDir), {
       layer: "navigation",
     });
-    if (await this.shouldIncludeKnowledgeBaseIndex(sharedDataDir, options.activeQuery)) {
-      pushIfFits(
-        "knowledge_base_index",
-        await this.readKnowledgeBaseIndex(sharedDataDir),
-        {
-          layer: "knowledge_base_index",
-        },
-      );
-    }
 
     return items;
   }
 
-  private async readSharedCognition(sharedDataDir: string): Promise<string> {
+  private async readGlobalPrinciples(sharedDataDir: string): Promise<string> {
+    const primary = await this.readUtf8OrEmpty(
+      path.join(sharedDataDir, "global-principles", "PRINCIPLES.md"),
+    );
+    if (primary) {
+      return primary;
+    }
+    // One-release compatibility: existing installs may still have the older
+    // shared-cognition file. Treat it as principles-only and stop writing new
+    // runtime state to that directory.
     return await this.readUtf8OrEmpty(
       path.join(sharedDataDir, "shared-cognition", "COGNITION.md"),
     );
-  }
-
-  private async readKnowledgeBaseIndex(sharedDataDir: string): Promise<string> {
-    const raw = await this.readUtf8OrEmpty(
-      path.join(sharedDataDir, "knowledge-base", "topic-index.json"),
-    );
-    if (!raw) return "";
-    const parsed = JSON.parse(raw) as KnowledgeTopicIndex;
-    const topics = parsed.topics ?? [];
-    return topics
-      .map((topic) => {
-        const id = topic.topicId ?? "unknown-topic";
-        const latestVersion = topic.latestVersion ?? "?";
-        const latestFile = topic.latestFile ?? "unknown-file";
-        return `- ${id}: v${latestVersion} -> ${latestFile}`;
-      })
-      .join("\n");
-  }
-
-  private async shouldIncludeKnowledgeBaseIndex(
-    sharedDataDir: string,
-    activeQuery?: string,
-  ): Promise<boolean> {
-    const normalized = activeQuery?.trim();
-    if (!normalized) {
-      return false;
-    }
-
-    // The knowledge-base index is only useful when the current ask is clearly
-    // doc-seeking; otherwise it is just prompt pressure.
-    if (StablePrefixStore.KNOWLEDGE_REFERENCE_RE.test(normalized)) {
-      return true;
-    }
-
-    if (!StablePrefixStore.REFERENCE_LOOKUP_RE.test(normalized)) {
-      return false;
-    }
-
-    return await this.hasKnowledgeBaseTopicHit(sharedDataDir, normalized);
   }
 
   private async readNavigation(workspaceDir: string): Promise<string> {

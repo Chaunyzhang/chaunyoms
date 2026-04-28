@@ -245,6 +245,13 @@ export async function replayMessages(
       turnNumber > 0 &&
       turnNumber % afterTurnEvery === 0
     ) {
+      await runtime.compact({
+        sessionId: config.sessionId,
+        config,
+        totalBudget: config.contextWindow,
+        systemPromptTokens: 0,
+        runtimeMessages: [],
+      });
       await runtime.afterTurn({
         sessionId: config.sessionId,
         config,
@@ -260,6 +267,13 @@ export async function finalizeReplay(
   runtime: ChaunyomsSessionRuntime,
   config: BridgeConfig,
 ): Promise<void> {
+  await runtime.compact({
+    sessionId: config.sessionId,
+    config,
+    totalBudget: config.contextWindow,
+    systemPromptTokens: 0,
+    runtimeMessages: [],
+  });
   await runtime.afterTurn({
     sessionId: config.sessionId,
     config,

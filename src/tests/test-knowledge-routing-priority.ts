@@ -106,6 +106,11 @@ async function main(): Promise<void> {
     ].join("\n"),
     "utf8",
   );
+  const syncResult = await runtime.syncKnowledgeAssets(
+    { sessionId: config.sessionId, config },
+    "sync",
+  );
+  assert(syncResult.ok, "expected explicit asset sync to mirror Markdown export metadata into SQLite");
 
   const payloadAdapter = new OpenClawPayloadAdapter(
     () => ({ config: {} }),
@@ -132,8 +137,8 @@ async function main(): Promise<void> {
     query: "Check the knowledge base for the queue retry policy",
   });
   const knowledgeText = String(knowledgeRetrieve.content[0]?.text ?? "");
-  assert(/Unified knowledge says/i.test(knowledgeText), "expected retrieval to return unified knowledge content");
-  assert(/Manual raw knowledge says queue retries must stop/i.test(knowledgeText), "expected retrieval to also return user-provided raw knowledge content");
+  assert(/Canonical retry policy for queue workers/i.test(knowledgeText), "expected retrieval to return unified SQLite-mirrored knowledge content");
+  assert(/Manual raw note for queue retry policy/i.test(knowledgeText), "expected retrieval to also return user-provided raw knowledge metadata mirrored into SQLite");
   assert(knowledgeRetrieve.details.topRecordType === "knowledge_record", "expected unified knowledge query to return undifferentiated knowledge records");
   assert(
     typeof knowledgeRetrieve.details.knowledgeHitCount === "number" &&
@@ -154,7 +159,7 @@ async function main(): Promise<void> {
     query: "Look in raw knowledge in the knowledge base for the queue retry policy",
   });
   const rawText = String(rawRetrieve.content[0]?.text ?? "");
-  assert(/Manual raw knowledge says queue retries must stop/i.test(rawText), "expected raw knowledge queries to surface manual raw content through the unified corpus");
+  assert(/Manual raw note for queue retry policy/i.test(rawText), "expected raw knowledge queries to surface manual raw metadata through the unified SQLite corpus");
   assert(!("sourceClassHitCount" in rawRetrieve.details), "expected retrieval metadata to avoid source-class split counts");
 
   await rm(dir, { recursive: true, force: true });

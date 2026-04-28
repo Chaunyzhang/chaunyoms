@@ -163,8 +163,13 @@ async function main(): Promise<void> {
     summaryMaxOutputTokens: 160,
     strictCompaction: true,
     compactionBarrierEnabled: true,
-    knowledgePromotionEnabled: true,
-    knowledgePromotionManualReviewEnabled: false,
+    knowledgePromotionEnabled: false,
+    knowledgePromotionManualReviewEnabled: true,
+    kbCandidateEnabled: true,
+    kbWriteEnabled: true,
+    kbPromotionMode: "balanced_auto" as const,
+    kbPromotionStrictness: "medium" as const,
+    kbExportEnabled: true,
     knowledgeIntakeUserOverrideEnabled: true,
   };
 

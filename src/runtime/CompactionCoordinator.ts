@@ -2,7 +2,7 @@ import { ContextAssembler } from "../engines/ContextAssembler";
 import { CompactionEngine } from "../engines/CompactionEngine";
 import {
   BridgeConfig,
-  DurableMemoryRepository,
+  MemoryItemDraftRepository,
   FixedPrefixProvider,
   HostFixedContextProvider,
   LoggerLike,
@@ -33,7 +33,7 @@ interface CompactionCoordinatorDependencies {
   hostFixedContextProvider: HostFixedContextProvider;
   compactionEngine: CompactionEngine;
   getConfig: () => BridgeConfig;
-  getDurableMemoryStore: () => DurableMemoryRepository;
+  getMemoryItemDraftStore: () => MemoryItemDraftRepository;
   setNavigationSnapshotPending: () => void;
   getDiagnostics: () => CompactionDiagnostics | null;
   setDiagnostics: (value: CompactionDiagnostics | null) => void;
@@ -199,7 +199,7 @@ export class CompactionCoordinator {
     activeQuery?: string,
   ): Promise<CompactionBudgetState> {
     const config = this.deps.getConfig();
-    const durableMemoryStore = this.deps.getDurableMemoryStore();
+    const memoryItemDraftStore = this.deps.getMemoryItemDraftStore();
     const budget = this.deps.assembler.allocateBudget(
       context.totalBudget,
       context.systemPromptTokens,
@@ -211,14 +211,14 @@ export class CompactionCoordinator {
       { activeQuery },
     );
     const recallGuidance = this.deps.assembler.buildRecallGuidance(summaryStore, context.sessionId);
-    const durableMemory = this.deps.assembler.assembleDurableMemory(
-      durableMemoryStore,
+    const memoryItemDraft = this.deps.assembler.assembleMemoryItems(
+      memoryItemDraftStore,
       budget.recallBudget,
     );
     const pluginFixedTokens = [
       ...stablePrefix,
       ...(recallGuidance ? [recallGuidance] : []),
-      ...durableMemory,
+      ...memoryItemDraft,
     ].reduce((sum, item) => sum + item.tokenCount, 0);
 
     const effectiveTailBudget = Math.min(

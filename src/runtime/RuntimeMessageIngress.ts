@@ -64,19 +64,21 @@ const CHAUNYOMS_CONTEXT_PREFIX_PATTERNS = [
   /^\[ChaunyOMS recalled memory\b[^\]]*\]/i,
   /^ChaunyOMS recalled memory\b/i,
   /^\[oms_recall_guidance\]/i,
+  /^\[global_principles\]/i,
   /^\[shared_cognition\]/i,
   /^\[navigation\]/i,
   /^\[knowledge_base_index\]/i,
 ];
 
-const CHAUNYOMS_MEMORY_PREFIX_PATTERN = /^\[durable_memory:[^\]]+\]/i;
+const CHAUNYOMS_MEMORY_PREFIX_PATTERN = /^\[memory_item:[^\]]+\]/i;
 
 const CHAUNYOMS_METADATA_MARKERS = new Set([
   "chaunyoms",
   "chaunyoms_summary",
   "untrusted_memory",
-  "durable_memory",
+  "memory_item",
   "oms_recall_guidance",
+  "global_principles",
   "shared_cognition",
   "navigation",
   "knowledge_base_index",
@@ -121,10 +123,11 @@ export class RuntimeMessageIngress {
       if (this.isLowValueToolReceipt(normalizedText)) {
         return this.skip("tool_receipt", normalizedText, "low_value_tool_receipt");
       }
-      return this.skip(
+      return this.keep(
         "tool_output",
         normalizedText,
-        "tool_output_scratch_only_not_persisted",
+        "tool_output_runtime_event_not_source",
+        "observation",
       );
     }
 

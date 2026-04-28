@@ -23,30 +23,24 @@ async function main(): Promise<void> {
   assert(safeContext.config.semanticCandidateExpansionEnabled === false, "expected safe preset to disable semantic candidate expansion");
   assert(safeContext.config.agentVaultMirrorEnabled === false, "expected AgentVault mirrors to be disabled by default");
   assert(safeContext.config.summaryMarkdownMirrorEnabled === false, "expected summary Markdown mirrors to be disabled by default");
-  assert(safeContext.config.durableMarkdownMirrorEnabled === false, "expected durable Markdown mirrors to be disabled by default");
+  assert(safeContext.config.memoryItemMarkdownMirrorEnabled === false, "expected MemoryItem Markdown mirrors to be disabled by default");
   assert(safeContext.config.transcriptMirrorEnabled === false, "expected transcript mirrors to be disabled by default");
   assert(safeContext.config.knowledgeMarkdownEnabled === true, "expected curated Knowledge Markdown to remain enabled by default");
-  assert(safeContext.config.sqlitePrimaryEnabled === true, "expected SQLite primary runtime storage by default");
-  assert(safeContext.config.jsonPersistenceMode === "off", "expected JSON hot-path persistence to be off by default");
 
   const mirrorContext = adapter.resolveLifecycleContext({
     config: {
       agentVaultMirrorEnabled: true,
       summaryMarkdownMirrorEnabled: true,
-      durableMarkdownMirrorEnabled: true,
+      memoryItemMarkdownMirrorEnabled: true,
       transcriptMirrorEnabled: true,
       knowledgeMarkdownEnabled: false,
-      sqlitePrimaryEnabled: false,
-      jsonPersistenceMode: "backup",
     },
   }, DEFAULT_BRIDGE_CONFIG);
   assert(mirrorContext.config.agentVaultMirrorEnabled === true, "expected explicit AgentVault mirror opt-in");
   assert(mirrorContext.config.summaryMarkdownMirrorEnabled === true, "expected explicit summary mirror opt-in");
-  assert(mirrorContext.config.durableMarkdownMirrorEnabled === true, "expected explicit durable mirror opt-in");
+  assert(mirrorContext.config.memoryItemMarkdownMirrorEnabled === true, "expected explicit MemoryItem mirror opt-in");
   assert(mirrorContext.config.transcriptMirrorEnabled === true, "expected explicit transcript mirror opt-in");
   assert(mirrorContext.config.knowledgeMarkdownEnabled === false, "expected explicit Knowledge Markdown opt-out to parse");
-  assert(mirrorContext.config.sqlitePrimaryEnabled === false, "expected explicit SQLite primary opt-out to parse");
-  assert(mirrorContext.config.jsonPersistenceMode === "backup", "expected explicit JSON backup mode to parse");
 
   const enhancedContext = adapter.resolveLifecycleContext({
     config: {

@@ -5,8 +5,8 @@ import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
 import { IngestPayload, LifecycleContext, RuntimeMessageSnapshot } from "../host/OpenClawPayloadAdapter";
 import {
   ContextItem,
-  DurableMemoryEntry,
-  DurableMemoryRepository,
+  MemoryItemDraftEntry,
+  MemoryItemDraftRepository,
   RawMessage,
   RawMessageRepository,
 } from "../types";
@@ -20,9 +20,9 @@ interface RuntimeIngressDependencies {
   knowledgeIntentClassifier: KnowledgeIntentClassifier;
   ensureSession: (sessionId: string, config: IngestPayload["config"]) => Promise<SessionDataStores>;
   appendRawMessages: (messages: RawMessage[]) => Promise<void>;
-  persistDurableMemories: (
-    durableMemoryStore: DurableMemoryRepository,
-    entries: DurableMemoryEntry[],
+  persistMemoryItemDrafts: (
+    memoryItemDraftStore: MemoryItemDraftRepository,
+    entries: MemoryItemDraftEntry[],
   ) => Promise<void>;
 }
 
@@ -38,7 +38,7 @@ export class RuntimeIngressService {
       return { importedMessages: 0 };
     }
 
-    const { rawStore, durableMemoryStore } = await this.deps.ensureSession(sessionId, config);
+    const { rawStore, memoryItemDraftStore } = await this.deps.ensureSession(sessionId, config);
     const inspectedMessages = runtimeMessages.map((message) => ({
       message,
       decision: this.deps.runtimeIngress.inspect(message),
@@ -81,7 +81,7 @@ export class RuntimeIngressService {
     let importedMessages = 0;
     let currentTurn = existingMessages[existingMessages.length - 1]?.turnNumber ?? 0;
     const rawMessagesToImport: RawMessage[] = [];
-    const durableMemoryEntriesToImport: DurableMemoryEntry[] = [];
+    const memoryItemDraftsToImport: MemoryItemDraftEntry[] = [];
 
     for (let index = 0; index < pendingRawMessages.length; index += 1) {
       const message = pendingRawMessages[index];
@@ -108,13 +108,13 @@ export class RuntimeIngressService {
         },
       };
       rawMessagesToImport.push(rawMessage);
-      durableMemoryEntriesToImport.push(...this.deps.extractionEngine.extractFromRawMessage(rawMessage));
+      memoryItemDraftsToImport.push(...this.deps.extractionEngine.extractFromRawMessage(rawMessage));
       existingSourceKeys.add(message.sourceKey);
       importedMessages += 1;
     }
 
     await this.deps.appendRawMessages(rawMessagesToImport);
-    await this.deps.persistDurableMemories(durableMemoryStore, durableMemoryEntriesToImport);
+    await this.deps.persistMemoryItemDrafts(memoryItemDraftStore, memoryItemDraftsToImport);
 
     return { importedMessages };
   }

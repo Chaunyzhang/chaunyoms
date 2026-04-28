@@ -99,7 +99,7 @@ export interface ObservationRepository {
   count(): number;
 }
 
-export interface DurableMemoryEntry {
+export interface MemoryItemDraftEntry {
   id: string;
   eventId?: string;
   sessionId: string;
@@ -122,13 +122,13 @@ export interface DurableMemoryEntry {
   metadata?: Record<string, unknown>;
 }
 
-export interface DurableMemoryRepository {
+export interface MemoryItemDraftRepository {
   init(): Promise<void>;
-  addEntries(entries: DurableMemoryEntry[]): Promise<number>;
-  replaceAll(entries: DurableMemoryEntry[]): Promise<void>;
+  addEntries(entries: MemoryItemDraftEntry[]): Promise<number>;
+  replaceAll(entries: MemoryItemDraftEntry[]): Promise<void>;
   removeSession?(sessionId: string): Promise<number>;
-  search(query: string, limit?: number): DurableMemoryEntry[];
-  getAll(): DurableMemoryEntry[];
+  search(query: string, limit?: number): MemoryItemDraftEntry[];
+  getAll(): MemoryItemDraftEntry[];
   count(): number;
 }
 
@@ -307,7 +307,14 @@ export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "i
 export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
-export type JsonPersistenceMode = "primary" | "backup" | "off";
+export type RetrievalStrength = "off" | "light" | "auto" | "strict" | "forensic";
+export type KbPromotionMode =
+  | "manual"
+  | "assisted"
+  | "conservative_auto"
+  | "balanced_auto"
+  | "aggressive_auto";
+export type KbPromotionStrictness = "low" | "medium" | "high";
 
 export interface KnowledgePromotionDraft {
   shouldWrite: boolean;
@@ -478,6 +485,74 @@ export interface KnowledgeRawEntry {
   lastProcessedAt?: string;
 }
 
+export type MemoryItemKind =
+  | "preference"
+  | "principle"
+  | "decision"
+  | "constraint"
+  | "lesson"
+  | "project_state"
+  | "correction"
+  | "procedure"
+  | "claim"
+  | "diagnosis"
+  | "kb_candidate"
+  | "general";
+
+export type MemoryItemScope = "agent" | "session" | "project" | "global_principle" | "global";
+export type MemoryItemStatus = "candidate" | "active" | "superseded" | "rejected" | "archived" | "expired";
+export type MemoryItemEvidenceLevel = "none" | "low" | "medium" | "high" | "inferred";
+export type MemoryItemContextPolicy =
+  | "never"
+  | "on_demand"
+  | "default"
+  | "always_core"
+  | "project_active"
+  | "strict_only";
+export type MemoryItemStability = "low" | "medium" | "high";
+export type MemoryItemPromotionState =
+  | "none"
+  | "candidate"
+  | "drafted"
+  | "approved"
+  | "exported"
+  | "rejected";
+
+export interface MemoryItemEntry {
+  id: string;
+  sourceTable: "memory_item_drafts" | "summary_evidence_drafts" | "knowledge_raw" | "inferred";
+  sourceId: string;
+  sessionId: string;
+  agentId?: string;
+  projectId?: string;
+  topicId?: string;
+  kind: MemoryItemKind;
+  status: MemoryItemStatus;
+  scope: MemoryItemScope;
+  scopeId: string;
+  evidenceLevel: MemoryItemEvidenceLevel;
+  contextPolicy: MemoryItemContextPolicy;
+  text: string;
+  confidence: number;
+  stability: MemoryItemStability;
+  priority: number;
+  tags: string[];
+  sourceIds: string[];
+  sourceRefs?: SourceSpanRef[];
+  inferred: boolean;
+  supersedes: string[];
+  conflictsWith: string[];
+  supports: string[];
+  promotionState: MemoryItemPromotionState;
+  validFrom?: string;
+  validUntil?: string;
+  createdByAgentId?: string;
+  updatedByAgentId?: string;
+  createdAt: string;
+  updatedAt: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface KnowledgeRawRepository {
   init(): Promise<void>;
   enqueue(entry: KnowledgeRawEntry): Promise<boolean>;
@@ -589,7 +664,7 @@ export interface AnswerCandidate {
 
 export interface FallbackTrace {
   from: RetrievalRoute | "assemble" | "compaction" | "knowledge_promotion";
-  to: RetrievalRoute | "recent_tail" | "durable_memory" | "none";
+  to: RetrievalRoute | "recent_tail" | "memory_item" | "none";
   reason: string;
 }
 
@@ -696,18 +771,22 @@ export interface BridgeConfig {
   strictCompaction: boolean;
   compactionBarrierEnabled: boolean;
   runtimeCaptureEnabled: boolean;
-  durableMemoryEnabled: boolean;
+  memoryItemEnabled: boolean;
   autoRecallEnabled: boolean;
   agentVaultMirrorEnabled: boolean;
   summaryMarkdownMirrorEnabled: boolean;
-  durableMarkdownMirrorEnabled: boolean;
+  memoryItemMarkdownMirrorEnabled: boolean;
   transcriptMirrorEnabled: boolean;
   knowledgeMarkdownEnabled: boolean;
-  sqlitePrimaryEnabled: boolean;
-  jsonPersistenceMode: JsonPersistenceMode;
+  retrievalStrength: RetrievalStrength;
   knowledgePromotionEnabled: boolean;
   knowledgePromotionManualReviewEnabled: boolean;
   knowledgeIntakeMode: KnowledgeIntakeMode;
+  kbCandidateEnabled: boolean;
+  kbWriteEnabled: boolean;
+  kbPromotionMode: KbPromotionMode;
+  kbPromotionStrictness: KbPromotionStrictness;
+  kbExportEnabled: boolean;
   knowledgeIntakeAllowProjectState: boolean;
   knowledgeIntakeAllowBranchSummaries: boolean;
   knowledgeIntakeUserOverrideEnabled: boolean;
@@ -785,7 +864,7 @@ export interface ProjectStateSnapshot {
 export type RetrievalRoute =
   | "recent_tail"
   | "project_registry"
-  | "durable_memory"
+  | "memory_item"
   | "summary_tree"
   | "knowledge";
 
@@ -810,7 +889,7 @@ export interface RetrievalLayerScore {
 
 export type SemanticCandidateKind =
   | "project_registry"
-  | "durable_memory"
+  | "memory_item"
   | "summary"
   | "knowledge";
 

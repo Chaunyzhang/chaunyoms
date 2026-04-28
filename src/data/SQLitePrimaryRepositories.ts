@@ -1,6 +1,6 @@
 import {
-  DurableMemoryEntry,
-  DurableMemoryRepository,
+  MemoryItemDraftEntry,
+  MemoryItemDraftRepository,
   EvidenceAtomEntry,
   EvidenceAtomRepository,
   KnowledgeRawEntry,
@@ -412,8 +412,8 @@ export class SQLiteSummaryRepository implements SummaryRepository {
   }
 }
 
-export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
-  private memories: DurableMemoryEntry[] = [];
+export class SQLiteMemoryItemDraftRepository implements MemoryItemDraftRepository {
+  private memories: MemoryItemDraftEntry[] = [];
 
   constructor(private readonly runtimeStore: SQLiteRuntimeStore) {}
 
@@ -422,7 +422,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     this.memories = this.runtimeStore.listMemories().map((entry) => this.normalizeEntry(entry));
   }
 
-  async addEntries(entries: DurableMemoryEntry[]): Promise<number> {
+  async addEntries(entries: MemoryItemDraftEntry[]): Promise<number> {
     let added = 0;
     for (const rawEntry of entries) {
       const entry = this.normalizeEntry(rawEntry);
@@ -445,7 +445,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     return added;
   }
 
-  async replaceAll(entries: DurableMemoryEntry[]): Promise<void> {
+  async replaceAll(entries: MemoryItemDraftEntry[]): Promise<void> {
     this.memories = entries
       .map((entry) => this.normalizeEntry(entry))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
@@ -458,7 +458,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     return before - this.memories.length;
   }
 
-  search(query: string, limit = 5): DurableMemoryEntry[] {
+  search(query: string, limit = 5): MemoryItemDraftEntry[] {
     const terms = query.toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/i).map((term) => term.trim()).filter((term) => term.length >= 2);
     if (terms.length === 0) {
       return [];
@@ -472,7 +472,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
       .map((item) => item.entry);
   }
 
-  getAll(): DurableMemoryEntry[] {
+  getAll(): MemoryItemDraftEntry[] {
     return [...this.memories];
   }
 
@@ -488,7 +488,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     );
   }
 
-  private supersedeActiveFactEntry(entry: DurableMemoryEntry): void {
+  private supersedeActiveFactEntry(entry: MemoryItemDraftEntry): void {
     const factKey = this.factKey(entry);
     const factValue = this.factValue(entry);
     if (!factKey || !factValue) {
@@ -505,7 +505,7 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     });
   }
 
-  private scoreEntry(entry: DurableMemoryEntry, terms: string[]): number {
+  private scoreEntry(entry: MemoryItemDraftEntry, terms: string[]): number {
     const haystack = `${entry.kind} ${entry.projectId ?? ""} ${entry.topicId ?? ""} ${entry.tags.join(" ")} ${entry.text}`.toLowerCase();
     let score = 0;
     for (const term of terms) {
@@ -525,17 +525,17 @@ export class SQLiteDurableMemoryRepository implements DurableMemoryRepository {
     return score;
   }
 
-  private factKey(entry: DurableMemoryEntry): string | null {
+  private factKey(entry: MemoryItemDraftEntry): string | null {
     const value = entry.metadata?.factKey;
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
-  private factValue(entry: DurableMemoryEntry): string | null {
+  private factValue(entry: MemoryItemDraftEntry): string | null {
     const value = entry.metadata?.factValue;
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
-  private normalizeEntry(entry: DurableMemoryEntry): DurableMemoryEntry {
+  private normalizeEntry(entry: MemoryItemDraftEntry): MemoryItemDraftEntry {
     return {
       ...entry,
       eventId: entry.eventId ?? buildStableEventId("memory", `${entry.id}|${entry.createdAt}`),

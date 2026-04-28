@@ -104,7 +104,7 @@ async function main(): Promise<void> {
   assert(atlasProject, "expected project registry to contain Project Atlas");
   assert(beaconProject, "expected project registry to contain Project Beacon");
 
-  const atlasDecisionMemories = stores.durableMemoryStore
+  const atlasDecisionMemories = stores.memoryItemDraftStore
     .getAll()
     .filter((entry) => entry.projectId === atlasProject?.id && /redis queue/i.test(entry.text));
   assert(atlasDecisionMemories.length >= 2, "expected organizer test fixture to create duplicate-ish Atlas memories");
@@ -146,8 +146,8 @@ async function main(): Promise<void> {
     query: "What constraint did we set for Project Beacon?",
   });
   const beaconText = String(beaconRetrieve.content[0]?.text ?? "");
-  assert(beaconRetrieve.details.route === "durable_memory", "expected durable constraint queries to route to durable memory");
-  assert(/postgres connection pool/i.test(beaconText), "expected durable retrieval to return the Beacon constraint");
+  assert(beaconRetrieve.details.route === "memory_item", "expected MemoryItem constraint queries to route to MemoryItem");
+  assert(/postgres connection pool/i.test(beaconText), "expected MemoryItem retrieval to return the Beacon constraint");
 
   const atlasRetrieve = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
@@ -155,9 +155,9 @@ async function main(): Promise<void> {
     query: "What decision did we make for Project Atlas?",
   });
   const atlasText = String(atlasRetrieve.content[0]?.text ?? "");
-  assert(atlasRetrieve.details.route === "durable_memory", "expected durable decision queries to route to durable memory");
-  assert(/redis queue/i.test(atlasText), "expected project-scoped durable retrieval to prioritize Atlas decision");
-  assert(!/postgres connection pool/i.test(atlasText), "expected project-scoped durable retrieval to avoid Beacon bleed-through");
+  assert(atlasRetrieve.details.route === "memory_item", "expected MemoryItem decision queries to route to MemoryItem");
+  assert(/redis queue/i.test(atlasText), "expected project-scoped MemoryItem retrieval to prioritize Atlas decision");
+  assert(!/postgres connection pool/i.test(atlasText), "expected project-scoped MemoryItem retrieval to avoid Beacon bleed-through");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-project-routing-and-organization passed");

@@ -1,14 +1,20 @@
-﻿import { createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 
 import {
-  DurableMemoryEntry,
+  MemoryItemDraftEntry,
   EvidenceAtomEntry,
   KnowledgeDocumentIndexEntry,
+  KnowledgeRawEntry,
   LoggerLike,
+  MemoryItemEntry,
+  MemoryItemKind,
+  MemoryItemScope,
+  MemoryItemStability,
   RawMessage,
+  SourceSpanRef,
   SummaryEntry,
 } from "../types";
 import { ContextPlannerResult } from "../engines/ContextPlanner";
@@ -69,9 +75,12 @@ export interface RuntimeTableCounts {
   summaries: number;
   evidenceAtoms: number;
   memories: number;
+  memoryItems: number;
   runtimeRecords: number;
   assets: number;
   sourceEdges: number;
+  traceEdges: number;
+  runtimeAnnotations: number;
   contextRuns: number;
   retrievalCandidates: number;
 }
@@ -188,7 +197,7 @@ export interface OmsExpandResult {
 
 export interface RuntimeAssemblyReader {
   getSummaryCount(sessionId?: string): number;
-  getActiveMemories(limit?: number): DurableMemoryEntry[];
+  getActiveMemoryItems(limit?: number): MemoryItemEntry[];
   getSummaries(budget: number, sessionId?: string): SummaryEntry[];
   getRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[];
 }
@@ -226,7 +235,7 @@ export class SQLiteRuntimeStore {
   async mirror(args: {
     messages: RawMessage[];
     summaries: SummaryEntry[];
-    memories: DurableMemoryEntry[];
+    memories: MemoryItemDraftEntry[];
     atoms?: EvidenceAtomEntry[];
   }): Promise<void> {
     await this.init();
@@ -243,11 +252,12 @@ export class SQLiteRuntimeStore {
       for (const summary of args.summaries) {
         this.upsertSummary(summary);
       }
+      this.deleteMemoryItemsFromSourceTables(["memory_item_drafts", "summary_evidence_drafts"]);
       for (const memory of args.memories) {
-        this.upsertMemory(memory);
+        this.upsertMemoryItem(this.memoryItemFromDraft(memory));
       }
       for (const atom of args.atoms ?? []) {
-        this.upsertEvidenceAtom(atom);
+        this.upsertMemoryItem(this.memoryItemFromEvidenceAtom(atom));
       }
       await this.mirrorAssetsFromMarkdownIndex();
       this.rebuildSourceEdges(args.summaries, args.memories, args.atoms ?? []);
@@ -345,7 +355,7 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  async recordMemories(memories: DurableMemoryEntry[]): Promise<boolean> {
+  async recordMemories(memories: MemoryItemDraftEntry[]): Promise<boolean> {
     if (memories.length === 0) {
       return true;
     }
@@ -358,8 +368,9 @@ export class SQLiteRuntimeStore {
       this.db?.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
       for (const memory of memories) {
-        this.upsertMemory(memory);
-        this.upsertMemorySourceEdges(memory);
+        const memoryItem = this.memoryItemFromDraft(memory);
+        this.upsertMemoryItem(memoryItem);
+        this.upsertMemoryItemSourceEdges(memoryItem);
       }
       this.db?.exec("COMMIT");
       transactionStarted = false;
@@ -386,7 +397,7 @@ export class SQLiteRuntimeStore {
     try {
       return reader({
         getSummaryCount: (sessionId) => this.readAssemblySummaryCount(sessionId),
-        getActiveMemories: (limit) => this.readAssemblyActiveMemories(limit),
+        getActiveMemoryItems: (limit) => this.readAssemblyActiveMemoryItems(limit),
         getSummaries: (budget, sessionId) => this.readAssemblySummaries(budget, sessionId),
         getRecentTailByTokens: (tokenBudget, maxTurns, sessionId) =>
           this.readAssemblyRecentTailByTokens(tokenBudget, maxTurns, sessionId),
@@ -400,8 +411,8 @@ export class SQLiteRuntimeStore {
     return this.withAssemblyRead((runtime) => runtime.getSummaryCount(sessionId)) ?? 0;
   }
 
-  getAssemblyActiveMemories(limit = 8): DurableMemoryEntry[] {
-    return this.withAssemblyRead((runtime) => runtime.getActiveMemories(limit)) ?? [];
+  getAssemblyActiveMemoryItems(limit = 8): MemoryItemEntry[] {
+    return this.withAssemblyRead((runtime) => runtime.getActiveMemoryItems(limit)) ?? [];
   }
 
   getAssemblySummaries(budget: number, sessionId?: string): SummaryEntry[] {
@@ -423,17 +434,18 @@ export class SQLiteRuntimeStore {
     `).get(sessionId ?? null, sessionId ?? null)?.count ?? 0);
   }
 
-  private readAssemblyActiveMemories(limit = 8): DurableMemoryEntry[] {
+  private readAssemblyActiveMemoryItems(limit = 8): MemoryItemEntry[] {
     if (!this.db) {
       return [];
     }
     return this.db.prepare(`
-      SELECT payload_json FROM memories
-      WHERE record_status = 'active'
-      ORDER BY created_at DESC
+      SELECT payload_json FROM memory_items
+      WHERE status = 'active'
+        AND context_policy != 'never'
+      ORDER BY priority ASC, updated_at DESC, created_at DESC
       LIMIT ?
     `).all(Math.max(Math.min(limit, 50), 1))
-      .map((row) => this.parseObject(row.payload_json) as unknown as DurableMemoryEntry);
+      .map((row) => this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry));
   }
 
   private readAssemblySummaries(budget: number, sessionId?: string): SummaryEntry[] {
@@ -719,13 +731,14 @@ export class SQLiteRuntimeStore {
     }
     try {
       const normalizedKind = this.normalizeKind(kind, id);
-      const target = this.lookupTarget(normalizedKind, id);
-      const edges = this.traceEdgesRecursive(normalizedKind, id, 5);
+      const normalizedId = this.normalizeTargetId(normalizedKind, id);
+      const target = this.lookupTarget(normalizedKind, normalizedId);
+      const edges = this.traceEdgesRecursive(normalizedKind, normalizedId, 5);
       const messageIds = new Set<string>();
       const summaryIds = new Set<string>();
 
       if (normalizedKind === "message") {
-        messageIds.add(id);
+        messageIds.add(normalizedId);
       }
       for (const edge of edges) {
         if (edge.targetKind === "message") {
@@ -753,7 +766,7 @@ export class SQLiteRuntimeStore {
     }
     try {
       const normalizedKind = this.normalizeKind(kind, id);
-      return this.traceEdgesRecursive(normalizedKind, id, 5);
+      return this.traceEdgesRecursive(normalizedKind, this.normalizeTargetId(normalizedKind, id), 5);
     } finally {
       this.closeDatabase();
     }
@@ -785,7 +798,7 @@ export class SQLiteRuntimeStore {
         seenEdges.add(edgeKey);
         edges.push(edge);
         const nodeKey = `${edge.targetKind}:${edge.targetId}`;
-        if (!seenNodes.has(nodeKey) && (edge.targetKind === "summary" || edge.targetKind === "memory" || edge.targetKind === "asset")) {
+        if (!seenNodes.has(nodeKey) && (edge.targetKind === "summary" || edge.targetKind === "memory_item" || edge.targetKind === "asset")) {
           seenNodes.add(nodeKey);
           queue.push({ kind: edge.targetKind, id: edge.targetId, depth: next.depth + 1 });
         }
@@ -892,14 +905,6 @@ export class SQLiteRuntimeStore {
           AND NOT EXISTS (
             SELECT 1 FROM summaries s
             WHERE edge.target_kind = 'summary' AND s.id = edge.target_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM evidence_atoms atom
-            WHERE edge.target_kind = 'evidence_atom' AND atom.id = edge.target_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM memories mem
-            WHERE edge.target_kind = 'memory' AND mem.id = edge.target_id
           )
           AND NOT EXISTS (
             SELECT 1 FROM assets a
@@ -1114,6 +1119,7 @@ export class SQLiteRuntimeStore {
       transactionStarted = true;
       if (mode === "reindex") {
         this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'asset'").run();
+        this.db?.prepare("DELETE FROM trace_edges WHERE source_kind = 'asset'").run();
         this.db?.prepare("DELETE FROM assets").run();
       }
       for (const document of documents) {
@@ -1130,6 +1136,7 @@ export class SQLiteRuntimeStore {
           const docId = String(row.doc_id ?? "");
           if (!documentIds.has(docId)) {
             this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'asset' AND source_id = ?").run(docId);
+            this.db?.prepare("DELETE FROM trace_edges WHERE source_kind = 'asset' AND source_id = ?").run(docId);
             this.db?.prepare("DELETE FROM assets WHERE doc_id = ?").run(docId);
             pruned += 1;
           }
@@ -1156,6 +1163,43 @@ export class SQLiteRuntimeStore {
         }
       }
       throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  searchKnowledgeAssets(query: string, limit = 6): KnowledgeDocumentIndexEntry[] {
+    const terms = this.queryTerms(query);
+    if (terms.length === 0 || !this.openDatabase()) {
+      return [];
+    }
+    try {
+      const rows = this.db?.prepare(`
+        SELECT payload_json, title, summary, tags_json
+        FROM assets
+        WHERE status = 'active'
+        ORDER BY updated_at DESC
+      `).all() ?? [];
+      return rows
+        .map((row) => {
+          const asset = this.parseObject(row.payload_json) as unknown as KnowledgeDocumentIndexEntry;
+          const tags = this.parseStringArray(row.tags_json);
+          const searchable = [
+            String(row.title ?? ""),
+            String(row.summary ?? ""),
+            tags.join(" "),
+            asset.canonicalKey,
+            asset.slug,
+          ].join(" ");
+          return {
+            asset,
+            score: this.scoreText(searchable, terms),
+          };
+        })
+        .filter((item) => item.score > 0)
+        .sort((left, right) => right.score - left.score || left.asset.title.localeCompare(right.asset.title))
+        .slice(0, Math.max(Math.min(limit, 50), 1))
+        .map((item) => item.asset);
     } finally {
       this.closeDatabase();
     }
@@ -1282,8 +1326,29 @@ export class SQLiteRuntimeStore {
         `DELETE FROM source_edges WHERE ${args.whereColumn} = ?`,
         args.target,
       );
-      deleted.evidence_atoms = this.deleteBySql(
-        `DELETE FROM evidence_atoms WHERE ${args.whereColumn} = ?`,
+      deleted.trace_edges = this.deleteBySql(
+        `DELETE FROM trace_edges WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.runtime_annotations = this.deleteBySql(
+        `
+          DELETE FROM runtime_annotations
+          WHERE (target_kind = 'memory_item' AND target_id IN (
+            SELECT id FROM memory_items WHERE ${args.whereColumn} = ?
+          ))
+          OR (target_kind = 'summary' AND target_id IN (
+            SELECT id FROM summaries WHERE ${args.whereColumn} = ?
+          ))
+          OR (target_kind = 'message' AND target_id IN (
+            SELECT id FROM messages WHERE ${args.whereColumn} = ?
+          ))
+          OR (target_kind = 'runtime_record' AND target_id IN (
+            SELECT id FROM runtime_records WHERE ${args.whereColumn} = ?
+          ))
+        `,
+        args.target,
+        args.target,
+        args.target,
         args.target,
       );
       deleted.messages = this.deleteBySql(
@@ -1294,8 +1359,8 @@ export class SQLiteRuntimeStore {
         `DELETE FROM summaries WHERE ${args.whereColumn} = ?`,
         args.target,
       );
-      deleted.memories = this.deleteBySql(
-        `DELETE FROM memories WHERE ${args.whereColumn} = ?`,
+      deleted.memory_items = this.deleteBySql(
+        `DELETE FROM memory_items WHERE ${args.whereColumn} = ?`,
         args.target,
       );
       deleted.runtime_records = this.deleteBySql(
@@ -1317,8 +1382,8 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  private deleteBySql(sql: string, param: SQLiteValue): number {
-    this.prepare(sql)?.run(param);
+  private deleteBySql(sql: string, ...params: SQLiteValue[]): number {
+    this.prepare(sql)?.run(...params);
     return this.getSingleNumber("SELECT changes() AS count");
   }
 
@@ -1416,44 +1481,48 @@ export class SQLiteRuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_summaries_session_turn ON summaries(session_id, start_turn, end_turn);
       CREATE INDEX IF NOT EXISTS idx_summaries_project ON summaries(project_id, record_status);
 
-      CREATE TABLE IF NOT EXISTS memories (
+      CREATE TABLE IF NOT EXISTS memory_items (
         id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        source_table TEXT NOT NULL,
+        source_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         agent_id TEXT,
         project_id TEXT,
         topic_id TEXT,
         kind TEXT NOT NULL,
-        record_status TEXT,
+        status TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        evidence_level TEXT NOT NULL,
+        context_policy TEXT NOT NULL,
         text TEXT NOT NULL,
+        content TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        stability TEXT NOT NULL DEFAULT 'medium',
+        priority INTEGER NOT NULL DEFAULT 50,
         tags_json TEXT NOT NULL DEFAULT '[]',
         source_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_refs_json TEXT NOT NULL DEFAULT '[]',
+        inferred INTEGER NOT NULL DEFAULT 0,
+        supersedes_json TEXT NOT NULL DEFAULT '[]',
+        conflicts_with_json TEXT NOT NULL DEFAULT '[]',
+        supports_json TEXT NOT NULL DEFAULT '[]',
+        promotion_state TEXT NOT NULL DEFAULT 'none',
+        valid_from TEXT,
+        valid_until TEXT,
+        valid_to TEXT,
+        created_by_agent_id TEXT,
+        updated_by_agent_id TEXT,
         created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
         payload_json TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_memories_project_status ON memories(project_id, record_status);
-
-      CREATE TABLE IF NOT EXISTS evidence_atoms (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        agent_id TEXT,
-        project_id TEXT,
-        topic_id TEXT,
-        record_status TEXT,
-        type TEXT NOT NULL,
-        text TEXT NOT NULL,
-        retrieval_text TEXT NOT NULL,
-        tags_json TEXT NOT NULL DEFAULT '[]',
-        source_summary_id TEXT NOT NULL,
-        source_message_ids_json TEXT NOT NULL DEFAULT '[]',
-        start_turn INTEGER NOT NULL,
-        end_turn INTEGER NOT NULL,
-        confidence REAL NOT NULL,
-        importance REAL NOT NULL,
-        created_at TEXT NOT NULL,
-        payload_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_atoms_session_type ON evidence_atoms(session_id, type, record_status);
-      CREATE INDEX IF NOT EXISTS idx_atoms_project_status ON evidence_atoms(project_id, record_status);
+      CREATE INDEX IF NOT EXISTS idx_memory_items_agent_status ON memory_items(agent_id, status);
+      CREATE INDEX IF NOT EXISTS idx_memory_items_source ON memory_items(source_table, source_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_items_project_status ON memory_items(project_id, status);
 
       CREATE TABLE IF NOT EXISTS assets (
         doc_id TEXT PRIMARY KEY,
@@ -1487,6 +1556,35 @@ export class SQLiteRuntimeStore {
       );
       CREATE INDEX IF NOT EXISTS idx_source_edges_source ON source_edges(source_kind, source_id);
       CREATE INDEX IF NOT EXISTS idx_source_edges_target ON source_edges(target_kind, target_id);
+
+      CREATE TABLE IF NOT EXISTS trace_edges (
+        id TEXT PRIMARY KEY,
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        project_id TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_trace_edges_source ON trace_edges(source_kind, source_id);
+      CREATE INDEX IF NOT EXISTS idx_trace_edges_target ON trace_edges(target_kind, target_id);
+
+      CREATE TABLE IF NOT EXISTS runtime_annotations (
+        id TEXT PRIMARY KEY,
+        annotation_kind TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_hash TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        provider TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_annotations_target ON runtime_annotations(target_kind, target_id, annotation_kind);
 
       CREATE TABLE IF NOT EXISTS context_runs (
         id TEXT PRIMARY KEY,
@@ -1535,6 +1633,80 @@ export class SQLiteRuntimeStore {
     // FTS is deliberately lazy. Exact/LIKE search remains canonical today, so
     // boot and normal mirroring should not pay virtual-table setup or refresh
     // costs until a future semantic/FTS path explicitly enables it.
+    this.ensureMemoryItemSchema();
+    this.dropLegacyMemoryTables();
+  }
+
+  private dropLegacyMemoryTables(): void {
+    if (!this.db) {
+      return;
+    }
+    this.db.exec(`
+      DELETE FROM source_edges
+      WHERE source_kind IN ('memory', 'evidence_atom')
+         OR target_kind IN ('memory', 'evidence_atom');
+      DELETE FROM trace_edges
+      WHERE source_kind IN ('memory', 'evidence_atom')
+         OR target_kind IN ('memory', 'evidence_atom');
+      DROP TABLE IF EXISTS memories;
+      DROP TABLE IF EXISTS evidence_atoms;
+      DROP TABLE IF EXISTS memories_fts;
+    `);
+  }
+
+  private ensureMemoryItemSchema(): void {
+    if (!this.db) {
+      return;
+    }
+    const rows = this.db.prepare("PRAGMA table_info(memory_items)").all();
+    const columns = new Set(rows.map((row) => String(row.name)));
+    const addColumn = (name: string, ddl: string): void => {
+      if (columns.has(name)) {
+        return;
+      }
+      this.db?.exec(`ALTER TABLE memory_items ADD COLUMN ${name} ${ddl};`);
+      columns.add(name);
+    };
+
+    // The final architecture document names MemoryItem as the canonical layer.
+    // The document-facing fields below are first-class columns; operational
+    // row ids and payload snapshots exist only to keep writes atomic and
+    // traceable inside SQLite.
+    addColumn("memory_id", "TEXT");
+    addColumn("scope_type", "TEXT");
+    addColumn("scope_id", "TEXT");
+    addColumn("content", "TEXT");
+    addColumn("confidence", "REAL NOT NULL DEFAULT 0.5");
+    addColumn("stability", "TEXT NOT NULL DEFAULT 'medium'");
+    addColumn("priority", "INTEGER NOT NULL DEFAULT 50");
+    addColumn("valid_to", "TEXT");
+    addColumn("created_by_agent_id", "TEXT");
+    addColumn("updated_by_agent_id", "TEXT");
+    addColumn("metadata_json", "TEXT NOT NULL DEFAULT '{}'");
+
+    this.db.exec(`
+      UPDATE memory_items
+      SET
+        memory_id = COALESCE(NULLIF(memory_id, ''), id),
+        scope_type = COALESCE(NULLIF(scope_type, ''), scope),
+        scope_id = COALESCE(NULLIF(scope_id, ''), project_id, agent_id, session_id, 'global'),
+        content = COALESCE(NULLIF(content, ''), text),
+        valid_to = COALESCE(valid_to, valid_until),
+        created_by_agent_id = COALESCE(created_by_agent_id, agent_id),
+        updated_by_agent_id = COALESCE(updated_by_agent_id, agent_id),
+        metadata_json = COALESCE(NULLIF(metadata_json, ''), '{}')
+      WHERE memory_id IS NULL
+        OR scope_type IS NULL
+        OR scope_id IS NULL
+        OR content IS NULL
+        OR valid_to IS NULL
+        OR created_by_agent_id IS NULL
+        OR updated_by_agent_id IS NULL
+        OR metadata_json IS NULL
+        OR metadata_json = '';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_memory_id ON memory_items(memory_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_items_scope ON memory_items(scope_type, scope_id, status);
+    `);
   }
 
   private createFtsTable(tableName: string, columns: string): void {
@@ -1586,7 +1758,6 @@ export class SQLiteRuntimeStore {
       return;
     }
     this.createFtsTable("messages_fts", "id UNINDEXED, content");
-    this.createFtsTable("memories_fts", "id UNINDEXED, text");
     this.createFtsTable("assets_fts", "doc_id UNINDEXED, title, summary");
     this.ftsReady = true;
   }
@@ -1697,87 +1868,291 @@ export class SQLiteRuntimeStore {
     );
   }
 
-  private upsertMemory(memory: DurableMemoryEntry): void {
+  private upsertMemoryItem(item: MemoryItemEntry): void {
+    const metadata = item.metadata ?? {};
     this.prepare(`
-      INSERT INTO memories (
-        id, session_id, agent_id, project_id, topic_id, kind, record_status,
-        text, tags_json, source_ids_json, created_at, payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory_items (
+        id, memory_id, source_table, source_id, session_id, agent_id, project_id,
+        topic_id, kind, status, scope, scope_type, scope_id, evidence_level,
+        context_policy, text, content, confidence, stability, priority,
+        tags_json, source_ids_json, source_refs_json, inferred, supersedes_json,
+        conflicts_with_json, supports_json, promotion_state, valid_from,
+        valid_until, valid_to, created_by_agent_id, updated_by_agent_id,
+        created_at, updated_at, metadata_json, payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
+        memory_id=excluded.memory_id,
         session_id=excluded.session_id,
         agent_id=excluded.agent_id,
         project_id=excluded.project_id,
         topic_id=excluded.topic_id,
         kind=excluded.kind,
-        record_status=excluded.record_status,
+        status=excluded.status,
+        scope=excluded.scope,
+        scope_type=excluded.scope_type,
+        scope_id=excluded.scope_id,
+        evidence_level=excluded.evidence_level,
+        context_policy=excluded.context_policy,
         text=excluded.text,
+        content=excluded.content,
+        confidence=excluded.confidence,
+        stability=excluded.stability,
+        priority=excluded.priority,
         tags_json=excluded.tags_json,
         source_ids_json=excluded.source_ids_json,
-        created_at=excluded.created_at,
+        source_refs_json=excluded.source_refs_json,
+        inferred=excluded.inferred,
+        supersedes_json=excluded.supersedes_json,
+        conflicts_with_json=excluded.conflicts_with_json,
+        supports_json=excluded.supports_json,
+        promotion_state=excluded.promotion_state,
+        valid_from=excluded.valid_from,
+        valid_until=excluded.valid_until,
+        valid_to=excluded.valid_to,
+        created_by_agent_id=excluded.created_by_agent_id,
+        updated_by_agent_id=excluded.updated_by_agent_id,
+        updated_at=excluded.updated_at,
+        metadata_json=excluded.metadata_json,
         payload_json=excluded.payload_json
     `)?.run(
-      memory.id,
-      memory.sessionId,
-      memory.agentId ?? null,
-      memory.projectId ?? null,
-      memory.topicId ?? null,
-      memory.kind,
-      memory.recordStatus ?? "active",
-      memory.text,
-      this.stringify(memory.tags ?? []),
-      this.stringify(memory.sourceIds ?? []),
-      memory.createdAt,
-      this.stringify(memory),
+      item.id,
+      item.id,
+      item.sourceTable,
+      item.sourceId,
+      item.sessionId,
+      item.agentId ?? null,
+      item.projectId ?? null,
+      item.topicId ?? null,
+      item.kind,
+      item.status,
+      item.scope,
+      item.scope,
+      item.scopeId,
+      item.evidenceLevel,
+      item.contextPolicy,
+      item.text,
+      item.text,
+      item.confidence,
+      item.stability,
+      item.priority,
+      this.stringify(item.tags ?? []),
+      this.stringify(item.sourceIds ?? []),
+      this.stringify(item.sourceRefs ?? []),
+      item.inferred ? 1 : 0,
+      this.stringify(item.supersedes ?? []),
+      this.stringify(item.conflictsWith ?? []),
+      this.stringify(item.supports ?? []),
+      item.promotionState,
+      item.validFrom ?? null,
+      item.validUntil ?? null,
+      item.validUntil ?? null,
+      item.createdByAgentId ?? item.agentId ?? null,
+      item.updatedByAgentId ?? item.agentId ?? null,
+      item.createdAt,
+      item.updatedAt,
+      this.stringify(metadata),
+      this.stringify(item),
     );
-    this.refreshFts("memories_fts", "id", memory.id, [memory.text, memory.tags.join(" ")]);
   }
 
-  private upsertEvidenceAtom(atom: EvidenceAtomEntry): void {
-    this.prepare(`
-      INSERT INTO evidence_atoms (
-        id, session_id, agent_id, project_id, topic_id, record_status,
-        type, text, retrieval_text, tags_json, source_summary_id,
-        source_message_ids_json, start_turn, end_turn, confidence, importance,
-        created_at, payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        session_id=excluded.session_id,
-        agent_id=excluded.agent_id,
-        project_id=excluded.project_id,
-        topic_id=excluded.topic_id,
-        record_status=excluded.record_status,
-        type=excluded.type,
-        text=excluded.text,
-        retrieval_text=excluded.retrieval_text,
-        tags_json=excluded.tags_json,
-        source_summary_id=excluded.source_summary_id,
-        source_message_ids_json=excluded.source_message_ids_json,
-        start_turn=excluded.start_turn,
-        end_turn=excluded.end_turn,
-        confidence=excluded.confidence,
-        importance=excluded.importance,
-        created_at=excluded.created_at,
-        payload_json=excluded.payload_json
-    `)?.run(
-      atom.id,
-      atom.sessionId,
-      atom.agentId ?? null,
-      atom.projectId ?? null,
-      atom.topicId ?? null,
-      atom.recordStatus ?? "active",
-      atom.type,
-      atom.text,
-      atom.retrievalText,
-      this.stringify(atom.tags ?? []),
+  private memoryItemFromDraft(memory: MemoryItemDraftEntry): MemoryItemEntry {
+    const kindByDraft: Record<MemoryItemDraftEntry["kind"], MemoryItemKind> = {
+      user_fact: "preference",
+      assistant_decision: "decision",
+      project_state: "project_state",
+      solution: "lesson",
+      diagnostic: "diagnosis",
+      constraint: "constraint",
+    };
+    const metadata = memory.metadata ?? {};
+    const sourceIds = this.uniqueStrings(memory.sourceIds ?? []);
+    const scope = this.memoryItemScope(memory);
+    const sourceRefs = this.sourceRefsFromMessageIds(memory.sourceType === "raw_message" ? sourceIds : []);
+    return {
+      id: `memory-item:${memory.id}`,
+      sourceTable: "memory_item_drafts",
+      sourceId: memory.id,
+      sessionId: memory.sessionId,
+      agentId: memory.agentId,
+      projectId: memory.projectId,
+      topicId: memory.topicId,
+      kind: kindByDraft[memory.kind] ?? "general",
+      status: memory.recordStatus ?? "active",
+      scope,
+      scopeId: this.memoryItemScopeId(scope, memory),
+      evidenceLevel: memory.sourceType === "raw_message" ? "high" : memory.sourceType === "snapshot" ? "medium" : "low",
+      contextPolicy: memory.projectId ? "project_active" : "default",
+      text: memory.text,
+      confidence: this.numberFromUnknown(metadata.confidence, memory.sourceType === "raw_message" ? 0.8 : 0.5),
+      stability: this.stabilityFromUnknown(metadata.stability),
+      priority: this.numberFromUnknown(metadata.priority, memory.projectId ? 20 : 30),
+      tags: memory.tags ?? [],
+      sourceIds,
+      sourceRefs,
+      inferred: false,
+      supersedes: this.stringArrayFromUnknown(metadata.supersedes),
+      conflictsWith: this.stringArrayFromUnknown(metadata.conflictsWith ?? metadata.conflicts_with),
+      supports: this.uniqueStrings([
+        ...sourceIds,
+        ...this.stringArrayFromUnknown(metadata.supports),
+      ]),
+      promotionState: "none",
+      validFrom: memory.sourceStartTimestamp,
+      validUntil: memory.sourceEndTimestamp,
+      createdByAgentId: memory.agentId,
+      updatedByAgentId: memory.agentId,
+      createdAt: memory.createdAt,
+      updatedAt: typeof metadata.updatedAt === "string" ? metadata.updatedAt : memory.createdAt,
+      metadata: {
+        ...metadata,
+        draftKind: memory.kind,
+        draftSourceType: memory.sourceType,
+        supersededById: memory.supersededById,
+        fingerprint: memory.fingerprint,
+        sourceSequenceMin: memory.sourceSequenceMin,
+        sourceSequenceMax: memory.sourceSequenceMax,
+      },
+    };
+  }
+
+  private memoryItemFromEvidenceAtom(atom: EvidenceAtomEntry): MemoryItemEntry {
+    const type = String(atom.type);
+    const kind: MemoryItemKind = type === "decision"
+      ? "decision"
+      : type === "constraint"
+        ? "constraint"
+        : type === "next_step"
+          ? "procedure"
+          : type === "blocker"
+            ? "diagnosis"
+            : "claim";
+    const scope = this.memoryItemScope(atom);
+    const sourceIds = this.uniqueStrings([
       atom.sourceSummaryId,
-      this.stringify(atom.sourceMessageIds ?? []),
-      atom.startTurn,
-      atom.endTurn,
-      atom.confidence,
-      atom.importance,
-      atom.createdAt,
-      this.stringify(atom),
-    );
+      ...(atom.sourceBinding?.messageIds ?? []),
+      ...(atom.sourceMessageIds ?? []),
+    ]);
+    return {
+      id: `memory-item:${atom.id}`,
+      sourceTable: "summary_evidence_drafts",
+      sourceId: atom.id,
+      sessionId: atom.sessionId,
+      agentId: atom.agentId,
+      projectId: atom.projectId,
+      topicId: atom.topicId,
+      kind,
+      status: atom.recordStatus ?? "active",
+      scope,
+      scopeId: this.memoryItemScopeId(scope, atom),
+      evidenceLevel: atom.sourceTraceComplete ? "high" : "medium",
+      contextPolicy: "strict_only",
+      text: atom.text,
+      confidence: atom.confidence,
+      stability: this.memoryItemStabilityFromScore(atom.stability),
+      priority: this.priorityFromEvidenceAtom(atom),
+      tags: atom.tags ?? [],
+      sourceIds,
+      sourceRefs: this.sourceRefsFromMessageIds([
+        ...(atom.sourceBinding?.messageIds ?? []),
+        ...(atom.sourceMessageIds ?? []),
+      ]),
+      inferred: !atom.sourceTraceComplete,
+      supersedes: [],
+      conflictsWith: atom.conflictGroupId ? [atom.conflictGroupId] : [],
+      supports: sourceIds,
+      promotionState: "none",
+      validFrom: atom.validFrom,
+      validUntil: atom.validUntil,
+      createdByAgentId: atom.agentId,
+      updatedByAgentId: atom.agentId,
+      createdAt: atom.createdAt,
+      updatedAt: atom.createdAt,
+      metadata: {
+        evidenceDraftType: atom.type,
+        confidence: atom.confidence,
+        importance: atom.importance,
+        stability: atom.stability,
+        atomStatus: atom.atomStatus,
+        sourceBinding: atom.sourceBinding,
+        sourceHash: atom.sourceHash,
+        sourceMessageCount: atom.sourceMessageCount,
+        ...(atom.metadata ?? {}),
+      },
+    };
+  }
+
+  private stringArrayFromUnknown(value: unknown): string[] {
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+  }
+
+  private uniqueStrings(values: string[]): string[] {
+    return values
+      .map((value) => value.trim())
+      .filter((value, index, items) => value.length > 0 && items.indexOf(value) === index);
+  }
+
+  private memoryItemScope(entry: { agentId?: string; projectId?: string }): MemoryItemScope {
+    if (entry.projectId) {
+      return "project";
+    }
+    if (entry.agentId) {
+      return "agent";
+    }
+    return "session";
+  }
+
+  private memoryItemScopeId(
+    scope: MemoryItemScope,
+    entry: { sessionId: string; agentId?: string; projectId?: string },
+  ): string {
+    if (scope === "project" && entry.projectId) {
+      return entry.projectId;
+    }
+    if (scope === "agent" && entry.agentId) {
+      return entry.agentId;
+    }
+    if ((scope === "global" || scope === "global_principle") && entry.projectId) {
+      return entry.projectId;
+    }
+    return entry.sessionId;
+  }
+
+  private numberFromUnknown(value: unknown, fallback: number): number {
+    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  private stabilityFromUnknown(value: unknown): MemoryItemStability {
+    if (value === "low" || value === "medium" || value === "high") {
+      return value;
+    }
+    return typeof value === "number" ? this.memoryItemStabilityFromScore(value) : "medium";
+  }
+
+  private memoryItemStabilityFromScore(value: number): MemoryItemStability {
+    if (value >= 0.75) {
+      return "high";
+    }
+    if (value <= 0.35) {
+      return "low";
+    }
+    return "medium";
+  }
+
+  private priorityFromEvidenceAtom(atom: EvidenceAtomEntry): number {
+    if (atom.type === "constraint" || atom.type === "decision") {
+      return 20;
+    }
+    if (atom.type === "exact_fact") {
+      return 30;
+    }
+    return Math.max(30, Math.min(80, Math.round(90 - atom.importance * 60)));
+  }
+
+  private sourceRefsFromMessageIds(messageIds: string[]): SourceSpanRef[] {
+    return this.uniqueStrings(messageIds).map((messageId) => ({ messageId }));
   }
 
   private async mirrorAssetsFromMarkdownIndex(): Promise<void> {
@@ -1803,6 +2178,89 @@ export class SQLiteRuntimeStore {
     } catch {
       // Markdown assets may not exist yet; runtime mirror remains usable for raw/summary/memory.
       return [];
+    }
+  }
+
+  private memoryItemFromKnowledgeRaw(entry: KnowledgeRawEntry): MemoryItemEntry {
+    const summary = entry.sourceSummary;
+    const promotionState = this.knowledgeRawPromotionState(entry.status);
+    const rejected = entry.status === "rejected" || entry.status === "failed" || entry.status === "skipped";
+    const settled = entry.status === "promoted" || entry.status === "duplicate";
+    const sourceIds = [
+      entry.sourceSummaryId,
+      ...(summary.sourceMessageIds ?? []),
+      ...(summary.sourceSummaryIds ?? []),
+    ].filter((id): id is string => typeof id === "string" && id.length > 0);
+    const scope = summary.projectId ? "project" : "agent";
+
+    return {
+      id: `memory-item:${entry.id}`,
+      sourceTable: "knowledge_raw",
+      sourceId: entry.id,
+      sessionId: entry.sessionId || summary.sessionId,
+      agentId: entry.agentId ?? summary.agentId,
+      projectId: summary.projectId,
+      topicId: summary.topicId,
+      kind: "kb_candidate",
+      status: rejected ? "rejected" : settled ? "active" : "candidate",
+      scope,
+      scopeId: this.memoryItemScopeId(scope, {
+        sessionId: entry.sessionId || summary.sessionId,
+        agentId: entry.agentId ?? summary.agentId,
+        projectId: summary.projectId,
+      }),
+      evidenceLevel: summary.sourceHash || entry.sourceBinding || summary.sourceBinding ? "high" : "inferred",
+      contextPolicy: "never",
+      text: entry.oneLineSummary?.trim() || summary.summary,
+      confidence: this.numberFromUnknown(entry.score?.total, summary.quality?.confidence ?? 0.5),
+      stability: "medium",
+      priority: 80,
+      tags: [
+        "kb_candidate",
+        entry.status,
+        ...(summary.keywords ?? []),
+      ].filter((tag, index, tags) => tag.length > 0 && tags.indexOf(tag) === index),
+      sourceIds: this.uniqueStrings(sourceIds),
+      sourceRefs: summary.sourceRefs ?? [],
+      inferred: !(summary.sourceHash || entry.sourceBinding || summary.sourceBinding),
+      supersedes: [],
+      conflictsWith: [],
+      supports: [entry.sourceSummaryId],
+      promotionState,
+      createdByAgentId: entry.agentId ?? summary.agentId,
+      updatedByAgentId: entry.agentId ?? summary.agentId,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      metadata: {
+        intakeReason: entry.intakeReason,
+        processReason: entry.processReason,
+        review: entry.review,
+        score: entry.score,
+        linkedDocId: entry.linkedDocId,
+        linkedSlug: entry.linkedSlug,
+        linkedVersion: entry.linkedVersion,
+        linkedFilePath: entry.linkedFilePath,
+        sourceHash: summary.sourceHash,
+        sourceMessageCount: summary.sourceMessageCount,
+        sourceBinding: entry.sourceBinding ?? summary.sourceBinding,
+      },
+    };
+  }
+
+  private knowledgeRawPromotionState(status: KnowledgeRawEntry["status"]): MemoryItemEntry["promotionState"] {
+    switch (status) {
+      case "review_pending":
+      case "processing":
+        return "drafted";
+      case "promoted":
+      case "duplicate":
+        return "exported";
+      case "rejected":
+      case "failed":
+      case "skipped":
+        return "rejected";
+      default:
+        return "candidate";
     }
   }
 
@@ -1848,23 +2306,24 @@ export class SQLiteRuntimeStore {
 
   private rebuildSourceEdges(
     summaries: SummaryEntry[],
-    memories: DurableMemoryEntry[],
+    memories: MemoryItemDraftEntry[],
     atoms: EvidenceAtomEntry[] = [],
   ): void {
     if (!this.db) {
       return;
     }
     this.db.prepare("DELETE FROM source_edges").run();
+    this.db.prepare("DELETE FROM trace_edges").run();
     for (const summary of summaries) {
       this.upsertSummarySourceEdges(summary, { deleteExisting: false });
     }
 
     for (const memory of memories) {
-      this.upsertMemorySourceEdges(memory, { deleteExisting: false });
+      this.upsertMemoryItemSourceEdges(this.memoryItemFromDraft(memory), { deleteExisting: false });
     }
 
     for (const atom of atoms) {
-      this.upsertEvidenceAtomSourceEdges(atom, { deleteExisting: false });
+      this.upsertMemoryItemSourceEdges(this.memoryItemFromEvidenceAtom(atom), { deleteExisting: false });
     }
 
     const assetRows = this.db.prepare("SELECT payload_json FROM assets").all();
@@ -1938,24 +2397,65 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  private upsertMemorySourceEdges(
-    memory: DurableMemoryEntry,
+  private upsertMemoryItemSourceEdges(
+    item: MemoryItemEntry,
     options: { deleteExisting?: boolean } = {},
   ): void {
     if (!this.db) {
       return;
     }
     if (options.deleteExisting !== false) {
-      this.deleteEdgesForSource("memory", memory.id);
+      this.deleteEdgesForSource("memory_item", item.id);
     }
-    for (const sourceId of [...new Set(memory.sourceIds ?? [])]) {
-      this.insertEdge("memory", memory.id, "derived_from", this.targetKindForSourceId(sourceId), sourceId, {
-        sessionId: memory.sessionId,
-        agentId: memory.agentId,
-        projectId: memory.projectId,
-        sourceType: memory.sourceType,
+    for (const sourceId of [...new Set(item.sourceIds ?? [])]) {
+      this.insertEdge("memory_item", item.id, "derived_from", this.targetKindForSourceId(sourceId), sourceId, {
+        sessionId: item.sessionId,
+        agentId: item.agentId,
+        projectId: item.projectId,
+        sourceTable: item.sourceTable,
+        sourceId: item.sourceId,
+        evidenceLevel: item.evidenceLevel,
+        inferred: item.inferred,
       });
     }
+    for (const supportedId of [...new Set(item.supports ?? [])]) {
+      this.insertEdge("memory_item", item.id, "supports", this.targetKindForSourceId(supportedId), supportedId, {
+        sessionId: item.sessionId,
+        agentId: item.agentId,
+        projectId: item.projectId,
+        sourceTable: item.sourceTable,
+        sourceId: item.sourceId,
+      });
+    }
+    for (const supersededId of [...new Set(item.supersedes ?? [])]) {
+      this.insertEdge("memory_item", item.id, "supersedes", "memory_item", this.normalizeMemoryItemTargetId(supersededId), {
+        sessionId: item.sessionId,
+        agentId: item.agentId,
+        projectId: item.projectId,
+        sourceTable: item.sourceTable,
+        sourceId: item.sourceId,
+      });
+    }
+    for (const conflictId of [...new Set(item.conflictsWith ?? [])]) {
+      this.insertEdge(
+        "memory_item",
+        item.id,
+        "conflicts_with",
+        conflictId.startsWith("memory-item:") || conflictId.startsWith("memory-") ? "memory_item" : "conflict_group",
+        conflictId.startsWith("memory-") ? this.normalizeMemoryItemTargetId(conflictId) : conflictId,
+        {
+          sessionId: item.sessionId,
+          agentId: item.agentId,
+          projectId: item.projectId,
+          sourceTable: item.sourceTable,
+          sourceId: item.sourceId,
+        },
+      );
+    }
+  }
+
+  private normalizeMemoryItemTargetId(id: string): string {
+    return id.startsWith("memory-item:") ? id : `memory-item:${id}`;
   }
 
   private deleteEdgesForSource(sourceKind: string, sourceId: string): void {
@@ -1963,6 +2463,32 @@ export class SQLiteRuntimeStore {
       DELETE FROM source_edges
       WHERE source_kind = ? AND source_id = ?
     `)?.run(sourceKind, sourceId);
+    this.prepare(`
+      DELETE FROM trace_edges
+      WHERE source_kind = ? AND source_id = ?
+    `)?.run(sourceKind, sourceId);
+  }
+
+  private deleteMemoryItemsFromSourceTables(sourceTables: MemoryItemEntry["sourceTable"][]): void {
+    if (!this.db || sourceTables.length === 0) {
+      return;
+    }
+    const placeholders = sourceTables.map(() => "?").join(", ");
+    this.prepare(`
+      DELETE FROM source_edges
+      WHERE source_kind = 'memory_item'
+        AND source_id IN (
+          SELECT id FROM memory_items WHERE source_table IN (${placeholders})
+        )
+    `)?.run(...sourceTables);
+    this.prepare(`
+      DELETE FROM trace_edges
+      WHERE source_kind = 'memory_item'
+        AND source_id IN (
+          SELECT id FROM memory_items WHERE source_table IN (${placeholders})
+        )
+    `)?.run(...sourceTables);
+    this.prepare(`DELETE FROM memory_items WHERE source_table IN (${placeholders})`)?.run(...sourceTables);
   }
 
   private insertEdge(
@@ -1995,6 +2521,27 @@ export class SQLiteRuntimeStore {
       typeof metadata.projectId === "string" ? metadata.projectId : null,
       this.stringify(metadata),
     );
+    this.prepare(`
+      INSERT INTO trace_edges (
+        id, source_kind, source_id, relation, target_kind, target_id,
+        session_id, agent_id, project_id, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET metadata_json=excluded.metadata_json
+    `)?.run(
+      id,
+      sourceKind,
+      sourceId,
+      relation,
+      targetKind,
+      targetId,
+      typeof metadata.sessionId === "string" ? metadata.sessionId : null,
+      typeof metadata.agentId === "string" ? metadata.agentId : null,
+      typeof metadata.projectId === "string" ? metadata.projectId : null,
+      this.stringify({
+        ...metadata,
+        mirrorOf: "source_edges",
+      }),
+    );
   }
 
   private refreshFts(tableName: string, idColumn: string, id: string, fields: string[]): void {
@@ -2007,9 +2554,6 @@ export class SQLiteRuntimeStore {
       if (tableName === "assets_fts") {
         this.db?.prepare("INSERT INTO assets_fts (doc_id, title, summary) VALUES (?, ?, ?)")
           .run(id, fields[0] ?? "", fields.slice(1).join(" "));
-      } else if (tableName === "memories_fts") {
-        this.db?.prepare("INSERT INTO memories_fts (id, text) VALUES (?, ?)")
-          .run(id, fields.join(" "));
       } else {
         this.db?.prepare("INSERT INTO messages_fts (id, content) VALUES (?, ?)")
           .run(id, fields.join(" "));
@@ -2088,11 +2632,14 @@ export class SQLiteRuntimeStore {
     return {
       messages: this.countTable("messages"),
       summaries: this.countTable("summaries"),
-      evidenceAtoms: this.countTable("evidence_atoms"),
-      memories: this.countTable("memories"),
+      evidenceAtoms: this.countTable("summary_evidence_drafts"),
+      memories: this.countTable("memory_item_drafts"),
+      memoryItems: this.countTable("memory_items"),
       runtimeRecords: this.countTable("runtime_records"),
       assets: this.countTable("assets"),
       sourceEdges: this.countTable("source_edges"),
+      traceEdges: this.countTable("trace_edges"),
+      runtimeAnnotations: this.countTable("runtime_annotations"),
       contextRuns: this.countTable("context_runs"),
       retrievalCandidates: this.countTable("retrieval_candidates"),
     };
@@ -2104,9 +2651,12 @@ export class SQLiteRuntimeStore {
       summaries: 0,
       evidenceAtoms: 0,
       memories: 0,
+      memoryItems: 0,
       runtimeRecords: 0,
       assets: 0,
       sourceEdges: 0,
+      traceEdges: 0,
+      runtimeAnnotations: 0,
       contextRuns: 0,
       retrievalCandidates: 0,
     };
@@ -2187,12 +2737,8 @@ export class SQLiteRuntimeStore {
         const row = this.db.prepare("SELECT payload_json FROM summaries WHERE id = ?").get(id);
         return row ? this.parseObject(row.payload_json) : null;
       }
-      case "memory": {
-        const row = this.db.prepare("SELECT payload_json FROM memories WHERE id = ?").get(id);
-        return row ? this.parseObject(row.payload_json) : null;
-      }
-      case "evidence_atom": {
-        const row = this.db.prepare("SELECT payload_json FROM evidence_atoms WHERE id = ?").get(id);
+      case "memory_item": {
+        const row = this.db.prepare("SELECT payload_json FROM memory_items WHERE id = ?").get(id);
         return row ? this.parseObject(row.payload_json) : null;
       }
       case "asset": {
@@ -2222,22 +2768,26 @@ export class SQLiteRuntimeStore {
 
   private normalizeKind(kind: string, id: string): string {
     const normalized = kind.trim().toLowerCase();
-    if (normalized === "atom") {
-      return "evidence_atom";
-    }
-    if (["message", "summary", "memory", "asset", "evidence_atom"].includes(normalized)) {
+    if (["message", "summary", "memory_item", "asset"].includes(normalized)) {
       return normalized;
     }
-    if (id.startsWith("atom-")) {
-      return "evidence_atom";
+    if (id.startsWith("memory-item:")) {
+      return "memory_item";
     }
-    if (id.startsWith("memory-")) {
-      return "memory";
+    if (normalized === "atom" || normalized === "memory" || normalized === "evidence_atom") {
+      return normalized;
     }
     if (id.includes("summary") || id.startsWith("s-")) {
       return "summary";
     }
     return "message";
+  }
+
+  private normalizeTargetId(kind: string, id: string): string {
+    if (kind === "memory_item" && !id.startsWith("memory-item:")) {
+      return this.normalizeMemoryItemTargetId(id);
+    }
+    return id;
   }
 
   private normalizeRole(value: unknown): RawMessage["role"] {
@@ -2247,11 +2797,11 @@ export class SQLiteRuntimeStore {
   }
 
   private targetKindForSourceId(sourceId: string): string {
-    if (sourceId.startsWith("atom-")) {
-      return "evidence_atom";
+    if (sourceId.startsWith("memory-item:")) {
+      return "memory_item";
     }
-    if (sourceId.startsWith("memory-")) {
-      return "memory";
+    if (sourceId.startsWith("atom-") || sourceId.startsWith("memory-")) {
+      return "memory_item";
     }
     if (sourceId.startsWith("summary") || sourceId.includes("summary")) {
       return "summary";
@@ -2267,10 +2817,10 @@ export class SQLiteRuntimeStore {
       return "message";
     }
     if (typeof item.metadata?.memoryId === "string") {
-      return "memory";
+      return "memory_item";
     }
     if (typeof item.metadata?.atomId === "string") {
-      return "evidence_atom";
+      return "memory_item";
     }
     if (item.summaryId) {
       return "summary";
@@ -2289,7 +2839,10 @@ export class SQLiteRuntimeStore {
       return item.metadata.messageId;
     }
     if (typeof item.metadata?.memoryId === "string") {
-      return item.metadata.memoryId;
+      return this.normalizeMemoryItemTargetId(item.metadata.memoryId);
+    }
+    if (typeof item.metadata?.atomId === "string") {
+      return this.normalizeMemoryItemTargetId(item.metadata.atomId);
     }
     if (typeof item.metadata?.docId === "string") {
       return item.metadata.docId;
@@ -2298,37 +2851,6 @@ export class SQLiteRuntimeStore {
       return fallbackId;
     }
     return null;
-  }
-
-  private upsertEvidenceAtomSourceEdges(
-    atom: EvidenceAtomEntry,
-    options: { deleteExisting?: boolean } = {},
-  ): void {
-    if (!this.db) {
-      return;
-    }
-    if (options.deleteExisting !== false) {
-      this.deleteEdgesForSource("evidence_atom", atom.id);
-    }
-    this.insertEdge("evidence_atom", atom.id, "derived_from", "summary", atom.sourceSummaryId, {
-      sessionId: atom.sessionId,
-      agentId: atom.agentId,
-      projectId: atom.projectId,
-      atomType: atom.type,
-    });
-    const messageIds = [
-      ...(atom.sourceBinding?.messageIds ?? []),
-      ...(atom.sourceMessageIds ?? []),
-    ];
-    for (const messageId of [...new Set(messageIds)]) {
-      this.insertEdge("evidence_atom", atom.id, "supported_by", "message", messageId, {
-        sessionId: atom.sessionId,
-        agentId: atom.agentId,
-        projectId: atom.projectId,
-        atomType: atom.type,
-        sourceHash: atom.sourceHash,
-      });
-    }
   }
 
   async recordEvidenceAtoms(atoms: EvidenceAtomEntry[]): Promise<boolean> {
@@ -2344,8 +2866,9 @@ export class SQLiteRuntimeStore {
       this.db?.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
       for (const atom of atoms) {
-        this.upsertEvidenceAtom(atom);
-        this.upsertEvidenceAtomSourceEdges(atom);
+        const memoryItem = this.memoryItemFromEvidenceAtom(atom);
+        this.upsertMemoryItem(memoryItem);
+        this.upsertMemoryItemSourceEdges(memoryItem);
       }
       this.db?.exec("COMMIT");
       transactionStarted = false;
@@ -2396,23 +2919,26 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  listMemories(options: { sessionId?: string } = {}): DurableMemoryEntry[] {
+  listMemories(options: { sessionId?: string } = {}): MemoryItemDraftEntry[] {
     if (!this.openDatabase()) {
       return [];
     }
     try {
       return this.db?.prepare(`
-        SELECT payload_json FROM memories
-        WHERE (? IS NULL OR session_id = ?)
+        SELECT payload_json FROM memory_items
+        WHERE source_table = 'memory_item_drafts'
+          AND (? IS NULL OR session_id = ?)
         ORDER BY created_at DESC
       `).all(options.sessionId ?? null, options.sessionId ?? null)
-        .map((row) => this.parseObject(row.payload_json) as unknown as DurableMemoryEntry) ?? [];
+        .map((row) => this.draftFromMemoryItem(
+          this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry),
+        )) ?? [];
     } finally {
       this.closeDatabase();
     }
   }
 
-  async replaceMemories(memories: DurableMemoryEntry[]): Promise<boolean> {
+  async replaceMemories(memories: MemoryItemDraftEntry[]): Promise<boolean> {
     await this.init();
     if (!this.openDatabase()) {
       return false;
@@ -2421,10 +2947,11 @@ export class SQLiteRuntimeStore {
     try {
       this.db?.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
-      this.db?.prepare("DELETE FROM source_edges WHERE source_kind = 'memory'").run();
-      this.db?.prepare("DELETE FROM memories").run();
+      this.deleteMemoryItemsFromSourceTables(["memory_item_drafts"]);
       for (const memory of memories) {
-        this.upsertMemory(memory);
+        const memoryItem = this.memoryItemFromDraft(memory);
+        this.upsertMemoryItem(memoryItem);
+        this.upsertMemoryItemSourceEdges(memoryItem);
       }
       this.db?.exec("COMMIT");
       transactionStarted = false;
@@ -2449,11 +2976,244 @@ export class SQLiteRuntimeStore {
     }
     try {
       return this.db?.prepare(`
-        SELECT payload_json FROM evidence_atoms
-        WHERE (? IS NULL OR session_id = ?)
-        ORDER BY session_id ASC, start_turn ASC, type ASC, id ASC
+        SELECT payload_json FROM memory_items
+        WHERE source_table = 'summary_evidence_drafts'
+          AND (? IS NULL OR session_id = ?)
+        ORDER BY session_id ASC, created_at ASC, kind ASC, id ASC
       `).all(options.sessionId ?? null, options.sessionId ?? null)
-        .map((row) => this.parseObject(row.payload_json) as unknown as EvidenceAtomEntry) ?? [];
+        .map((row) => this.evidenceAtomFromMemoryItem(
+          this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry),
+        )) ?? [];
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  private normalizeMemoryItemEntry(entry: MemoryItemEntry): MemoryItemEntry {
+    const scope = this.normalizeMemoryItemScope(entry.scope);
+    const contextPolicy = this.normalizeMemoryItemContextPolicy(entry.contextPolicy);
+    const promotionState = this.normalizeMemoryItemPromotionState(entry.promotionState);
+    return {
+      ...entry,
+      kind: this.normalizeMemoryItemKind(entry.kind),
+      status: this.normalizeMemoryItemStatus(entry.status),
+      scope,
+      scopeId: entry.scopeId ?? this.memoryItemScopeId(scope, entry),
+      contextPolicy,
+      confidence: this.numberFromUnknown(entry.confidence, 0.5),
+      stability: this.stabilityFromUnknown(entry.stability),
+      priority: this.numberFromUnknown(entry.priority, 50),
+      promotionState,
+      tags: entry.tags ?? [],
+      sourceIds: entry.sourceIds ?? [],
+      sourceRefs: entry.sourceRefs ?? [],
+      supersedes: entry.supersedes ?? [],
+      conflictsWith: entry.conflictsWith ?? [],
+      supports: entry.supports ?? [],
+      metadata: entry.metadata ?? {},
+    };
+  }
+
+  private draftFromMemoryItem(item: MemoryItemEntry): MemoryItemDraftEntry {
+    const metadata = item.metadata ?? {};
+    const draftKind = typeof metadata.draftKind === "string" ? metadata.draftKind : "";
+    const kind: MemoryItemDraftEntry["kind"] =
+      draftKind === "user_fact" ||
+      draftKind === "assistant_decision" ||
+      draftKind === "project_state" ||
+      draftKind === "solution" ||
+      draftKind === "diagnostic" ||
+      draftKind === "constraint"
+        ? draftKind
+        : item.kind === "decision"
+          ? "assistant_decision"
+          : item.kind === "project_state"
+            ? "project_state"
+            : item.kind === "lesson"
+              ? "solution"
+              : item.kind === "diagnosis"
+                ? "diagnostic"
+                : item.kind === "constraint"
+                  ? "constraint"
+                  : "user_fact";
+    const draftSourceType = metadata.draftSourceType;
+    const sourceType: MemoryItemDraftEntry["sourceType"] =
+      draftSourceType === "observation" || draftSourceType === "snapshot" || draftSourceType === "raw_message"
+        ? draftSourceType
+        : "raw_message";
+    return {
+      id: item.sourceId || item.id.replace(/^memory-item:/, ""),
+      eventId: typeof metadata.eventId === "string" ? metadata.eventId : undefined,
+      sessionId: item.sessionId,
+      agentId: item.agentId,
+      projectId: item.projectId,
+      topicId: item.topicId,
+      kind,
+      recordStatus: item.status === "candidate" || item.status === "rejected" || item.status === "expired" ? "archived" : item.status,
+      supersededById: typeof metadata.supersededById === "string" ? metadata.supersededById : undefined,
+      text: item.text,
+      fingerprint: typeof metadata.fingerprint === "string" ? metadata.fingerprint : this.hash(`${item.kind}:${item.text}`),
+      tags: item.tags,
+      createdAt: item.createdAt,
+      sourceType,
+      sourceIds: item.sourceIds,
+      sourceSequenceMin: typeof metadata.sourceSequenceMin === "number" ? metadata.sourceSequenceMin : undefined,
+      sourceSequenceMax: typeof metadata.sourceSequenceMax === "number" ? metadata.sourceSequenceMax : undefined,
+      sourceStartTimestamp: item.validFrom,
+      sourceEndTimestamp: item.validUntil,
+      metadata,
+    };
+  }
+
+  private evidenceAtomFromMemoryItem(item: MemoryItemEntry): EvidenceAtomEntry {
+    const metadata = item.metadata ?? {};
+    const evidenceDraftType = metadata.evidenceDraftType;
+    const type: EvidenceAtomEntry["type"] =
+      evidenceDraftType === "constraint" ||
+      evidenceDraftType === "decision" ||
+      evidenceDraftType === "exact_fact" ||
+      evidenceDraftType === "blocker" ||
+      evidenceDraftType === "next_step" ||
+      evidenceDraftType === "entity"
+        ? evidenceDraftType
+        : item.kind === "decision"
+          ? "decision"
+          : item.kind === "constraint"
+            ? "constraint"
+            : item.kind === "procedure"
+              ? "next_step"
+              : item.kind === "diagnosis"
+                ? "blocker"
+                : "exact_fact";
+    const sourceBinding = metadata.sourceBinding && typeof metadata.sourceBinding === "object"
+      ? metadata.sourceBinding as EvidenceAtomEntry["sourceBinding"]
+      : undefined;
+    const sourceMessageIds = item.sourceIds.filter((id) => this.targetKindForSourceId(id) === "message");
+    const summaryId = item.sourceIds.find((id) => this.targetKindForSourceId(id) === "summary");
+    return {
+      id: item.sourceId || item.id.replace(/^memory-item:/, ""),
+      eventId: typeof metadata.eventId === "string" ? metadata.eventId : undefined,
+      sessionId: item.sessionId,
+      agentId: item.agentId,
+      projectId: item.projectId,
+      topicId: item.topicId,
+      recordStatus: item.status === "candidate" || item.status === "rejected" || item.status === "expired" ? "archived" : item.status,
+      atomStatus: "accepted",
+      type,
+      text: item.text,
+      retrievalText: item.text,
+      tags: item.tags,
+      confidence: item.confidence,
+      importance: typeof metadata.importance === "number" ? metadata.importance : Math.max(0.1, Math.min(1, (100 - item.priority) / 100)),
+      stability: typeof metadata.stability === "number" ? metadata.stability : item.stability === "high" ? 0.9 : item.stability === "low" ? 0.25 : 0.5,
+      sourceTraceComplete: item.evidenceLevel === "high" && !item.inferred,
+      sourceSummaryId: summaryId ?? "",
+      sourceBinding,
+      sourceMessageIds,
+      startTurn: 0,
+      endTurn: 0,
+      sourceHash: typeof metadata.sourceHash === "string" ? metadata.sourceHash : undefined,
+      sourceMessageCount: typeof metadata.sourceMessageCount === "number" ? metadata.sourceMessageCount : sourceMessageIds.length || undefined,
+      validFrom: item.validFrom,
+      validUntil: item.validUntil,
+      conflictGroupId: item.conflictsWith[0],
+      createdAt: item.createdAt,
+      metadata,
+    };
+  }
+
+  private normalizeMemoryItemKind(kind: string): MemoryItemKind {
+    const allowed: MemoryItemKind[] = [
+      "preference",
+      "principle",
+      "decision",
+      "constraint",
+      "lesson",
+      "project_state",
+      "correction",
+      "procedure",
+      "claim",
+      "diagnosis",
+      "kb_candidate",
+      "general",
+    ];
+    return allowed.includes(kind as MemoryItemKind) ? kind as MemoryItemKind : "general";
+  }
+
+  private normalizeMemoryItemStatus(status: string): MemoryItemEntry["status"] {
+    if (status === "candidate" || status === "active" || status === "superseded" ||
+      status === "rejected" || status === "archived" || status === "expired") {
+      return status;
+    }
+    return "candidate";
+  }
+
+  private normalizeMemoryItemScope(scope: string): MemoryItemScope {
+    if (scope === "agent" || scope === "session" || scope === "project" ||
+      scope === "global_principle" || scope === "global") {
+      return scope;
+    }
+    return "session";
+  }
+
+  private normalizeMemoryItemContextPolicy(value: string): MemoryItemEntry["contextPolicy"] {
+    switch (value) {
+      case "on_recall":
+        return "on_demand";
+      case "auto":
+        return "default";
+      case "strict":
+      case "forensic":
+        return "strict_only";
+      case "never":
+      case "on_demand":
+      case "default":
+      case "always_core":
+      case "project_active":
+      case "strict_only":
+        return value;
+      default:
+        return "on_demand";
+    }
+  }
+
+  private normalizeMemoryItemPromotionState(value: string): MemoryItemEntry["promotionState"] {
+    switch (value) {
+      case "review_pending":
+        return "drafted";
+      case "promoted":
+        return "exported";
+      case "skipped":
+        return "rejected";
+      case "none":
+      case "candidate":
+      case "drafted":
+      case "approved":
+      case "exported":
+      case "rejected":
+        return value;
+      default:
+        return "none";
+    }
+  }
+
+  listMemoryItems(options: { sessionId?: string; agentId?: string } = {}): MemoryItemEntry[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      return this.db?.prepare(`
+        SELECT payload_json FROM memory_items
+        WHERE (? IS NULL OR session_id = ?)
+          AND (? IS NULL OR agent_id = ?)
+        ORDER BY updated_at DESC, created_at DESC
+      `).all(
+        options.sessionId ?? null,
+        options.sessionId ?? null,
+        options.agentId ?? null,
+        options.agentId ?? null,
+      )
+        .map((row) => this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry)) ?? [];
     } finally {
       this.closeDatabase();
     }
@@ -2484,6 +3244,11 @@ export class SQLiteRuntimeStore {
         entry.updatedAt || now,
         this.stringify(entry.payload),
       );
+      if (entry.kind === "knowledge_raw") {
+        const memoryItem = this.memoryItemFromKnowledgeRaw(entry.payload as unknown as KnowledgeRawEntry);
+        this.upsertMemoryItem(memoryItem);
+        this.upsertMemoryItemSourceEdges(memoryItem);
+      }
       return true;
     } finally {
       this.closeDatabase();
@@ -2526,6 +3291,29 @@ export class SQLiteRuntimeStore {
       return 0;
     }
     try {
+      if (kind === "knowledge_raw") {
+        const where = `
+          source_table = 'knowledge_raw'
+          AND source_id IN (
+            SELECT id FROM runtime_records
+            WHERE kind = ?
+              AND (? IS NULL OR session_id = ?)
+              AND (? IS NULL OR agent_id = ?)
+          )
+        `;
+        this.prepare(`
+          DELETE FROM source_edges
+          WHERE source_kind = 'memory_item'
+            AND source_id IN (SELECT id FROM memory_items WHERE ${where})
+        `)?.run(kind, options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null);
+        this.prepare(`
+          DELETE FROM trace_edges
+          WHERE source_kind = 'memory_item'
+            AND source_id IN (SELECT id FROM memory_items WHERE ${where})
+        `)?.run(kind, options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null);
+        this.prepare(`DELETE FROM memory_items WHERE ${where}`)
+          ?.run(kind, options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null);
+      }
       this.prepare(`
         DELETE FROM runtime_records
         WHERE kind = ?
@@ -2552,39 +3340,7 @@ export class SQLiteRuntimeStore {
       .split(/[^a-z0-9\u4e00-\u9fff-]+/i)
       .map((term) => term.trim())
       .map((term) => this.normalizeRuntimeQueryTerm(term));
-    const expandedTerms = [...rawTerms];
-    const add = (...terms: string[]) => expandedTerms.push(...terms.map((term) => this.normalizeRuntimeQueryTerm(term)));
-    if (/\boccupation|previous\s+role|used\s+to\s+work\b/i.test(normalizedQuery)) add("role", "job", "work", "worked", "marketing", "startup");
-    if (/\btennis|racket|racquet\b/i.test(normalizedQuery)) add("tennis", "racket", "sports", "store", "downtown");
-    if (/\bplaylist|spotify\b/i.test(normalizedQuery)) add("playlist", "spotify", "called", "created");
-    if (/\btheater|theatre|play\b/i.test(normalizedQuery)) add("play", "production", "theater", "community");
-    if (/\byoga|studio|classes?\b/i.test(normalizedQuery)) add("yoga", "studio", "serenity");
-    if (/\bcoupon|creamer|redeem\b/i.test(normalizedQuery)) add("coupon", "creamer", "redeem", "target", "cartwheel");
-    if (/\bcharity|race|awareness\b/i.test(normalizedQuery)) add("charity", "race", "raise", "awareness", "mental", "health");
-    if (/\bspotify|playlist\b/i.test(normalizedQuery)) add("spotify", "playlists", "playlist", "music", "organize");
-    if (/\bstudy abroad|abroad program\b/i.test(normalizedQuery)) add("study", "abroad", "university", "melbourne", "australia");
-    if (/\bdiscount|first purchase|clothing brand\b/i.test(normalizedQuery)) add("discount", "purchase", "clothing", "brand");
-    if (/\bikea|bookshelf|assemble\b/i.test(normalizedQuery)) add("ikea", "bookshelf", "assembled", "hours");
-    if (/\bsister|birthday|gift\b/i.test(normalizedQuery)) add("sister", "birthday", "gift", "yellow", "dress");
-    if (/\binternet|speed|plan\b/i.test(normalizedQuery)) add("internet", "speed", "upgraded", "mbps");
-    if (/\bdog|breed\b/i.test(normalizedQuery)) add("dog", "breed", "golden", "retriever", "max");
-    if (/\bspirituality|stance\b/i.test(normalizedQuery)) add("spirituality", "stance", "atheist", "buddhism");
-    if (/\brunning shoes|favorite running|shoe brand\b/i.test(normalizedQuery)) add("running", "shoes", "nike");
-    if (/\bcertification|last month\b/i.test(normalizedQuery)) add("certification", "data", "science", "completed");
-    if (/\bbikes?\b/i.test(normalizedQuery)) add("bike", "bikes", "own");
-    if (/\bfishing|largemouth|bass|lake michigan\b/i.test(normalizedQuery)) add("fishing", "lake", "michigan", "largemouth", "bass", "caught");
-    if (/\bcomedian|open mic\b/i.test(normalizedQuery)) add("open", "mic", "comedians", "perform");
-    if (/\bcat\b|\bcat'?s name\b/i.test(normalizedQuery)) add("cat", "name", "luna");
-    if (/\bnecklace|grandma|how old\b/i.test(normalizedQuery)) add("grandma", "necklace", "silver");
-    if (/\bgin|vermouth|martini|ratio\b/i.test(normalizedQuery)) add("gin", "vermouth", "ratio", "martini");
-    if (/\bram|laptop|upgrade\b/i.test(normalizedQuery)) add("ram", "laptop", "upgrade", "gb");
-    if (/\bpainting|sunset|worth|paid\b/i.test(normalizedQuery)) add("painting", "sunset", "worth", "triple", "paid");
-    if (/\bcousin|wedding\b/i.test(normalizedQuery)) add("cousin", "wedding", "grand", "ballroom");
-    if (/\bbachelor|computer science|ucla\b/i.test(normalizedQuery)) add("undergrad", "cs", "ucla", "computer", "science");
-    if (/\bnew apartment|move\b/i.test(normalizedQuery)) add("move", "moved", "apartment", "hours");
-    if (/\bcocktail|recipe|last weekend\b/i.test(normalizedQuery)) add("cocktail", "recipe", "lavender", "gin", "fizz");
-    if (/\brice\b/i.test(normalizedQuery)) add("rice", "japanese", "short", "grain", "favorite");
-    return expandedTerms
+    return rawTerms
       .filter((term) => {
         if (term.length < 2 || SQLITE_RUNTIME_STOP_WORDS.has(term) || seen.has(term)) {
           return false;

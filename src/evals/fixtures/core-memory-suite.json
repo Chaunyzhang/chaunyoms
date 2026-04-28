@@ -71,7 +71,7 @@
         "mustInclude": ["QUEUE_WINDOW=7m"],
         "mustNotInclude": ["QUEUE_WINDOW=3m"],
         "detailEquals": {
-          "retrievalHitType": "durable_memory"
+          "retrievalHitType": "memory_item"
         }
       }
     },

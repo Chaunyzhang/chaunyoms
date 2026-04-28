@@ -1,6 +1,6 @@
 import {
-  DurableMemoryEntry,
-  DurableMemoryRepository,
+  MemoryItemDraftEntry,
+  MemoryItemDraftRepository,
   LoggerLike,
   ProjectRecord,
   ProjectRegistryRepository,
@@ -16,23 +16,23 @@ export class BackgroundOrganizerEngine {
   constructor(private readonly logger: LoggerLike) {}
 
   async run(
-    durableMemoryStore: DurableMemoryRepository,
+    memoryItemDraftStore: MemoryItemDraftRepository,
     summaryStore: SummaryRepository,
     projectStore: ProjectRegistryRepository,
     agentId: string,
   ): Promise<void> {
-    await this.consolidateDurableMemories(durableMemoryStore);
-    await this.reconcileProjects(durableMemoryStore, summaryStore, projectStore, agentId);
+    await this.consolidateMemoryItemDrafts(memoryItemDraftStore);
+    await this.reconcileProjects(memoryItemDraftStore, summaryStore, projectStore, agentId);
   }
 
-  private async consolidateDurableMemories(
-    durableMemoryStore: DurableMemoryRepository,
+  private async consolidateMemoryItemDrafts(
+    memoryItemDraftStore: MemoryItemDraftRepository,
   ): Promise<void> {
-    const allEntries = durableMemoryStore.getAll();
+    const allEntries = memoryItemDraftStore.getAll();
     const activeEntries = allEntries
       .filter((entry) => entry.recordStatus !== "archived")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    const groups = new Map<string, DurableMemoryEntry[]>();
+    const groups = new Map<string, MemoryItemDraftEntry[]>();
     for (const entry of activeEntries) {
       const key = [
         entry.projectId ?? "no-project",
@@ -63,22 +63,22 @@ export class BackgroundOrganizerEngine {
     }
 
     if (changed) {
-      this.logger.info("background_organizer_durable_reconciled", {
+      this.logger.info("background_organizer_memory_item_reconciled", {
         activeBefore: activeEntries.length,
         activeAfter: nextEntries.filter((entry) => entry.recordStatus === "active").length,
       });
-      await durableMemoryStore.replaceAll(nextEntries);
+      await memoryItemDraftStore.replaceAll(nextEntries);
     }
   }
 
   private async reconcileProjects(
-    durableMemoryStore: DurableMemoryRepository,
+    memoryItemDraftStore: MemoryItemDraftRepository,
     summaryStore: SummaryRepository,
     projectStore: ProjectRegistryRepository,
     agentId: string,
   ): Promise<void> {
     const summaries = summaryStore.getActiveSummaries();
-    const memories = durableMemoryStore.getAll().filter((entry) => entry.recordStatus === "active");
+    const memories = memoryItemDraftStore.getAll().filter((entry) => entry.recordStatus === "active");
     const grouped = new Map<string, { summaries: typeof summaries; memories: typeof memories }>();
 
     for (const summary of summaries) {

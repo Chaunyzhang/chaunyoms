@@ -78,10 +78,10 @@ async function main(): Promise<void> {
   });
 
   assert(result.details.route === "knowledge", "expected knowledge queries to stay in the unified knowledge route");
-  assert(result.details.retrievalHitType === "recent_tail", "expected no vector hit in the standard runtime path");
+  assert(result.details.retrievalHitType === "knowledge", "expected no vector hit or Markdown fallback in the standard runtime path");
   assert(
-    String(result.content[0]?.text ?? "").includes("No standard retrieval hit found"),
-    "expected standard fallback text when no reviewed knowledge exists",
+    String(result.content[0]?.text ?? "").includes("No SQLite knowledge assets matched"),
+    "expected SQLite-first knowledge miss text when no reviewed knowledge exists",
   );
 
   await rm(dir, { recursive: true, force: true });

@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     summary,
     {
       shouldWrite: true,
-      reason: "durable_retry_policy",
+      reason: "memory_item_retry_policy",
       bucket: "patterns",
       slug: "worker-retry-policy",
       title: "Worker Retry Policy",

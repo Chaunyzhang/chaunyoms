@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
 import { ContextPlanner } from "../engines/ContextPlanner";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
@@ -5,14 +8,14 @@ import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
 import {
   AnswerCandidate,
   ContextItem,
-  DurableMemoryEntry,
   EvidenceAtomEntry,
   FixedPrefixProvider,
   KnowledgeDocumentIndexEntry,
-  KnowledgeRepository,
+  MemoryItemEntry,
   ProjectRecord,
   RecallResult,
   RetrievalDecision,
+  RetrievalStrength,
   SemanticCandidate,
   SourceTrace,
   SummaryEntry,
@@ -34,7 +37,7 @@ interface ToolResponse {
 interface SemanticExpansionResult {
   candidates: SemanticCandidate[];
   knowledgeHits: KnowledgeDocumentIndexEntry[];
-  durableHits: DurableMemoryEntry[];
+  memoryItemHits: MemoryItemEntry[];
   summaryHits: SummaryEntry[];
   projectHit: ProjectRecord | null;
 }
@@ -103,6 +106,7 @@ export class ChaunyomsRetrievalService {
   async executeMemoryRoute(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const stores = await this.runtime.getSessionStores(context);
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
     const query = this.getQuery(args);
     const scope = this.getScopeArg(args);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
@@ -111,8 +115,8 @@ export class ChaunyomsRetrievalService {
       query,
       context,
       decision,
-      durableEntries: stores.durableMemoryStore.getAll(),
-      knowledgeHits: stores.knowledgeStore.searchRelatedDocuments(
+      memoryItems: runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
+      knowledgeHits: runtimeStore.searchKnowledgeAssets(
         query,
         context.config.semanticCandidateLimit,
       ),
@@ -143,12 +147,39 @@ export class ChaunyomsRetrievalService {
   }
 
   async executeMemoryRetrieve(args: unknown): Promise<ToolResponse> {
-    const context = this.resolveContext(args);
+    const resolvedContext = this.resolveContext(args);
+    const retrievalStrength = this.resolveRetrievalStrength(args, resolvedContext.config.retrievalStrength);
+    const context: LifecycleContext = {
+      ...resolvedContext,
+      config: {
+        ...resolvedContext.config,
+        retrievalStrength,
+      },
+    };
     const stores = await this.runtime.getSessionStores(context);
-    const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = stores;
+    const { rawStore, summaryStore, projectStore } = stores;
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
+    }
+
+    if (retrievalStrength === "off") {
+      return {
+        content: [{
+          type: "text",
+          text: "ChaunyOMS retrieval is off for this request; no memory, summary, knowledge, or source recall layers were consulted.",
+        }],
+        details: {
+          ok: true,
+          query,
+          route: "recent_tail",
+          retrievalStrength,
+          retrievalHitType: "disabled",
+          sourceTraceRequired: false,
+          evidencePresentation: "none",
+          consultedLayers: [],
+        },
+      };
     }
 
     const scope = this.getScopeArg(args);
@@ -157,20 +188,21 @@ export class ChaunyomsRetrievalService {
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
     const emptyExpansion = this.emptySemanticExpansion(matchedProject);
-    const durableHits = decision.route === "durable_memory" ||
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const shouldProbeMemoryItems = decision.route === "memory_item" ||
       ((decision.requiresSourceRecall || decision.route === "summary_tree") &&
-        (!context.config.autoRecallEnabled || context.config.emergencyBrake))
-      ? this.searchDurableHits(
-        durableMemoryStore.getAll(),
+        (!context.config.autoRecallEnabled || context.config.emergencyBrake));
+    const memoryItemHits = shouldProbeMemoryItems
+      ? this.searchMemoryItemHits(
+        runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
         query,
         matchedProject?.id,
         3,
       )
       : [];
-
     if ((decision.requiresSourceRecall || decision.route === "summary_tree") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
       return this.attachDiagnostics(
-        this.buildRecallDisabledResponse(query, durableHits, context, decision),
+        this.buildRecallDisabledResponse(query, memoryItemHits, context, decision),
         query,
         context,
         decision,
@@ -189,9 +221,9 @@ export class ChaunyomsRetrievalService {
       );
     }
 
-    if (decision.route === "durable_memory" && durableHits.length > 0) {
+    if (decision.route === "memory_item" && memoryItemHits.length > 0) {
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatDurableMemoryText(query, durableHits) }],
+        content: [{ type: "text", text: this.formatMemoryItemText(query, memoryItemHits) }],
         details: {
           ok: true,
           route: decision.route,
@@ -200,8 +232,10 @@ export class ChaunyomsRetrievalService {
           explanation: decision.explanation,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
-          hitCount: durableHits.length,
-          retrievalHitType: "durable_memory",
+          hitCount: memoryItemHits.length,
+          memoryItemHitCount: memoryItemHits.length,
+          topRecordType: "memory_item",
+          retrievalHitType: "memory_item",
           autoRecall: false,
           autoRecallReason: null,
           matchedProjectId: decision.matchedProjectId ?? null,
@@ -213,14 +247,14 @@ export class ChaunyomsRetrievalService {
     const shouldCheckKnowledge = decision.route === "knowledge" ||
       (decision.route === "recent_tail" && this.shouldProbeKnowledgeFallback(query, context));
     const managedKnowledgeHits = shouldCheckKnowledge
-      ? knowledgeStore.searchRelatedDocuments(query, 6)
+      ? runtimeStore.searchKnowledgeAssets(query, 6)
       : [];
     const knowledgeExpansion = managedKnowledgeHits.length > 0
       ? await this.collectSemanticExpansion({
         query,
         context,
         decision,
-        durableEntries: [],
+        memoryItems: [],
         knowledgeHits: managedKnowledgeHits,
         summaryHits: [],
         projects: [],
@@ -232,9 +266,9 @@ export class ChaunyomsRetrievalService {
       return this.attachDiagnostics(
         await this.buildUnifiedKnowledgeResult(
           query,
-          knowledgeStore,
           managedKnowledgeHits,
           decision,
+          context,
         ),
         query,
         context,
@@ -246,9 +280,9 @@ export class ChaunyomsRetrievalService {
     if (decision.route === "recent_tail" && managedKnowledgeHits.length > 0) {
       const result = await this.buildUnifiedKnowledgeResult(
         query,
-        knowledgeStore,
         managedKnowledgeHits,
         decision,
+        context,
       );
       return this.attachDiagnostics({
         ...result,
@@ -266,7 +300,7 @@ export class ChaunyomsRetrievalService {
     if (this.shouldAutoRecall(decision, context)) {
       if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
         return this.attachDiagnostics(
-          this.buildRecallDisabledResponse(query, durableHits, context, decision),
+          this.buildRecallDisabledResponse(query, memoryItemHits, context, decision),
           query,
           context,
           decision,
@@ -322,7 +356,7 @@ export class ChaunyomsRetrievalService {
         item.metadata?.persistentEvidenceAtom !== true,
       ).length;
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget);
-      const presentation = this.resolveRecallPresentationOptions(args);
+      const presentation = this.resolveRecallPresentationOptions(args, context.config.retrievalStrength);
       timings.totalMs = Date.now() - startedAt;
       return this.attachDiagnostics({
         content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate, {
@@ -365,19 +399,32 @@ export class ChaunyomsRetrievalService {
     }
 
     if (decision.route === "knowledge") {
-      const hit = await this.fixedPrefixProvider.getKnowledgeBaseHit(
-        context.config.sharedDataDir,
-        query,
-      );
-      if (hit) {
-        return this.attachDiagnostics(
-          this.buildRouteHitResult(hit, decision, query),
+      return this.attachDiagnostics({
+        content: [{
+          type: "text",
+          text: `No SQLite knowledge assets matched query: ${query}. Run oms_asset_sync or oms_asset_reindex to mirror human-readable Markdown exports before retrieval.`,
+        }],
+        details: {
+          ok: true,
+          route: decision.route,
+          retrievalLabel: this.describeRetrievalRoute(decision),
           query,
-          context,
-          decision,
-          knowledgeExpansion,
-        );
-      }
+          hitCount: 0,
+          knowledgeHitCount: 0,
+          topRecordType: null,
+          retrievalHitType: "knowledge",
+          autoRecall: false,
+          autoRecallReason: null,
+          routePlan: decision.routePlan,
+          layerScores: decision.layerScores ?? [],
+          explanation: decision.explanation,
+          fallbackTrace: [{
+            from: decision.route,
+            to: "none",
+            reason: "sqlite_knowledge_asset_miss",
+          }],
+        },
+      }, query, context, decision, knowledgeExpansion);
     }
 
     const recentTail = rawStore.getRecentTail(3, { sessionId: context.sessionId });
@@ -544,10 +591,16 @@ export class ChaunyomsRetrievalService {
       configPreset: context.config.configPreset,
       enableTools: true,
       runtimeCaptureEnabled: true,
-      durableMemoryEnabled: true,
+      memoryItemEnabled: true,
       autoRecallEnabled: context.config.configPreset !== "safe",
+      retrievalStrength: context.config.retrievalStrength,
       knowledgePromotionEnabled: false,
       knowledgePromotionManualReviewEnabled: true,
+      kbCandidateEnabled: true,
+      kbWriteEnabled: false,
+      kbPromotionMode: context.config.kbPromotionMode,
+      kbPromotionStrictness: context.config.kbPromotionStrictness,
+      kbExportEnabled: true,
       knowledgeIntakeMode: context.config.knowledgeIntakeMode,
       sqliteJournalMode: context.config.sqliteJournalMode,
     };
@@ -631,6 +684,42 @@ export class ChaunyomsRetrievalService {
     const label = this.getStringArg(args, "label");
     const result = await this.runtime.backup(context, label);
     return this.jsonToolResponse("oms_backup", result, result.ok);
+  }
+
+  async executeOmsAgentExport(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const result = await this.runtime.exportAgentCapsule(context, {
+      agentId: this.getStringArg(args, "agentId") || undefined,
+      label: this.getStringArg(args, "label") || undefined,
+    });
+    return this.jsonToolResponse("oms_agent_export", result, Boolean(result.ok));
+  }
+
+  async executeOmsAgentVerify(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const capsulePath = this.getStringArg(args, "capsulePath");
+    if (!capsulePath) {
+      return {
+        content: [{ type: "text", text: "oms_agent_verify requires capsulePath." }],
+        details: { ok: false, tool: "oms_agent_verify", reason: "missing_capsulePath" },
+      };
+    }
+    const result = await this.runtime.verifyAgentCapsule(context, capsulePath);
+    return this.jsonToolResponse("oms_agent_verify", result, Boolean(result.ok));
+  }
+
+  async executeOmsAgentImport(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const capsulePath = this.getStringArg(args, "capsulePath");
+    if (!capsulePath) {
+      return {
+        content: [{ type: "text", text: "oms_agent_import requires capsulePath." }],
+        details: { ok: false, tool: "oms_agent_import", reason: "missing_capsulePath" },
+      };
+    }
+    const apply = this.getBooleanArg(args, "apply", false);
+    const result = await this.runtime.importAgentCapsule(context, capsulePath, apply);
+    return this.jsonToolResponse("oms_agent_import", result, Boolean(result.ok));
   }
 
   async executeOmsRestore(args: unknown): Promise<ToolResponse> {
@@ -873,6 +962,13 @@ export class ChaunyomsRetrievalService {
       promptForApi,
       apiPrompt: null,
       autoRecallEnabled: context.config.autoRecallEnabled,
+      retrievalStrength: context.config.retrievalStrength,
+      sourceTraceRequired: context.config.retrievalStrength === "strict" || context.config.retrievalStrength === "forensic",
+      evidencePresentation: context.config.retrievalStrength === "forensic"
+        ? "show_source_trace"
+        : context.config.retrievalStrength === "strict"
+          ? "show_when_needed"
+          : "hidden_by_default",
       emergencyBrake: context.config.emergencyBrake,
       configPreset: context.config.configPreset,
       configWarnings,
@@ -906,7 +1002,7 @@ export class ChaunyomsRetrievalService {
     query: string;
     context: LifecycleContext;
     decision: RetrievalDecision;
-    durableEntries: DurableMemoryEntry[];
+    memoryItems: MemoryItemEntry[];
     knowledgeHits: KnowledgeDocumentIndexEntry[];
     summaryHits: SummaryEntry[];
     projects: ProjectRecord[];
@@ -917,7 +1013,7 @@ export class ChaunyomsRetrievalService {
       return {
         candidates: [],
         knowledgeHits: [],
-        durableHits: [],
+        memoryItemHits: [],
         summaryHits: [],
         projectHit: args.matchedProject,
       };
@@ -948,35 +1044,34 @@ export class ChaunyomsRetrievalService {
       });
     }
 
-    const durableHits = [...args.durableEntries]
-      .filter((entry) => entry.recordStatus !== "superseded" && entry.recordStatus !== "archived")
+    const memoryItemHits = [...args.memoryItems]
+      .filter((entry) => entry.status === "active" && entry.contextPolicy !== "never")
       .map((entry) => ({
         entry,
-        score: this.scoreSemanticHaystack(
-          [entry.kind, entry.projectId ?? "", entry.topicId ?? "", ...entry.tags, entry.text].join(" "),
-          terms,
-          args.query,
-        ) + (args.matchedProject?.id && entry.projectId === args.matchedProject.id ? 4 : 0),
+        score: this.scoreMemoryItemEntry(entry, terms, args.query) +
+          (args.matchedProject?.id && entry.projectId === args.matchedProject.id ? 4 : 0),
       }))
       .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score || right.entry.createdAt.localeCompare(left.entry.createdAt))
+      .sort((left, right) => right.score - left.score || right.entry.updatedAt.localeCompare(left.entry.updatedAt))
       .slice(0, Math.max(args.context.config.semanticCandidateLimit, 1));
-    for (const item of durableHits) {
+    for (const item of memoryItemHits) {
       const matchedProjectTitle = args.matchedProject && args.matchedProject.id === item.entry.projectId
         ? args.matchedProject.title
         : undefined;
       candidates.push({
-        kind: "durable_memory",
+        kind: "memory_item",
         id: item.entry.id,
         title: `[${item.entry.kind}] ${item.entry.text.slice(0, 72)}`,
         score: item.score,
         reasons: [
-          `durable:${item.entry.kind}`,
+          `memory_item:${item.entry.kind}`,
+          `source:${item.entry.sourceTable}`,
+          `evidence:${item.entry.evidenceLevel}`,
           ...(args.matchedProject?.id && item.entry.projectId === args.matchedProject.id
             ? ["matched_project"]
             : []),
         ],
-        authority: "authoritative",
+        authority: item.entry.inferred ? "hint" : "authoritative",
         sourceRoute: "semantic_candidate_expansion",
         matchedProjectId: item.entry.projectId,
         matchedProjectTitle,
@@ -1049,7 +1144,7 @@ export class ChaunyomsRetrievalService {
         .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
         .slice(0, Math.max(args.context.config.semanticCandidateLimit, 1)),
       knowledgeHits: knowledgeHits.map((item) => item.entry),
-      durableHits: durableHits.map((item) => item.entry),
+      memoryItemHits: memoryItemHits.map((item) => item.entry),
       summaryHits: summaryHits.map((item) => item.entry),
       projectHit,
     };
@@ -1059,7 +1154,7 @@ export class ChaunyomsRetrievalService {
     return {
       candidates: [],
       knowledgeHits: [],
-      durableHits: [],
+      memoryItemHits: [],
       summaryHits: [],
       projectHit,
     };
@@ -1081,6 +1176,13 @@ export class ChaunyomsRetrievalService {
     }
     const value = args[key];
     return typeof value === "string" ? value.trim() : "";
+  }
+
+  private resolveRetrievalStrength(args: unknown, fallback: RetrievalStrength): RetrievalStrength {
+    const value = this.getStringArg(args, "retrievalStrength").toLowerCase();
+    return ["off", "light", "auto", "strict", "forensic"].includes(value)
+      ? value as RetrievalStrength
+      : fallback;
   }
 
   private getNumberArg(args: unknown, key: string, fallback: number): number {
@@ -1133,14 +1235,15 @@ export class ChaunyomsRetrievalService {
       (this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true));
   }
 
-  private resolveRecallPresentationOptions(args: unknown): RecallPresentationOptions {
+  private resolveRecallPresentationOptions(args: unknown, retrievalStrength: RetrievalStrength): RecallPresentationOptions {
     const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
     const maxItems = this.getOptionalNumberArg(args, "maxItems");
     const maxCharsPerItem = this.getOptionalNumberArg(args, "maxCharsPerItem");
+    const forcedTrace = retrievalStrength === "strict" || retrievalStrength === "forensic";
     return {
       maxItems: Math.max(1, Math.min(12, Math.floor(maxItems ?? (deepRecall ? 8 : 4)))),
       maxCharsPerItem: Math.max(240, Math.min(2000, Math.floor(maxCharsPerItem ?? (deepRecall ? 1200 : 700)))),
-      includeFullTrace: this.getBooleanArg(args, "debugTrace", false) || this.getBooleanArg(args, "verbose", false),
+      includeFullTrace: forcedTrace || this.getBooleanArg(args, "debugTrace", false) || this.getBooleanArg(args, "verbose", false),
     };
   }
 
@@ -1732,26 +1835,27 @@ export class ChaunyomsRetrievalService {
     query: string,
     context: LifecycleContext,
   ): Promise<{ decision: RetrievalDecision }> {
-    const { rawStore, summaryStore, durableMemoryStore, projectStore, knowledgeStore } = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, projectStore } = await this.runtime.getSessionStores(context);
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
     const projects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, projects);
-    const scopedDurableHits = this.shouldProbeDurableMemory(query)
-      ? this.searchDurableHits(
-        durableMemoryStore.getAll(),
+    const scopedMemoryItemHits = this.shouldProbeMemoryItems(query)
+      ? this.searchMemoryItemHits(
+        runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
         query,
         matchedProject?.id,
         3,
       )
       : [];
     const hasKnowledgeHits = this.shouldProbeKnowledgeDecision(query, context)
-      ? knowledgeStore.searchRelatedDocuments(query, 1).length > 0
+      ? runtimeStore.searchKnowledgeAssets(query, 1).length > 0
       : false;
     const decision = this.retrievalRouter.decide(query, {
       hasKnowledgeHits,
       hasKnowledgeRawHint: false,
       hasCompactedHistory: summaryStore.getAllSummaries().length > 0,
       hasProjectRegistry: projects.length > 0,
-      hasDurableHits: scopedDurableHits.length > 0,
+      hasMemoryItemHits: scopedMemoryItemHits.length > 0,
       recentAssistantUncertainty: this.hasRecentAssistantUncertainty(rawStore),
       queryComplexity: this.classifyQueryComplexity(query),
       referencesCurrentWork: this.referencesCurrentWork(query),
@@ -2006,7 +2110,7 @@ export class ChaunyomsRetrievalService {
     return windows.sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug))[0]?.slug ?? slugs[0];
   }
 
-  private shouldProbeDurableMemory(query: string): boolean {
+  private shouldProbeMemoryItems(query: string): boolean {
     return /(current|latest|now|currently|updated|correction|after correction|exact|parameter|constraint|decision|rule|setting|config|remember|must|当前|最新|修正后|参数|约束|决策|规则|配置|记住)/i.test(query);
   }
 
@@ -2062,10 +2166,11 @@ export class ChaunyomsRetrievalService {
     return new RegExp(terms.join("|"), "i").test(query);
   }
 
-  private formatDurableMemoryText(query: string, items: DurableMemoryEntry[]): string {
+  private formatMemoryItemText(query: string, items: MemoryItemEntry[]): string {
     return [
-      `Durable memory hits for: ${query}`,
-      ...items.map((item, index) => `${index + 1}. [${item.kind}] ${item.text}`),
+      `MemoryItem hits for: ${query}`,
+      ...items.map((item, index) =>
+        `${index + 1}. [${item.kind}/${item.sourceTable}] ${item.text}`),
     ].join("\n");
   }
 
@@ -2082,59 +2187,30 @@ export class ChaunyomsRetrievalService {
     ].join("\n\n");
   }
 
-  private searchDurableHits(
-    entries: DurableMemoryEntry[],
+  private searchMemoryItemHits(
+    entries: MemoryItemEntry[],
     query: string,
     projectId?: string,
     limit = 5,
-  ): DurableMemoryEntry[] {
-    const terms = query
-      .toLowerCase()
-      .split(/[^a-z0-9\u4e00-\u9fff]+/i)
-      .map((term) => term.trim())
-      .filter((term) => term.length >= 2);
+  ): MemoryItemEntry[] {
+    const terms = this.queryTerms(query);
     if (terms.length === 0) {
       return [];
     }
 
     const scored = entries
-      .filter((entry) => entry.recordStatus === "active")
-      .map((entry) => {
-        const haystack = [
-          entry.kind,
-          entry.projectId ?? "",
-          entry.topicId ?? "",
-          ...entry.tags,
-          typeof entry.metadata?.factKey === "string" ? entry.metadata.factKey : "",
-          typeof entry.metadata?.factValue === "string" ? entry.metadata.factValue : "",
-          entry.text,
-        ].join(" ").toLowerCase();
-        let score = 0;
-        for (const term of terms) {
-          if (haystack.includes(term)) {
-            score += term.length >= 6 ? 3 : 2;
-          }
-        }
-        if (terms.every((term) => haystack.includes(term))) {
-          score += 4;
-        }
-        if (projectId && entry.projectId === projectId) {
-          score += 5;
-        }
-        if (entry.metadata?.factRecencyHint === true) {
-          score += 3;
-        }
-        if (/(current|latest|now|currently|现在|当前|最新)/i.test(query) && entry.metadata?.factKey) {
-          score += 4;
-        }
-        return { entry, score };
-      })
+      .filter((entry) => entry.status === "active" && entry.contextPolicy !== "never")
+      .map((entry) => ({
+        entry,
+        score: this.scoreMemoryItemEntry(entry, terms, query) +
+          (projectId && entry.projectId === projectId ? 5 : 0),
+      }))
       .filter((item) => item.score > 0)
       .sort((left, right) => {
         if (right.score !== left.score) {
           return right.score - left.score;
         }
-        return right.entry.createdAt.localeCompare(left.entry.createdAt);
+        return right.entry.updatedAt.localeCompare(left.entry.updatedAt);
       });
 
     const scoped = projectId
@@ -2142,6 +2218,43 @@ export class ChaunyomsRetrievalService {
       : [];
     const source = scoped.length > 0 ? scoped : scored;
     return source.slice(0, Math.max(limit, 1)).map((item) => item.entry);
+  }
+
+  private scoreMemoryItemEntry(
+    entry: MemoryItemEntry,
+    terms: string[],
+    query: string,
+  ): number {
+    const metadata = entry.metadata ?? {};
+    const haystack = [
+      entry.kind,
+      entry.status,
+      entry.scope,
+      entry.evidenceLevel,
+      entry.contextPolicy,
+      entry.sourceTable,
+      entry.projectId ?? "",
+      entry.topicId ?? "",
+      ...entry.tags,
+      typeof metadata.factKey === "string" ? metadata.factKey : "",
+      typeof metadata.factValue === "string" ? metadata.factValue : "",
+      typeof metadata.draftKind === "string" ? metadata.draftKind : "",
+      typeof metadata.evidenceDraftType === "string" ? metadata.evidenceDraftType : "",
+      entry.text,
+    ].join(" ").toLowerCase();
+    let score = this.scoreHaystack(haystack, terms);
+    if (entry.evidenceLevel === "high") {
+      score += 3;
+    } else if (entry.inferred) {
+      score -= 1;
+    }
+    if (entry.contextPolicy === "strict_only" || entry.contextPolicy === "always_core") {
+      score += 2;
+    }
+    if (/(current|latest|now|currently)/i.test(query) && typeof metadata.factKey === "string") {
+      score += 4;
+    }
+    return score;
   }
 
   private queryTerms(query: string): string[] {
@@ -2296,34 +2409,33 @@ export class ChaunyomsRetrievalService {
 
   private async buildUnifiedKnowledgeResult(
     query: string,
-    knowledgeStore: KnowledgeRepository,
-    managedHits: Array<ReturnType<KnowledgeRepository["searchRelatedDocuments"]>[number]>,
+    managedHits: KnowledgeDocumentIndexEntry[],
     decision: RetrievalDecision,
+    context: LifecycleContext,
   ): Promise<ToolResponse> {
     const terms = this.semanticTerms(query);
-    const managedDocuments = (
-      await Promise.all(managedHits.map((hit) => knowledgeStore.getById(hit.docId)))
-    ).filter((document): document is NonNullable<typeof document> => Boolean(document));
-    const unifiedHits = managedDocuments
-      .map((document) => ({
+    const unifiedHits = await Promise.all(managedHits
+      .map(async (entry) => ({
         recordType: "knowledge_record" as const,
-        score: this.scoreKnowledgeEntry(document.entry, terms, query),
-        title: document.entry.title,
-        body: document.content.trim(),
+        score: this.scoreKnowledgeEntry(entry, terms, query),
+        title: entry.title,
+        body: await this.resolveKnowledgeBody(entry, context),
         metadata: [
           `type: knowledge_record`,
-          `origin: ${document.entry.origin}`,
-          `bucket: ${document.entry.bucket}`,
-          `canonicalKey: ${document.entry.canonicalKey}`,
-          `status: ${document.entry.status}`,
-          `versions: ${document.entry.versions.length}`,
-          `provenance refs: ${document.entry.sourceRefs.length}`,
-          `linked summaries: ${document.entry.linkedSummaryIds.join(", ") || "none"}`,
-          `source refs: ${document.entry.sourceRefs.join(", ") || "none"}`,
+          `origin: ${entry.origin}`,
+          `bucket: ${entry.bucket}`,
+          `canonicalKey: ${entry.canonicalKey}`,
+          `status: ${entry.status}`,
+          `summary: ${entry.summary}`,
+          `versions: ${entry.versions.length}`,
+          `provenance refs: ${entry.sourceRefs.length}`,
+          `linked summaries: ${entry.linkedSummaryIds.join(", ") || "none"}`,
+          `source refs: ${entry.sourceRefs.join(", ") || "none"}`,
         ],
-      }))
+      })))
+      .then((hits) => hits
       .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
-      .slice(0, 6);
+      .slice(0, 6));
 
     const text = unifiedHits.length > 0
       ? unifiedHits
@@ -2344,7 +2456,7 @@ export class ChaunyomsRetrievalService {
         retrievalLabel: this.describeRetrievalRoute(decision),
         query,
         hitCount: unifiedHits.length,
-        knowledgeHitCount: managedDocuments.length,
+        knowledgeHitCount: managedHits.length,
         topRecordType: unifiedHits[0]?.recordType ?? null,
         retrievalHitType: "knowledge",
         autoRecall: false,
@@ -2433,13 +2545,14 @@ export class ChaunyomsRetrievalService {
 
   private buildRecallDisabledResponse(
     query: string,
-    durableHits: DurableMemoryEntry[],
+    memoryItemHits: MemoryItemEntry[],
     context: LifecycleContext,
     decision: RetrievalDecision,
   ): ToolResponse {
-    const text = durableHits.length > 0
-      ? `${this.formatDurableMemoryText(query, durableHits)}\n\nSource recall is currently disabled by safety policy.`
+    const text = memoryItemHits.length > 0
+      ? `${this.formatMemoryItemText(query, memoryItemHits)}\n\nSource recall is currently disabled by safety policy.`
       : `Source recall is currently disabled${context.config.emergencyBrake ? " because emergency brake is enabled" : " by configuration"}.`;
+    const hitCount = memoryItemHits.length;
     return {
       content: [{ type: "text", text }],
       details: {
@@ -2447,8 +2560,10 @@ export class ChaunyomsRetrievalService {
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
         query,
-        hitCount: durableHits.length,
-        retrievalHitType: durableHits.length > 0 ? "durable_memory" : this.getRetrievalHitType(decision),
+        hitCount,
+        memoryItemHitCount: memoryItemHits.length,
+        topRecordType: memoryItemHits.length > 0 ? "memory_item" : null,
+        retrievalHitType: hitCount > 0 ? "memory_item" : this.getRetrievalHitType(decision),
         autoRecall: false,
         autoRecallReason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
         emergencyBrake: context.config.emergencyBrake,
@@ -2458,7 +2573,7 @@ export class ChaunyomsRetrievalService {
         explanation: decision.explanation,
         fallbackTrace: [{
           from: decision.route,
-          to: durableHits.length > 0 ? "durable_memory" : "none",
+          to: memoryItemHits.length > 0 ? "memory_item" : "none",
           reason: context.config.emergencyBrake ? "emergency_brake_enabled" : "auto_recall_disabled",
         }],
       },
@@ -2497,12 +2612,12 @@ export class ChaunyomsRetrievalService {
 
   private getRetrievalHitType(
     decision: RetrievalDecision,
-  ): "route_hit" | "summary_tree_recall" | "recent_tail" | "project_registry" | "durable_memory" | "knowledge" {
+  ): "route_hit" | "summary_tree_recall" | "recent_tail" | "project_registry" | "memory_item" | "knowledge" {
     if (decision.route === "project_registry") {
       return "project_registry";
     }
-    if (decision.route === "durable_memory") {
-      return "durable_memory";
+    if (decision.route === "memory_item") {
+      return "memory_item";
     }
     if (decision.route === "knowledge") {
       return "knowledge";
@@ -2519,8 +2634,8 @@ export class ChaunyomsRetrievalService {
         return "recent-tail direct context";
       case "project_registry":
         return "project registry state";
-      case "durable_memory":
-        return "durable memory";
+      case "memory_item":
+        return "MemoryItem";
       case "summary_tree":
         return "summary tree -> raw recall";
       case "knowledge":
@@ -2568,6 +2683,24 @@ export class ChaunyomsRetrievalService {
     };
   }
 
+  private async resolveKnowledgeBody(
+    entry: KnowledgeDocumentIndexEntry,
+    context: LifecycleContext,
+  ): Promise<string> {
+    const fallback = entry.summary.trim();
+    if (!entry.latestFile || !entry.bucket) {
+      return fallback;
+    }
+    try {
+      const filePath = path.join(context.config.knowledgeBaseDir, entry.bucket, entry.latestFile);
+      const content = await readFile(filePath, "utf8");
+      const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
+      return body || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   private matchProject(query: string, projects: ProjectRecord[]): ProjectRecord | null {
     const terms = query
       .toLowerCase()
@@ -2607,40 +2740,6 @@ export class ChaunyomsRetrievalService {
     return best?.project ?? null;
   }
 
-  private buildRouteHitResult(
-    hit: { title: string; content: string; filePath?: string } | null,
-    decision: RetrievalDecision,
-    query: string,
-  ): ToolResponse {
-    const text =
-      hit && hit.content.trim()
-        ? hit.content
-        : `No direct route-hit content found for query: ${query}`;
-    return {
-      content: [{ type: "text", text }],
-      details: {
-        ok: true,
-        route: decision.route,
-        retrievalLabel: this.describeRetrievalRoute(decision),
-        query,
-        title: hit?.title ?? null,
-        filePath: hit?.filePath ?? null,
-        retrievalHitType: decision.route === "knowledge" ? "knowledge" : "route_hit",
-        autoRecall: false,
-        autoRecallReason: null,
-        routePlan: decision.routePlan,
-        layerScores: decision.layerScores ?? [],
-        explanation: decision.explanation,
-        matchedProjectId: decision.matchedProjectId ?? null,
-        matchedProjectTitle: decision.matchedProjectTitle ?? null,
-        fallbackTrace: hit ? [] : [{
-          from: decision.route,
-          to: "none",
-          reason: "route_hit_not_found",
-        }],
-      },
-    };
-  }
 }
 
 

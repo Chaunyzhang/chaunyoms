@@ -36,7 +36,7 @@ export class KnowledgeMaintenanceService {
   }
 
   schedule(context: Pick<LifecycleContext, "sessionId" | "config" | "summaryModel">): void {
-    if (!context.config.knowledgePromotionEnabled || context.config.emergencyBrake) {
+    if (!this.canProcessKnowledgeWrites(context.config)) {
       return;
     }
     const key = `${context.config.agentId}|${context.sessionId}|${context.config.dataDir}`;
@@ -52,7 +52,7 @@ export class KnowledgeMaintenanceService {
     entry: SummaryEntry,
     context: LifecycleContext,
   ): Promise<void> {
-    if (!context.config.knowledgePromotionEnabled || context.config.emergencyBrake) {
+    if (!this.canCreateKnowledgeCandidate(context.config)) {
       return;
     }
 
@@ -92,9 +92,20 @@ export class KnowledgeMaintenanceService {
       return;
     }
 
-    const now = new Date().toISOString();
     const score = this.deps.knowledgeCandidateScorer.score(entry, sourceResolution.messages);
-    const manualReview = context.config.knowledgePromotionManualReviewEnabled;
+    if (!userOverride && !this.passesCandidateStrictness(score.total, context.config)) {
+      this.deps.logger.info("knowledge_raw_intake_rejected", {
+        summaryId: entry.id,
+        reason: "candidate_score_below_kb_promotion_strictness",
+        strictness: context.config.kbPromotionStrictness,
+        score: score.total,
+        recommendation: score.recommendation,
+      });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const autoPromote = this.shouldAutoPromote(score.total, context.config, Boolean(userOverride));
     const enqueued = await knowledgeRawStore.enqueue({
       id: `knowledge-raw-${entry.id}`,
       sessionId: entry.sessionId,
@@ -105,11 +116,11 @@ export class KnowledgeMaintenanceService {
       oneLineSummary: this.deps.knowledgeCandidateScorer.summarize(entry),
       score,
       review: {
-        mode: manualReview ? "manual" : "auto",
-        state: manualReview ? "awaiting_review" : "auto_accepted",
+        mode: autoPromote ? "auto" : "manual",
+        state: autoPromote ? "auto_accepted" : "awaiting_review",
       },
       intakeReason: decision.reason,
-      status: manualReview ? "review_pending" : "pending",
+      status: autoPromote ? "pending" : "review_pending",
       createdAt: now,
       updatedAt: now,
     });
@@ -126,9 +137,13 @@ export class KnowledgeMaintenanceService {
       oneLineSummary: this.deps.knowledgeCandidateScorer.summarize(entry),
       score: score.total,
       recommendation: score.recommendation,
-      reviewMode: manualReview ? "manual" : "auto",
+      reviewMode: autoPromote ? "auto" : "manual",
+      kbPromotionMode: context.config.kbPromotionMode,
+      kbPromotionStrictness: context.config.kbPromotionStrictness,
+      kbWriteEnabled: context.config.kbWriteEnabled,
+      kbExportEnabled: context.config.kbExportEnabled,
     });
-    if (!manualReview) {
+    if (autoPromote) {
       this.schedule(context);
     }
   }
@@ -164,6 +179,9 @@ export class KnowledgeMaintenanceService {
     config: BridgeConfig;
     summaryModel?: string;
   }): Promise<void> {
+    if (!this.canProcessKnowledgeWrites(context.config)) {
+      return;
+    }
     const { rawStore, knowledgeRawStore, knowledgeStore } = await this.deps.ensureSession(
       context.sessionId,
       context.config,
@@ -204,6 +222,7 @@ export class KnowledgeMaintenanceService {
             sessionId: context.sessionId,
             summaryModel: context.summaryModel,
             knowledgePromotionModel: context.config.knowledgePromotionModel,
+            config: context.config,
             knowledgeStore,
           });
           await knowledgeRawStore.markSettled({
@@ -243,6 +262,51 @@ export class KnowledgeMaintenanceService {
           });
         }
       }
+    }
+  }
+
+  private canCreateKnowledgeCandidate(config: BridgeConfig): boolean {
+    return config.kbCandidateEnabled && !config.emergencyBrake;
+  }
+
+  private canProcessKnowledgeWrites(config: BridgeConfig): boolean {
+    return config.kbWriteEnabled && config.kbExportEnabled && !config.emergencyBrake;
+  }
+
+  private shouldAutoPromote(score: number, config: BridgeConfig, force = false): boolean {
+    if (!this.canProcessKnowledgeWrites(config)) {
+      return false;
+    }
+    if (force && this.isAutoPromotionMode(config.kbPromotionMode)) {
+      return true;
+    }
+    switch (config.kbPromotionMode) {
+      case "conservative_auto":
+        return score >= 75 && this.passesCandidateStrictness(score, config);
+      case "balanced_auto":
+        return score >= 50 && this.passesCandidateStrictness(score, config);
+      case "aggressive_auto":
+        return score >= 35 && this.passesCandidateStrictness(score, config);
+      case "manual":
+      case "assisted":
+      default:
+        return false;
+    }
+  }
+
+  private isAutoPromotionMode(mode: BridgeConfig["kbPromotionMode"]): boolean {
+    return mode === "conservative_auto" || mode === "balanced_auto" || mode === "aggressive_auto";
+  }
+
+  private passesCandidateStrictness(score: number, config: Pick<BridgeConfig, "kbPromotionStrictness">): boolean {
+    switch (config.kbPromotionStrictness) {
+      case "low":
+        return score >= 25;
+      case "medium":
+        return score >= 40;
+      case "high":
+      default:
+        return score >= 50;
     }
   }
 

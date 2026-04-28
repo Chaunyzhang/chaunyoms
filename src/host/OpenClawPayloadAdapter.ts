@@ -189,7 +189,7 @@ export class OpenClawPayloadAdapter {
   } {
     const warnings: string[] = [];
     if (config.emergencyBrake) {
-      warnings.push("Emergency brake is enabled; runtime capture, durable writes, auto recall, and knowledge promotion are forced off.");
+      warnings.push("Emergency brake is enabled; runtime capture, MemoryItem writes, auto recall, and knowledge promotion are forced off.");
     }
     if (!config.strictCompaction && config.knowledgePromotionEnabled) {
       warnings.push("Knowledge promotion is enabled while strict compaction is off; weaker summaries may reduce promotion quality.");
@@ -200,11 +200,20 @@ export class OpenClawPayloadAdapter {
     if (config.semanticCandidateExpansionEnabled && config.semanticCandidateLimit <= 0) {
       warnings.push("Semantic candidate expansion is enabled but semanticCandidateLimit is non-positive.");
     }
-    if (config.knowledgePromotionEnabled && !config.durableMemoryEnabled) {
-      warnings.push("Knowledge promotion is enabled while durable memory extraction is disabled; promotion inputs will be thinner than expected.");
+    if (config.knowledgePromotionEnabled && !config.memoryItemEnabled) {
+      warnings.push("Knowledge promotion is enabled while MemoryItem extraction is disabled; promotion inputs will be thinner than expected.");
     }
     if (config.knowledgePromotionEnabled && !config.knowledgePromotionManualReviewEnabled) {
       warnings.push("Knowledge promotion is automatic. Set knowledgePromotionManualReviewEnabled=true if you want a scored manual approval queue before Markdown writes.");
+    }
+    if ((config.retrievalStrength === "strict" || config.retrievalStrength === "forensic") && !config.autoRecallEnabled) {
+      warnings.push(`${config.retrievalStrength} retrieval requires source recall, but autoRecallEnabled=false; exact evidence recall will be limited.`);
+    }
+    if (config.kbWriteEnabled && !config.kbExportEnabled) {
+      warnings.push("kbWriteEnabled=true but kbExportEnabled=false; knowledge candidates can be written only after export is enabled.");
+    }
+    if (config.kbPromotionMode === "aggressive_auto") {
+      warnings.push("kbPromotionMode=aggressive_auto is research-only; manual, assisted, or conservative_auto is safer for production knowledge-vault writes.");
     }
     return {
       preset: config.configPreset,
@@ -227,6 +236,11 @@ export class OpenClawPayloadAdapter {
         this.getApi()?.config,
     ) ?? {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
+    const identityBaseConfig: BridgeConfig = {
+      ...baseConfig,
+      sessionId: this.resolveStringValue(pluginConfig.sessionId, baseConfig.sessionId),
+      agentId: this.resolveStringValue(pluginConfig.agentId, baseConfig.agentId),
+    };
     const configPreset = this.resolveStringEnum(
       [
         pluginConfig.configPreset,
@@ -288,15 +302,15 @@ export class OpenClawPayloadAdapter {
           baseConfig.runtimeCaptureEnabled,
         );
 
-    const durableMemoryEnabled = emergencyBrake
+    const memoryItemEnabled = emergencyBrake
       ? false
       : this.resolveBooleanFlag(
           [
-            pluginConfig.durableMemoryEnabled,
-            this.inverseBoolean(pluginConfig.stopDurableWrites),
-            this.inverseBoolean(pluginConfig.pauseDurableMemory),
+            pluginConfig.memoryItemEnabled,
+            this.inverseBoolean(pluginConfig.stopMemoryItemWrites),
+            this.inverseBoolean(pluginConfig.pauseMemoryItems),
           ],
-          baseConfig.durableMemoryEnabled,
+          baseConfig.memoryItemEnabled,
         );
 
     const autoRecallEnabled = emergencyBrake
@@ -386,13 +400,13 @@ export class OpenClawPayloadAdapter {
       baseConfig.summaryMarkdownMirrorEnabled,
     );
 
-    const durableMarkdownMirrorEnabled = this.resolveBooleanFlag(
+    const memoryItemMarkdownMirrorEnabled = this.resolveBooleanFlag(
       [
-        pluginConfig.durableMarkdownMirrorEnabled,
-        pluginConfig.enableDurableMarkdownMirror,
-        this.inverseBoolean(pluginConfig.disableDurableMarkdownMirror),
+        pluginConfig.memoryItemMarkdownMirrorEnabled,
+        pluginConfig.enableMemoryItemMarkdownMirror,
+        this.inverseBoolean(pluginConfig.disableMemoryItemMarkdownMirror),
       ],
-      baseConfig.durableMarkdownMirrorEnabled,
+      baseConfig.memoryItemMarkdownMirrorEnabled,
     );
 
     const transcriptMirrorEnabled = this.resolveBooleanFlag(
@@ -413,23 +427,33 @@ export class OpenClawPayloadAdapter {
       baseConfig.knowledgeMarkdownEnabled,
     );
 
-    const sqlitePrimaryEnabled = this.resolveBooleanFlag(
+    const retrievalStrength = this.resolveStringEnum(
       [
-        pluginConfig.sqlitePrimaryEnabled,
-        pluginConfig.enableSqlitePrimary,
-        this.inverseBoolean(pluginConfig.disableSqlitePrimary),
+        pluginConfig.retrievalStrength,
+        pluginConfig.retrievalMode,
+        pluginConfig.recallStrength,
       ],
-      baseConfig.sqlitePrimaryEnabled,
-    );
+      ["off", "light", "auto", "strict", "forensic"],
+      baseConfig.retrievalStrength,
+    ) as BridgeConfig["retrievalStrength"];
 
-    const jsonPersistenceMode = this.resolveStringEnum(
+    const kbPromotionMode = this.resolveStringEnum(
       [
-        pluginConfig.jsonPersistenceMode,
-        pluginConfig.legacyJsonPersistenceMode,
+        pluginConfig.kbPromotionMode,
+        pluginConfig.knowledgePromotionMode,
       ],
-      ["primary", "backup", "off"],
-      baseConfig.jsonPersistenceMode,
-    ) as BridgeConfig["jsonPersistenceMode"];
+      ["manual", "assisted", "conservative_auto", "balanced_auto", "aggressive_auto"],
+      baseConfig.kbPromotionMode,
+    ) as BridgeConfig["kbPromotionMode"];
+
+    const kbPromotionStrictness = this.resolveStringEnum(
+      [
+        pluginConfig.kbPromotionStrictness,
+        pluginConfig.knowledgePromotionStrictness,
+      ],
+      ["low", "medium", "high"],
+      baseConfig.kbPromotionStrictness,
+    ) as BridgeConfig["kbPromotionStrictness"];
 
     const sqliteJournalMode = this.resolveStringEnum(
       [
@@ -442,8 +466,8 @@ export class OpenClawPayloadAdapter {
 
     return this.validateConfig({
       dataDir,
-      sessionId: this.resolveSessionId(payload, baseConfig),
-      agentId: this.resolveAgentId(payload, baseConfig),
+      sessionId: this.resolveSessionId(payload, identityBaseConfig),
+      agentId: this.resolveAgentId(payload, identityBaseConfig),
       configPreset,
       workspaceDir,
       sharedDataDir,
@@ -511,18 +535,44 @@ export class OpenClawPayloadAdapter {
         baseConfig.compactionBarrierEnabled,
       ),
       runtimeCaptureEnabled,
-      durableMemoryEnabled,
+      memoryItemEnabled,
       autoRecallEnabled,
       agentVaultMirrorEnabled,
       summaryMarkdownMirrorEnabled,
-      durableMarkdownMirrorEnabled,
+      memoryItemMarkdownMirrorEnabled,
       transcriptMirrorEnabled,
       knowledgeMarkdownEnabled,
-      sqlitePrimaryEnabled,
-      jsonPersistenceMode,
+      retrievalStrength,
       knowledgePromotionEnabled,
       knowledgePromotionManualReviewEnabled,
       knowledgeIntakeMode,
+      kbCandidateEnabled: this.resolveBooleanFlag(
+        [
+          pluginConfig.kbCandidateEnabled,
+          pluginConfig.knowledgeCandidateEnabled,
+          this.inverseBoolean(pluginConfig.disableKbCandidates),
+        ],
+        baseConfig.kbCandidateEnabled,
+      ),
+      kbWriteEnabled: this.resolveBooleanFlag(
+        [
+          pluginConfig.kbWriteEnabled,
+          pluginConfig.knowledgeWriteEnabled,
+          pluginConfig.knowledgePromotionEnabled,
+          this.inverseBoolean(pluginConfig.disableKbWrites),
+        ],
+        baseConfig.kbWriteEnabled,
+      ),
+      kbPromotionMode,
+      kbPromotionStrictness,
+      kbExportEnabled: this.resolveBooleanFlag(
+        [
+          pluginConfig.kbExportEnabled,
+          pluginConfig.knowledgeExportEnabled,
+          this.inverseBoolean(pluginConfig.disableKbExport),
+        ],
+        baseConfig.kbExportEnabled,
+      ),
       knowledgeIntakeAllowProjectState,
       knowledgeIntakeAllowBranchSummaries,
       knowledgeIntakeUserOverrideEnabled,
@@ -592,6 +642,13 @@ export class OpenClawPayloadAdapter {
     return "";
   }
 
+  private resolveStringValue(value: unknown, fallback: string): string {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+    return fallback;
+  }
+
   private buildDataDir(sharedDataDir: string): string {
     return path.join(sharedDataDir, "data", "chaunyoms");
   }
@@ -638,6 +695,14 @@ export class OpenClawPayloadAdapter {
       return directAgentId;
     }
 
+    const configuredAgentId =
+      typeof currentConfig.agentId === "string" && currentConfig.agentId.trim().length > 0
+        ? currentConfig.agentId.trim()
+        : null;
+    if (configuredAgentId && configuredAgentId !== DEFAULT_BRIDGE_CONFIG.agentId) {
+      return configuredAgentId;
+    }
+
     const inferredFromSession = this.resolveAgentIdFromOpenClawSessionOwner(
       payload,
       currentConfig,
@@ -658,6 +723,7 @@ export class OpenClawPayloadAdapter {
     }
 
     const fallback =
+      configuredAgentId ??
       currentConfig.agentId ??
       DEFAULT_BRIDGE_CONFIG.agentId;
 

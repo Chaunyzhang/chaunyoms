@@ -2,9 +2,10 @@ import {
   ContextBudget,
   ContextItem,
   ContextViewRepository,
-  DurableMemoryEntry,
-  DurableMemoryRepository,
+  MemoryItemDraftEntry,
+  MemoryItemDraftRepository,
   FixedPrefixProvider,
+  MemoryItemEntry,
   RawMessage,
   RawMessageRepository,
   SummaryEntry,
@@ -22,7 +23,7 @@ import {
 interface AssembleOptions {
   includeStablePrefix?: boolean;
   includeSummaries?: boolean;
-  includeDurableMemory?: boolean;
+  includeMemoryItems?: boolean;
   activeQuery?: string;
   sessionId?: string;
 }
@@ -135,15 +136,15 @@ export class ContextAssembler {
     return this.summaryEntriesToItems(selected);
   }
 
-  assembleDurableMemory(durableMemoryStore: DurableMemoryRepository, budget: number): ContextItem[] {
+  assembleMemoryItems(memoryItemDraftStore: MemoryItemDraftRepository, budget: number): ContextItem[] {
     if (budget <= 0) {
       return [];
     }
-    const memories = [...durableMemoryStore.getAll()]
+    const memories = [...memoryItemDraftStore.getAll()]
       .filter((entry) => entry.recordStatus === "active")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, 8);
-    return this.durableMemoryEntriesToItems(memories, budget);
+    return this.memoryInputEntriesToContextItems(memories, budget);
   }
 
   buildRecallGuidance(summaryStore: SummaryRepository, sessionId?: string): ContextItem | null {
@@ -202,12 +203,12 @@ export class ContextAssembler {
       const recallGuidance = options.includeSummaries === false
         ? null
         : this.buildRecallGuidanceFromCount(runtime.getSummaryCount(options.sessionId));
-      const durableMemory = options.includeDurableMemory === false
+      const memoryItems = options.includeMemoryItems === false
         ? []
-        : this.durableMemoryEntriesToItems(runtime.getActiveMemories(8), budget.recallBudget);
+        : this.memoryItemsToContextItems(runtime.getActiveMemoryItems(8), budget.recallBudget);
       const fixedPluginTokens = this.sumTokens(stablePrefix) +
         (recallGuidance?.tokenCount ?? 0) +
-        this.sumTokens(durableMemory);
+        this.sumTokens(memoryItems);
       const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
       const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
       const dynamicSummaryBudget = Math.max(
@@ -231,7 +232,7 @@ export class ContextAssembler {
       );
       return {
         recallGuidance,
-        durableMemory,
+        memoryItems,
         summaries,
         recentTail,
       };
@@ -239,11 +240,11 @@ export class ContextAssembler {
     if (!runtimeRead) {
       throw new Error("SQLite runtime assembly read unavailable");
     }
-    const { recallGuidance, durableMemory, summaries, recentTail } = runtimeRead;
+    const { recallGuidance, memoryItems, summaries, recentTail } = runtimeRead;
     return this.planAndStore([
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
-      ...this.tagCandidateSource(durableMemory, "active_memory"),
+      ...this.tagCandidateSource(memoryItems, "active_memory"),
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
@@ -253,7 +254,7 @@ export class ContextAssembler {
   async assemble(
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
-    durableMemoryStore: DurableMemoryRepository,
+    memoryItemDraftStore: MemoryItemDraftRepository,
     totalBudget: number,
     systemPromptTokens: number,
     freshTailTokens: number,
@@ -278,12 +279,12 @@ export class ContextAssembler {
     const recallGuidance = options.includeSummaries === false
       ? null
       : this.buildRecallGuidance(summaryStore, options.sessionId);
-    const durableMemory = options.includeDurableMemory === false
+    const memoryItems = options.includeMemoryItems === false
       ? []
-      : this.assembleDurableMemory(durableMemoryStore, budget.recallBudget);
+      : this.assembleMemoryItems(memoryItemDraftStore, budget.recallBudget);
     const fixedPluginTokens = this.sumTokens(stablePrefix) +
       (recallGuidance?.tokenCount ?? 0) +
-      this.sumTokens(durableMemory);
+      this.sumTokens(memoryItems);
     const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
     const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
     const dynamicSummaryBudget = Math.max(
@@ -310,7 +311,7 @@ export class ContextAssembler {
     return this.planAndStore([
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
-      ...this.tagCandidateSource(durableMemory, "active_memory"),
+      ...this.tagCandidateSource(memoryItems, "active_memory"),
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
@@ -473,12 +474,12 @@ export class ContextAssembler {
     }));
   }
 
-  private durableMemoryEntriesToItems(memories: DurableMemoryEntry[], budget: number): ContextItem[] {
+  private memoryItemsToContextItems(memories: MemoryItemEntry[], budget: number): ContextItem[] {
     const selected: ContextItem[] = [];
     let consumed = 0;
 
     for (const memory of memories) {
-      const content = `[durable_memory:${memory.kind}] ${memory.text}`;
+      const content = `[memory_item:${memory.kind}] ${memory.text}`;
       const tokenCount = estimateTokens(content);
       if (consumed + tokenCount > budget) {
         break;
@@ -490,7 +491,41 @@ export class ContextAssembler {
         tokenCount,
         content,
         metadata: {
-          layer: "durable_memory",
+          layer: "memory_item",
+          memoryItemId: memory.id,
+          kind: memory.kind,
+          tags: memory.tags,
+          projectId: memory.projectId,
+          topicId: memory.topicId,
+          recordStatus: memory.status,
+          evidenceLevel: memory.evidenceLevel,
+          contextPolicy: memory.contextPolicy,
+        },
+      });
+    }
+
+    return selected;
+  }
+
+  private memoryInputEntriesToContextItems(memories: MemoryItemDraftEntry[], budget: number): ContextItem[] {
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+
+    for (const memory of memories) {
+      const content = `[memory_item:${memory.kind}] ${memory.text}`;
+      const tokenCount = estimateTokens(content);
+      if (consumed + tokenCount > budget) {
+        break;
+      }
+
+      consumed += tokenCount;
+      selected.unshift({
+        kind: "summary",
+        tokenCount,
+        content,
+        metadata: {
+          layer: "memory_item",
+          memoryItemId: `memory-item:${memory.id}`,
           kind: memory.kind,
           tags: memory.tags,
           projectId: memory.projectId,

@@ -2,7 +2,7 @@
 import {
   ContextItem,
   ContextViewRepository,
-  DurableMemoryRepository,
+  MemoryItemDraftRepository,
   FixedPrefixProvider,
   RawMessageRepository,
   SummaryEntry,
@@ -97,7 +97,7 @@ const summaryStore: SummaryRepository = {
   async attachParent() {},
 };
 
-const durableMemoryStore: DurableMemoryRepository = {
+const memoryItemDraftStore: MemoryItemDraftRepository = {
   async init() {},
   async addEntries() { return 0; },
   async replaceAll() {},
@@ -111,7 +111,7 @@ async function main(): Promise<void> {
   const result = await assembler.assemble(
     rawStore,
     summaryStore,
-    durableMemoryStore,
+    memoryItemDraftStore,
     320,
     20,
     40,

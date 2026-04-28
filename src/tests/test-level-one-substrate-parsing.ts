@@ -40,7 +40,7 @@ const markdown = `
 - Should promotion require human review when conflicts are present?
 
 ## Conflicts / Ambiguities
-- Tool output can be source evidence, but raw tool payload should not be durable memory.
+- Tool output can be source evidence, but raw tool payload should not be MemoryItem.
 
 ## Candidate Evidence Atoms
 - constraint | Tool results must be scratch-only unless promoted into sourced facts.

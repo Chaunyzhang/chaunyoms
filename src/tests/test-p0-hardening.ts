@@ -1,4 +1,5 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 
 import { OpenClawBridge } from "../OpenClawBridge";
 import { DEFAULT_BRIDGE_CONFIG } from "../host/OpenClawHostServices";
@@ -65,6 +66,24 @@ function assertConfigValidation(): void {
     },
   }, DEFAULT_BRIDGE_CONFIG);
   assert(valid.config.semanticCandidateLimit === 0, "semanticCandidateLimit should allow zero");
+  assert(valid.config.retrievalStrength === DEFAULT_BRIDGE_CONFIG.retrievalStrength, "retrievalStrength should default from base config");
+
+  const finalShapeConfig = adapter.resolveLifecycleContext({
+    config: {
+      retrievalStrength: "forensic",
+      kbCandidateEnabled: false,
+      kbWriteEnabled: true,
+      kbPromotionMode: "manual",
+      kbPromotionStrictness: "medium",
+      kbExportEnabled: false,
+    },
+  }, DEFAULT_BRIDGE_CONFIG);
+  assert(finalShapeConfig.config.retrievalStrength === "forensic", "retrievalStrength should resolve as the single retrieval policy setting");
+  assert(finalShapeConfig.config.kbCandidateEnabled === false, "kbCandidateEnabled should be configurable independently");
+  assert(finalShapeConfig.config.kbWriteEnabled === true, "kbWriteEnabled should be configurable independently");
+  assert(finalShapeConfig.config.kbPromotionMode === "manual", "kbPromotionMode should resolve final-shape values");
+  assert(finalShapeConfig.config.kbPromotionStrictness === "medium", "kbPromotionStrictness should resolve final-shape values");
+  assert(finalShapeConfig.config.kbExportEnabled === false, "kbExportEnabled should be configurable independently");
 
   let failed = false;
   try {
@@ -80,6 +99,38 @@ function assertConfigValidation(): void {
   assert(failed, "invalid core config should fail with a clear validation error");
 }
 
+function assertNoScenarioAliasExpansion(): void {
+  const hotPathFiles = [
+    path.join(process.cwd(), "src", "data", "SQLiteRuntimeStore.ts"),
+    path.join(process.cwd(), "src", "resolvers", "RecallQueryAnalyzer.ts"),
+    path.join(process.cwd(), "src", "resolvers", "RawRecallResolver.ts"),
+  ];
+  const forbidden = [
+    "tennis",
+    "spotify",
+    "coupon",
+    "martini",
+    "ucla",
+    "golden retriever",
+    "cartwheel",
+    "sports store downtown",
+    "university of melbourne",
+    "data science",
+    "serenity yoga",
+  ];
+
+  for (const filePath of hotPathFiles) {
+    const source = readFileSync(filePath, "utf8").toLowerCase();
+    for (const term of forbidden) {
+      const pattern = new RegExp(
+        `\\b${term.split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+")}\\b`,
+        "i",
+      );
+      assert(!pattern.test(source), `${path.basename(filePath)} must not contain scenario-specific recall alias: ${term}`);
+    }
+  }
+}
+
 function assertPortablePaths(): void {
   const sharedDir = getDefaultSharedDataDir();
   const configPath = getOpenClawConfigPath();
@@ -92,6 +143,7 @@ async function main(): Promise<void> {
   assertSummaryMemoryIsUntrusted();
   assertConfigValidation();
   assertPortablePaths();
+  assertNoScenarioAliasExpansion();
   console.log("test-p0-hardening passed");
 }
 

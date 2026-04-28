@@ -40,7 +40,7 @@ export class KnowledgeIntakeGate {
       return this.reject("summary_missing_source_boundary");
     }
 
-    const durableSignalCount = [
+    const memoryItemSignalCount = [
       summary.decisions.length > 0,
       summary.constraints.length > 0,
       summary.exactFacts.length > 0,
@@ -48,7 +48,7 @@ export class KnowledgeIntakeGate {
     ].filter(Boolean).length;
     const hasStrongPromotionIntent =
       promotionIntent === "promote" || promotionIntent === "priority_promote";
-    const hasDurableType = [
+    const hasMemoryItemType = [
       "decision",
       "constraint",
       "diagnostic",
@@ -60,7 +60,7 @@ export class KnowledgeIntakeGate {
       memoryType === "project_state" &&
       !config.knowledgeIntakeAllowProjectState &&
       !hasStrongPromotionIntent &&
-      durableSignalCount < thresholds.projectStateSignals
+      memoryItemSignalCount < thresholds.projectStateSignals
     ) {
       return this.reject("project_state_summary_stays_in_asset_layer");
     }
@@ -73,11 +73,11 @@ export class KnowledgeIntakeGate {
       return this.accept("project_state_allowed_by_intake_policy");
     }
 
-    if (hasDurableType && durableSignalCount >= thresholds.durableSignals) {
-      return this.accept("summary_has_durable_memory_type_signal");
+    if (hasMemoryItemType && memoryItemSignalCount >= thresholds.memoryItemSignals) {
+      return this.accept("summary_has_memory_item_type_signal");
     }
 
-    if (durableSignalCount >= thresholds.generalSignals) {
+    if (memoryItemSignalCount >= thresholds.generalSignals) {
       return this.accept("summary_has_sufficient_structured_long_term_signals");
     }
 
@@ -100,27 +100,27 @@ export class KnowledgeIntakeGate {
 
   private resolveThresholds(mode: BridgeConfig["knowledgeIntakeMode"]): {
     generalSignals: number;
-    durableSignals: number;
+    memoryItemSignals: number;
     projectStateSignals: number;
   } {
     switch (mode) {
       case "conservative":
         return {
           generalSignals: 3,
-          durableSignals: 2,
+          memoryItemSignals: 2,
           projectStateSignals: 3,
         };
       case "aggressive":
         return {
           generalSignals: 1,
-          durableSignals: 1,
+          memoryItemSignals: 1,
           projectStateSignals: 1,
         };
       case "balanced":
       default:
         return {
           generalSignals: 2,
-          durableSignals: 1,
+          memoryItemSignals: 1,
           projectStateSignals: 2,
         };
     }

@@ -1,5 +1,5 @@
 import { ContextAssembler } from "../engines/ContextAssembler";
-import { ContextItem, ContextViewRepository, DurableMemoryRepository, FixedPrefixProvider, RawMessageRepository, SummaryRepository } from "../types";
+import { ContextItem, ContextViewRepository, MemoryItemDraftRepository, FixedPrefixProvider, RawMessageRepository, SummaryRepository } from "../types";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
@@ -201,7 +201,7 @@ const summaryStore: SummaryRepository = {
   async attachParent() {},
 };
 
-const durableMemoryStore: DurableMemoryRepository = {
+const memoryItemDraftStore: MemoryItemDraftRepository = {
   async init() {},
   async addEntries() {
     return 0;
@@ -240,7 +240,7 @@ async function main(): Promise<void> {
   const result = await assembler.assemble(
     rawStore,
     summaryStore,
-    durableMemoryStore,
+    memoryItemDraftStore,
     400,
     0,
     80,
@@ -253,8 +253,8 @@ async function main(): Promise<void> {
     if (typeof item.metadata?.layer === "string") {
       return item.metadata.layer;
     }
-    if (typeof item.content === "string" && item.content.startsWith("[durable_memory:")) {
-      return "durable_memory";
+    if (typeof item.content === "string" && item.content.startsWith("[memory_item:")) {
+      return "memory_item";
     }
     if (typeof item.summaryId === "string") {
       return "summaries";
@@ -267,7 +267,7 @@ async function main(): Promise<void> {
 
   assert(
     labels.join(" > ") ===
-      "shared_cognition > navigation > oms_recall_guidance > durable_memory > summaries > knowledge_base_index > recent_tail",
+      "shared_cognition > navigation > oms_recall_guidance > memory_item > summaries > knowledge_base_index > recent_tail",
     `unexpected assembly order: ${labels.join(" > ")}`,
   );
 

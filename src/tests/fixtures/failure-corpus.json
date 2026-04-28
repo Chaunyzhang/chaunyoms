@@ -15,10 +15,10 @@
     "kind": "standard_no_authority",
     "query": "something related to architecture docs in the knowledge base",
     "expectedTextIncludes": [
-      "No standard retrieval hit found"
+      "No SQLite knowledge assets matched query"
     ],
     "expectedDetails": {
-      "retrievalHitType": "recent_tail"
+      "retrievalHitType": "knowledge"
     }
   }
 ]

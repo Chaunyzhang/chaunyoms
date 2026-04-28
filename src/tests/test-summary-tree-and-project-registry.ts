@@ -128,10 +128,10 @@ async function main(): Promise<void> {
   assert(project.summaryIds.length > 0, "expected project registry to link summaries");
   assert(project.title.length > 0, "expected project registry to carry a title");
 
-  const projectStateEntries = stores.durableMemoryStore
+  const projectStateEntries = stores.memoryItemDraftStore
     .getAll()
     .filter((entry) => entry.kind === "project_state");
-  assert(projectStateEntries.length > 0, "expected compaction-triggered navigation writes to emit project_state durable memories");
+  assert(projectStateEntries.length > 0, "expected compaction-triggered navigation writes to emit project_state MemoryItem drafts");
   const activeProjectStateEntries = projectStateEntries.filter((entry) => entry.recordStatus === "active");
   assert(activeProjectStateEntries.length === 1, "expected only the newest project_state memory to remain active");
 

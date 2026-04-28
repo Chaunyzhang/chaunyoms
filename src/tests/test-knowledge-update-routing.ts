@@ -94,7 +94,7 @@ async function main(): Promise<void> {
   await turn(2, "Correction: QUEUE_WINDOW=7m is the current setting now.", "Updated current queue window to 7m.");
 
   const stores = await runtime.getSessionStores({ sessionId: config.sessionId, config });
-  const factEntries = stores.durableMemoryStore
+  const factEntries = stores.memoryItemDraftStore
     .getAll()
     .filter((entry) => entry.metadata?.factKey === "QUEUE_WINDOW");
   assert(factEntries.length >= 2, "expected extracted fact entries for queue window history");
@@ -129,7 +129,9 @@ async function main(): Promise<void> {
     query: "what is the current exact QUEUE_WINDOW now",
   });
   const text = String(result.content[0]?.text ?? "");
-  assert(result.details.route === "durable_memory", "expected current exact fact to route to durable memory");
+  assert(result.details.route === "memory_item", "expected current exact fact to route to MemoryItem");
+  assert(result.details.topRecordType === "memory_item", "expected MemoryItem retrieval to use the MemoryItem record as its primary record");
+  assert(Number(result.details.memoryItemHitCount ?? 0) > 0, "expected MemoryItem retrieval to report MemoryItem hits");
   assert(/QUEUE_WINDOW=7m/i.test(text), "expected updated fact to be returned");
   assert(!/QUEUE_WINDOW=3m/i.test(text), "expected stale fact not to appear in the primary answer");
 

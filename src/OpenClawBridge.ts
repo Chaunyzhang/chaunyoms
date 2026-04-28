@@ -213,6 +213,12 @@ export class OpenClawBridge {
             description:
               "Retrieval scope. Defaults to agent-wide memory; use session only for deliberately narrow current-session recall.",
           },
+          retrievalStrength: {
+            type: "string",
+            enum: ["off", "light", "auto", "strict", "forensic"],
+            description:
+              "Optional per-call override for the single retrieval policy knob: depth, source trace, and evidence presentation.",
+          },
         },
         required: ["query"],
         additionalProperties: false,
@@ -302,6 +308,52 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsBackup(args),
+    );
+
+    register(
+      "oms_agent_export",
+      "Export a full Agent Capsule for the current agent, including capsule.sqlite, capsule.sql, checksums, restore instructions, complete Source, summaries, MemoryItems, and trace metadata.",
+      {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Current agent id. Defaults to configured agentId." },
+          label: { type: "string", description: "Optional short capsule label." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAgentExport(args),
+    );
+
+    register(
+      "oms_agent_verify",
+      "Verify a full Agent Capsule manifest, required files, complete-source declaration, and checksums.",
+      {
+        type: "object",
+        properties: {
+          capsulePath: { type: "string", description: "Capsule directory under dataDir/agent_capsules." },
+        },
+        required: ["capsulePath"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAgentVerify(args),
+    );
+
+    register(
+      "oms_agent_import",
+      "Dry-run or apply a full Agent Capsule import. Defaults to dry-run; apply=true replaces the current agent SQLite after a backup.",
+      {
+        type: "object",
+        properties: {
+          capsulePath: { type: "string", description: "Capsule directory under dataDir/agent_capsules." },
+          apply: { type: "boolean", description: "When true, apply the import. Defaults to false." },
+        },
+        required: ["capsulePath"],
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsAgentImport(args),
     );
 
     register(

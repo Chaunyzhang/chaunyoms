@@ -5,7 +5,7 @@ const CURRENT_FACT_RE = /(current|latest|now|currently|updated|correction|after 
 const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未解决|阻塞|决策|status|state|progress|next step|next action|todo|pending|blocker|blocked|decision|where we left off)/i;
 const CURRENT_WORK_RE = /(这个项目|当前任务|当前工作|这件事|我们现在|当前主线|this project|current task|current work|our work|what we are doing)/i;
 const HISTORY_RE = /(历史|之前|回溯|回忆|原文|历史对话|summary|history|what happened earlier|why did we)/i;
-const DURABLE_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
+const MEMORY_ITEM_RE = /(长期约束|长期决策|约束|限制|配置|规则|记住|must|constraint|decision|rule|setting|config)/i;
 const KNOWLEDGE_BASE_RE = /(knowledge[- ]?base|知识库|文档|资料|topic-index|architecture docs?)/i;
 const KNOWLEDGE_ADVISORY_RE = /(想想|发散|灵感|创造力|创意|知识广度|经验|学习|借鉴|参考|最佳实践|案例|模式|lesson|learn|learning|experience|inspiration|creative|creativity|brainstorm|broaden|best practice|pattern|example|case study)/i;
 const RAW_KNOWLEDGE_RE = /(raw knowledge|raw notes|manual knowledge|manual notes|原始知识|原始资料|手动知识|手动资料|手动笔记)/i;
@@ -22,7 +22,7 @@ export interface RouteContext {
   hasKnowledgeRawHint?: boolean;
   hasCompactedHistory?: boolean;
   hasProjectRegistry?: boolean;
-  hasDurableHits?: boolean;
+  hasMemoryItemHits?: boolean;
   recentAssistantUncertainty?: boolean;
   queryComplexity?: "low" | "medium" | "high";
   referencesCurrentWork?: boolean;
@@ -45,7 +45,7 @@ export class MemoryRetrievalRouter {
     const asksProjectState = PROJECT_STATE_RE.test(normalized);
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(normalized);
     const asksHistory = HISTORY_RE.test(normalized);
-    const asksDurable = DURABLE_RE.test(normalized);
+    const asksMemoryItem = MEMORY_ITEM_RE.test(normalized);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(normalized);
     const asksKnowledgeAdvisory = KNOWLEDGE_ADVISORY_RE.test(normalized);
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(normalized);
@@ -57,35 +57,35 @@ export class MemoryRetrievalRouter {
       !asksCurrentFact &&
       !mentionsKnowledge &&
       !asksRawKnowledge &&
-      !asksDurable &&
+      !asksMemoryItem &&
       !complexTask &&
       !(asksProjectState && explicitProjectState);
 
-    if (asksDurable && context.hasDurableHits) {
+    if (asksMemoryItem && context.hasMemoryItemHits) {
       return this.decision(
-        "durable_memory",
-        context.matchedProjectId ? "matched_project_durable_memory_query" : "durable_memory_query",
+        "memory_item",
+        context.matchedProjectId ? "matched_project_memory_item_query" : "memory_item_query",
         false,
         false,
         true,
-        ["durable_memory", "recent_tail"],
+        ["memory_item", "recent_tail"],
         context.matchedProjectTitle
-          ? `The query asks for stable constraints/decisions, so durable memory is the primary layer for the matched project (${context.matchedProjectTitle}).`
-          : "The query asks for stable constraints/decisions, so durable memory is the primary layer.",
+          ? `The query asks for stable constraints/decisions, so MemoryItem is the primary layer for the matched project (${context.matchedProjectTitle}).`
+          : "The query asks for stable constraints/decisions, so MemoryItem is the primary layer.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
     }
 
-    if (needsFacts && asksCurrentFact && context.hasDurableHits) {
+    if (needsFacts && asksCurrentFact && context.hasMemoryItemHits) {
       return this.decision(
-        "durable_memory",
-        "current_fact_prefers_active_durable_memory",
+        "memory_item",
+        "current_fact_prefers_active_memory_item",
         false,
         false,
         true,
-        ["durable_memory", "summary_tree"],
-        "The query asks for the current/latest fact value, so active durable memory should outrank older summary recall.",
+        ["memory_item", "summary_tree"],
+        "The query asks for the current/latest fact value, so active MemoryItem records should outrank older summary recall.",
         context.matchedProjectId,
         context.matchedProjectTitle,
       );
@@ -126,7 +126,7 @@ export class MemoryRetrievalRouter {
         false,
         false,
         true,
-        ["project_registry", "durable_memory", "recent_tail"],
+        ["project_registry", "memory_item", "recent_tail"],
         context.matchedProjectTitle
           ? `The query is about project state, so route to the project registry first (matched project: ${context.matchedProjectTitle}).`
           : "The query is about project state, so route to the project registry first.",
@@ -142,7 +142,7 @@ export class MemoryRetrievalRouter {
         false,
         false,
         true,
-        ["project_registry", "durable_memory", "recent_tail"],
+        ["project_registry", "memory_item", "recent_tail"],
         "The query is coordinating current work, so prefer structured project state before raw history.",
         context.matchedProjectId,
         context.matchedProjectTitle,
@@ -201,8 +201,8 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if (context.hasDurableHits && /(remember|constraint|decision|config|rule|长期|约束|决策|配置)/i.test(normalized)) {
-      return this.decision("durable_memory", "fallback_durable_memory_match", false, false, true, ["durable_memory", "recent_tail"], "Durable memory contains matching stable facts, so use it before the volatile recent tail.", context.matchedProjectId, context.matchedProjectTitle);
+    if (context.hasMemoryItemHits && /(remember|constraint|decision|config|rule|长期|约束|决策|配置)/i.test(normalized)) {
+      return this.decision("memory_item", "fallback_memory_item_match", false, false, true, ["memory_item", "recent_tail"], "MemoryItem contains matching stable facts, so use it before the volatile recent tail.", context.matchedProjectId, context.matchedProjectTitle);
     }
 
     return this.decision("recent_tail", "default_recent_tail", false, false, true, ["recent_tail"], "No higher-priority structured route matched, so answer from the recent tail.");
@@ -252,7 +252,7 @@ export class MemoryRetrievalRouter {
     const asksProjectState = PROJECT_STATE_RE.test(query);
     const referencesCurrentWork = context.referencesCurrentWork ?? CURRENT_WORK_RE.test(query);
     const asksHistory = HISTORY_RE.test(query);
-    const asksDurable = DURABLE_RE.test(query);
+    const asksMemoryItem = MEMORY_ITEM_RE.test(query);
     const mentionsKnowledge = KNOWLEDGE_BASE_RE.test(query);
     const asksKnowledgeAdvisory = KNOWLEDGE_ADVISORY_RE.test(query);
     const asksRawKnowledge = RAW_KNOWLEDGE_RE.test(query);
@@ -260,7 +260,7 @@ export class MemoryRetrievalRouter {
     const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
 
     if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
-    if (needsFacts && asksCurrentFact) add("durable_memory", 6, "current_fact_terms");
+    if (needsFacts && asksCurrentFact) add("memory_item", 6, "current_fact_terms");
     if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
     if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");
     if (
@@ -268,7 +268,7 @@ export class MemoryRetrievalRouter {
       this.keywordLookupTerms(query).length >= 4 &&
       !mentionsKnowledge &&
       !asksRawKnowledge &&
-      !asksDurable &&
+      !asksMemoryItem &&
       !complexTask &&
       !(asksProjectState && explicitProjectState)
     ) {
@@ -280,9 +280,9 @@ export class MemoryRetrievalRouter {
     if (context.hasProjectRegistry) add("project_registry", 2, "project_registry_available");
     if (context.matchedProjectId) add("project_registry", 3, "matched_project");
 
-    if (asksDurable) add("durable_memory", 7, "durable_terms");
-    if (context.hasDurableHits) add("durable_memory", 4, "durable_hits_available");
-    if (context.matchedProjectId && context.hasDurableHits) add("durable_memory", 2, "matched_project_durable_hits");
+    if (asksMemoryItem) add("memory_item", 7, "memory_item_terms");
+    if (context.hasMemoryItemHits) add("memory_item", 4, "memory_item_hits_available");
+    if (context.matchedProjectId && context.hasMemoryItemHits) add("memory_item", 2, "matched_project_memory_item_hits");
 
     if (mentionsKnowledge) add("knowledge", 8, "knowledge_terms");
     if (asksKnowledgeAdvisory) add("knowledge", 5, "knowledge_advisory_terms");
@@ -291,7 +291,7 @@ export class MemoryRetrievalRouter {
     if (context.hasKnowledgeRawHint) add("knowledge", 3, "knowledge_raw_hint");
 
     add("recent_tail", 1, "default_available");
-    if (!needsFacts && !asksHistory && !mentionsKnowledge && !asksKnowledgeAdvisory && !asksDurable && !asksProjectState) {
+    if (!needsFacts && !asksHistory && !mentionsKnowledge && !asksKnowledgeAdvisory && !asksMemoryItem && !asksProjectState) {
       add("recent_tail", 3, "no_structured_signal");
     }
 

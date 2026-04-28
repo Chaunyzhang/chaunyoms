@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -52,7 +53,7 @@ export class OmsAdminService {
     const scopedQuery = scope === "session" ? { sessionId: context.sessionId } : undefined;
     const rawMessages = stores.rawStore.getAll(scopedQuery);
     const summaries = stores.summaryStore.getAllSummaries(scopedQuery);
-    const durableMemories = stores.durableMemoryStore.getAll();
+    const memoryItemDrafts = stores.memoryItemDraftStore.getAll();
     const evidenceAtoms = stores.evidenceAtomStore.getAll(scopedQuery);
     const knowledgeRawItems = stores.knowledgeRawStore.getAll();
     return {
@@ -71,8 +72,8 @@ export class OmsAdminService {
         summaries: summaries.length,
         summaryTokens: stores.summaryStore.getTotalTokens(scopedQuery),
         observations: stores.observationStore.count(),
-        durableMemories: durableMemories.length,
-        activeDurableMemories: durableMemories.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
+        memoryItemDrafts: memoryItemDrafts.length,
+        activeMemoryItemDrafts: memoryItemDrafts.filter((memory) => memory.recordStatus !== "superseded" && memory.recordStatus !== "archived").length,
         evidenceAtoms: evidenceAtoms.length,
         knowledgeRawItems: knowledgeRawItems.length,
         pendingKnowledgeRawItems: knowledgeRawItems.filter((entry) => entry.status === "review_pending" || entry.status === "pending" || entry.status === "processing").length,
@@ -88,16 +89,20 @@ export class OmsAdminService {
         strictCompaction: context.config.strictCompaction,
         compactionBarrierEnabled: context.config.compactionBarrierEnabled,
         runtimeCaptureEnabled: context.config.runtimeCaptureEnabled,
-        durableMemoryEnabled: context.config.durableMemoryEnabled,
+        memoryItemEnabled: context.config.memoryItemEnabled,
         autoRecallEnabled: context.config.autoRecallEnabled,
+        retrievalStrength: context.config.retrievalStrength,
         knowledgePromotionEnabled: context.config.knowledgePromotionEnabled,
         knowledgePromotionManualReviewEnabled: context.config.knowledgePromotionManualReviewEnabled,
+        kbCandidateEnabled: context.config.kbCandidateEnabled,
+        kbWriteEnabled: context.config.kbWriteEnabled,
+        kbPromotionMode: context.config.kbPromotionMode,
+        kbPromotionStrictness: context.config.kbPromotionStrictness,
+        kbExportEnabled: context.config.kbExportEnabled,
         semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
         semanticCandidateLimit: context.config.semanticCandidateLimit,
         emergencyBrake: context.config.emergencyBrake,
         sqliteJournalMode: context.config.sqliteJournalMode,
-        sqlitePrimaryEnabled: context.config.sqlitePrimaryEnabled,
-        jsonPersistenceMode: context.config.jsonPersistenceMode,
       },
       runtimeStore: this.deps.sessionData.getRuntimeStore().getStatus(),
       lastCompactionDiagnostics: this.deps.getLastCompactionDiagnostics() as OmsRuntimeStatus["lastCompactionDiagnostics"],
@@ -136,6 +141,211 @@ export class OmsAdminService {
       runtimeStore,
       warnings,
       errors,
+    };
+  }
+
+  async exportAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { agentId?: string; label?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    const stores = await this.deps.ensureSession(context.sessionId, context.config);
+    await this.deps.sessionData.mirrorRuntimeState();
+    const agentId = (options.agentId || context.config.agentId).trim();
+    if (!agentId || agentId !== context.config.agentId) {
+      return {
+        ok: false,
+        agentId,
+        reason: "Only the current configured agent can be exported by this runtime instance.",
+      };
+    }
+
+    const safeLabel = (options.label ?? "").trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const capsuleDir = path.join(context.config.dataDir, "agent_capsules", agentId, `${stamp}${safeLabel ? `-${safeLabel}` : ""}`);
+    await mkdir(capsuleDir, { recursive: true });
+
+    const runtimeStore = this.deps.sessionData.getRuntimeStore();
+    const runtimeStatus = runtimeStore.getStatus();
+    const capsuleSqlite = path.join(capsuleDir, "capsule.sqlite");
+    const capsuleSql = path.join(capsuleDir, "capsule.sql");
+    const manifestPath = path.join(capsuleDir, "manifest.json");
+    const checksumsPath = path.join(capsuleDir, "checksums.txt");
+    const restorePath = path.join(capsuleDir, "README.restore.txt");
+
+    const copied: string[] = [];
+    const skipped: string[] = [];
+    if (await this.copyIfPresent(runtimeStatus.dbPath, capsuleSqlite)) {
+      copied.push("capsule.sqlite");
+    } else {
+      skipped.push("capsule.sqlite");
+    }
+
+    const rawMessages = stores.rawStore.getAll();
+    const summaries = stores.summaryStore.getAllSummaries();
+    const memoryItemDrafts = stores.memoryItemDraftStore.getAll();
+    const evidenceAtoms = stores.evidenceAtomStore.getAll();
+    const knowledgeRaw = stores.knowledgeRawStore.getAll();
+    const memoryItems = runtimeStore.listMemoryItems({ agentId });
+    const verify = await this.verify(context, { scope: "agent" });
+    const manifest = {
+      schemaVersion: 1,
+      capsuleKind: "full_agent_capsule",
+      createdAt: new Date().toISOString(),
+      agentId,
+      sessionId: context.sessionId,
+      runtimeSchema: "sqlite-first",
+      includes: {
+        completeSource: true,
+        sqlite: copied.includes("capsule.sqlite"),
+        sqlText: true,
+        sourceTrace: true,
+        memoryItems: true,
+      },
+      counts: {
+        rawMessages: rawMessages.length,
+        summaries: summaries.length,
+        memoryItemDrafts: memoryItemDrafts.length,
+        evidenceAtoms: evidenceAtoms.length,
+        knowledgeRaw: knowledgeRaw.length,
+        memoryItems: memoryItems.length,
+        sourceEdges: runtimeStatus.counts.sourceEdges,
+        traceEdges: runtimeStatus.counts.traceEdges,
+      },
+      config: {
+        agentId: context.config.agentId,
+        retrievalStrength: context.config.retrievalStrength,
+        kbPromotionMode: context.config.kbPromotionMode,
+        kbPromotionStrictness: context.config.kbPromotionStrictness,
+      },
+      verify: {
+        ok: verify.ok,
+        warnings: verify.warnings,
+        errors: verify.errors,
+      },
+    };
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    await writeFile(capsuleSql, [
+      "-- ChaunyOMS full Agent Capsule text manifest",
+      `-- agent_id: ${agentId}`,
+      `-- created_at: ${manifest.createdAt}`,
+      "-- The authoritative restore artifact is capsule.sqlite; this file is for Git-visible review.",
+      `-- counts: ${JSON.stringify(manifest.counts)}`,
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(restorePath, [
+      "# Restore ChaunyOMS Agent Capsule",
+      "",
+      "1. Verify first with `oms_agent_verify`.",
+      "2. Import defaults to dry-run. Use `oms_agent_import` with `apply=true` only after backup review.",
+      "3. `capsule.sqlite` is the complete runtime brain package for this agent and contains the Source ledger plus traceable summaries/memory.",
+      "4. Markdown/Obsidian exports are not part of the runtime brain and should remain a separate Git repository.",
+      "",
+    ].join("\n"), "utf8");
+    const checksums = await this.buildChecksums([manifestPath, capsuleSql, capsuleSqlite, restorePath]);
+    await writeFile(checksumsPath, checksums.join("\n") + "\n", "utf8");
+
+    return {
+      ok: copied.includes("capsule.sqlite") && verify.ok,
+      capsuleDir,
+      manifestPath,
+      checksumsPath,
+      agentId,
+      copied,
+      skipped,
+      counts: manifest.counts,
+      warnings: verify.warnings,
+      errors: verify.errors,
+    };
+  }
+
+  async verifyAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    capsulePathInput: string,
+  ): Promise<Record<string, unknown>> {
+    const capsuleDir = path.resolve(capsulePathInput);
+    const allowedRoot = path.resolve(context.config.dataDir, "agent_capsules");
+    if (!this.isPathInside(capsuleDir, allowedRoot)) {
+      return {
+        ok: false,
+        capsuleDir,
+        errors: ["capsulePath must be inside dataDir/agent_capsules for this runtime."],
+        warnings: [],
+      };
+    }
+    const manifestPath = path.join(capsuleDir, "manifest.json");
+    const checksumsPath = path.join(capsuleDir, "checksums.txt");
+    const sqlitePath = path.join(capsuleDir, "capsule.sqlite");
+    const sqlPath = path.join(capsuleDir, "capsule.sql");
+    const restorePath = path.join(capsuleDir, "README.restore.txt");
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    let manifest: Record<string, unknown> | null = null;
+    try {
+      manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    } catch (error) {
+      errors.push(`manifest.json missing or invalid: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const filePath of [sqlitePath, sqlPath, restorePath, checksumsPath]) {
+      try {
+        await readFile(filePath);
+      } catch {
+        errors.push(`${path.basename(filePath)} is missing`);
+      }
+    }
+    if (manifest && this.asRecord(manifest.includes).completeSource !== true) {
+      errors.push("manifest does not declare completeSource=true");
+    }
+    const counts = manifest ? this.asRecord(manifest.counts) : {};
+    if (Number(counts.rawMessages ?? 0) <= 0) {
+      warnings.push("capsule has zero raw Source messages; this may be valid for a new agent but is not a useful full brain export.");
+    }
+    if (errors.length === 0) {
+      const expected = await readFile(checksumsPath, "utf8");
+      const checksumErrors = await this.verifyChecksums(capsuleDir, expected);
+      errors.push(...checksumErrors);
+    }
+    return {
+      ok: errors.length === 0,
+      capsuleDir,
+      manifest,
+      counts,
+      errors,
+      warnings,
+    };
+  }
+
+  async importAgentCapsule(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    capsulePathInput: string,
+    apply = false,
+  ): Promise<Record<string, unknown>> {
+    const verification = await this.verifyAgentCapsule(context, capsulePathInput);
+    if (!verification.ok) {
+      return {
+        ok: false,
+        apply,
+        verification,
+        reason: "capsule_verification_failed",
+      };
+    }
+    if (!apply) {
+      return {
+        ok: true,
+        apply,
+        verification,
+        warnings: ["Dry run only. Re-run with apply=true to replace the current agent runtime SQLite with capsule.sqlite."],
+      };
+    }
+    const backup = await this.backup(context, `pre-capsule-import-${context.config.agentId}`);
+    const target = this.deps.sessionData.getRuntimeStore().getPath();
+    await cp(path.join(String(verification.capsuleDir), "capsule.sqlite"), target, { force: true });
+    return {
+      ok: true,
+      apply,
+      verification,
+      backupDir: backup.backupDir,
+      imported: ["capsule.sqlite"],
+      target,
     };
   }
 
@@ -187,7 +397,7 @@ export class OmsAdminService {
     const runtimeStatus = this.deps.sessionData.getRuntimeStore().getStatus();
     const rawMessages = stores.rawStore.getAll();
     const summaries = stores.summaryStore.getAllSummaries();
-    const memories = stores.durableMemoryStore.getAll();
+    const memories = stores.memoryItemDraftStore.getAll();
     const atoms = stores.evidenceAtomStore.getAll();
     const comparisons = {
       messages: { repository: rawMessages.length, sqlite: runtimeStatus.counts.messages },
@@ -200,14 +410,11 @@ export class OmsAdminService {
       .map(([key, value]) => `${key}: repository=${value.repository} sqlite=${value.sqlite}`);
     return {
       ok: runtimeStatus.enabled && mismatches.length === 0,
-      mode: context.config.sqlitePrimaryEnabled ? "sqlite_primary" : "legacy_json_primary",
-      jsonPersistenceMode: context.config.jsonPersistenceMode,
+      mode: "sqlite_primary",
       comparisons,
       runtimeStore: runtimeStatus,
       errors: mismatches,
-      warnings: context.config.sqlitePrimaryEnabled
-        ? []
-        : ["sqlitePrimaryEnabled=false: verification compared the legacy repository mirror against SQLite, not a SQLite primary repository."],
+      warnings: [],
     };
   }
 
@@ -224,7 +431,7 @@ export class OmsAdminService {
     const files = {
       raw: path.join(exportDir, "raw-messages.json"),
       summaries: path.join(exportDir, "summaries.json"),
-      durableMemories: path.join(exportDir, "durable-memories.json"),
+      memoryItemDrafts: path.join(exportDir, "memory-item-drafts.json"),
       evidenceAtoms: path.join(exportDir, "evidence-atoms.json"),
       observations: path.join(exportDir, "observations.json"),
       projects: path.join(exportDir, "projects.json"),
@@ -232,7 +439,7 @@ export class OmsAdminService {
     };
     await writeFile(files.raw, JSON.stringify(stores.rawStore.getAll(), null, 2), "utf8");
     await writeFile(files.summaries, JSON.stringify(stores.summaryStore.getAllSummaries(), null, 2), "utf8");
-    await writeFile(files.durableMemories, JSON.stringify(stores.durableMemoryStore.getAll(), null, 2), "utf8");
+    await writeFile(files.memoryItemDrafts, JSON.stringify(stores.memoryItemDraftStore.getAll(), null, 2), "utf8");
     await writeFile(files.evidenceAtoms, JSON.stringify(stores.evidenceAtomStore.getAll(), null, 2), "utf8");
     await writeFile(files.observations, JSON.stringify(stores.observationStore.getAll(), null, 2), "utf8");
     await writeFile(files.projects, JSON.stringify(stores.projectStore.getAll(), null, 2), "utf8");
@@ -258,7 +465,7 @@ export class OmsAdminService {
       /\.raw\.jsonl$/i,
       /\.summaries\.json$/i,
       /\.observations\.jsonl$/i,
-      /\.durable-memory\.json$/i,
+      /\.memory-item-draft\.json$/i,
       /\.knowledge-raw\.json$/i,
       /\.evidence-atoms\.json$/i,
       /^project-registry\.json$/i,
@@ -605,6 +812,55 @@ export class OmsAdminService {
       { label: "agent_vault", source: path.join(backupDir, "agent_vault"), target: path.join(config.memoryVaultDir, "agents", config.agentId) },
       { label: "workspace_memory", source: path.join(backupDir, "workspace_memory"), target: path.join(config.workspaceDir, "memory") },
     ];
+  }
+
+  private async buildChecksums(filePaths: string[]): Promise<string[]> {
+    const rows: string[] = [];
+    for (const filePath of filePaths) {
+      try {
+        const content = await readFile(filePath);
+        rows.push(`${this.sha256(content)}  ${path.basename(filePath)}`);
+      } catch {
+        // Missing optional files are reflected in the manifest skipped list.
+      }
+    }
+    return rows;
+  }
+
+  private async verifyChecksums(capsuleDir: string, checksumsText: string): Promise<string[]> {
+    const errors: string[] = [];
+    for (const line of checksumsText.split(/\r?\n/)) {
+      const match = line.match(/^([a-f0-9]{64})\s+(.+)$/i);
+      if (!match) {
+        continue;
+      }
+      const expected = match[1].toLowerCase();
+      const fileName = match[2].trim();
+      try {
+        const actual = this.sha256(await readFile(path.join(capsuleDir, fileName)));
+        if (actual !== expected) {
+          errors.push(`${fileName} checksum mismatch`);
+        }
+      } catch {
+        errors.push(`${fileName} listed in checksums.txt but missing`);
+      }
+    }
+    return errors;
+  }
+
+  private sha256(content: Buffer): string {
+    return createHash("sha256").update(content).digest("hex");
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }
+
+  private isPathInside(candidatePath: string, allowedRoot: string): boolean {
+    const relative = path.relative(allowedRoot, candidatePath);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   }
 
   private async copyIfPresent(source: string, target: string): Promise<boolean> {

@@ -10,8 +10,8 @@ function assert(condition: unknown, message: string): void {
   }
 }
 
-function hasKnowledgeBaseIndex(items: Array<{ metadata?: Record<string, unknown> }>): boolean {
-  return items.some((item) => item.metadata?.layer === "knowledge_base_index");
+function hasLayer(items: Array<{ metadata?: Record<string, unknown> }>, layer: string): boolean {
+  return items.some((item) => item.metadata?.layer === layer);
 }
 
 async function main(): Promise<void> {
@@ -19,10 +19,13 @@ async function main(): Promise<void> {
   const sharedDataDir = path.join(dir, "shared");
   const workspaceDir = path.join(dir, "workspace");
   const knowledgeBaseDir = path.join(sharedDataDir, "knowledge-base");
+  const principlesDir = path.join(sharedDataDir, "global-principles");
 
   await mkdir(knowledgeBaseDir, { recursive: true });
+  await mkdir(principlesDir, { recursive: true });
   await mkdir(path.join(workspaceDir, "memory"), { recursive: true });
 
+  await writeFile(path.join(principlesDir, "PRINCIPLES.md"), "Only shared principles belong here.\n", "utf8");
   await writeFile(
     path.join(knowledgeBaseDir, "topic-index.json"),
     JSON.stringify(
@@ -49,36 +52,21 @@ async function main(): Promise<void> {
   const store = new StablePrefixStore();
 
   const nonDocQuery = await store.load(sharedDataDir, workspaceDir, 200, {
-    activeQuery: "继续修当前 bug，把测试补上。",
+    activeQuery: "continue fixing the current bug and add tests",
   });
-  assert(
-    !hasKnowledgeBaseIndex(nonDocQuery),
-    "expected knowledge base index to stay hidden for non-reference work",
-  );
+  assert(hasLayer(nonDocQuery, "global_principles"), "expected global principles to be available as the only shared runtime prefix");
+  assert(!hasLayer(nonDocQuery, "shared_cognition"), "expected legacy shared cognition not to be injected as a broad shared memory layer");
+  assert(!hasLayer(nonDocQuery, "knowledge_base_index"), "expected knowledge-base index to stay out of the runtime hot path");
 
   const explicitDocQuery = await store.load(sharedDataDir, workspaceDir, 200, {
-    activeQuery: "看一下知识库里的架构文档",
+    activeQuery: "review the architecture docs in the knowledge base",
   });
-  assert(
-    hasKnowledgeBaseIndex(explicitDocQuery),
-    "expected knowledge base index to appear for explicit document queries",
-  );
+  assert(!hasLayer(explicitDocQuery, "knowledge_base_index"), "expected explicit doc queries to use SQLite retrieval/admin paths, not stable-prefix Markdown injection");
 
   const topicLookupQuery = await store.load(sharedDataDir, workspaceDir, 200, {
-    activeQuery: "找一下 queue retry policy",
+    activeQuery: "find queue retry policy",
   });
-  assert(
-    hasKnowledgeBaseIndex(topicLookupQuery),
-    "expected knowledge base index to appear for topic lookup queries with index hits",
-  );
-
-  const topicOnlyQuery = await store.load(sharedDataDir, workspaceDir, 200, {
-    activeQuery: "queue retry policy 怎么改",
-  });
-  assert(
-    !hasKnowledgeBaseIndex(topicOnlyQuery),
-    "expected knowledge base index to stay hidden when only the topic name is mentioned without doc-seeking intent",
-  );
+  assert(!hasLayer(topicLookupQuery, "knowledge_base_index"), "expected topic lookup queries not to inject Markdown index into model context");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-knowledge-base-index-exposure passed");

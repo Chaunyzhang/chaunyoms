@@ -1,18 +1,11 @@
 import path from "node:path";
 import { rm } from "node:fs/promises";
 
-import { DurableMemoryStore } from "../stores/DurableMemoryStore";
-import { EvidenceAtomStore } from "../stores/EvidenceAtomStore";
-import { KnowledgeRawStore } from "../stores/KnowledgeRawStore";
 import { KnowledgeMarkdownStore } from "../stores/KnowledgeMarkdownStore";
-import { ObservationStore } from "../stores/ObservationStore";
-import { ProjectRegistryStore } from "../stores/ProjectRegistryStore";
-import { RawMessageStore } from "../stores/RawMessageStore";
 import { RuntimeStatsLogStore } from "../stores/RuntimeStatsLogStore";
-import { SummaryIndexStore } from "../stores/SummaryIndexStore";
 import { SQLiteRuntimeStore } from "./SQLiteRuntimeStore";
 import {
-  SQLiteDurableMemoryRepository,
+  SQLiteMemoryItemDraftRepository,
   SQLiteEvidenceAtomRepository,
   SQLiteKnowledgeRawRepository,
   SQLiteObservationRepository,
@@ -23,8 +16,8 @@ import {
 import { ContextPlannerResult } from "../engines/ContextPlanner";
 import {
   BridgeConfig,
-  DurableMemoryEntry,
-  DurableMemoryRepository,
+  MemoryItemDraftEntry,
+  MemoryItemDraftRepository,
   EvidenceAtomEntry,
   EvidenceAtomRepository,
   KnowledgeRawRepository,
@@ -40,16 +33,13 @@ import {
   SummaryRepository,
 } from "../types";
 import { SourceMessageResolver } from "../resolvers/SourceMessageResolver";
-import { DataSchemaRegistry } from "./DataSchemaRegistry";
-import { SessionDataMigrationRunner } from "./SessionDataMigrationRunner";
 import { AgentVault } from "./AgentVault";
-import { SessionUpgradeManager } from "./SessionUpgradeManager";
 
 export interface SessionDataStores {
   rawStore: RawMessageRepository;
   summaryStore: SummaryRepository;
   observationStore: ObservationRepository;
-  durableMemoryStore: DurableMemoryRepository;
+  memoryItemDraftStore: MemoryItemDraftRepository;
   evidenceAtomStore: EvidenceAtomRepository;
   knowledgeRawStore: KnowledgeRawRepository;
   knowledgeStore: KnowledgeRepository;
@@ -68,17 +58,14 @@ export class SessionDataLayer {
   private rawStore: RawMessageRepository | null = null;
   private summaryStore: SummaryRepository | null = null;
   private observationStore: ObservationRepository | null = null;
-  private durableMemoryStore: DurableMemoryRepository | null = null;
+  private memoryItemDraftStore: MemoryItemDraftRepository | null = null;
   private evidenceAtomStore: EvidenceAtomRepository | null = null;
   private knowledgeRawStore: KnowledgeRawRepository | null = null;
   private knowledgeStore: KnowledgeMarkdownStore | null = null;
   private projectStore: ProjectRegistryRepository | null = null;
   private statsLogStore: RuntimeStatsLogStore | null = null;
   private runtimeStore: SQLiteRuntimeStore | null = null;
-  private schemaRegistry: DataSchemaRegistry | null = null;
-  private migrationRunner: SessionDataMigrationRunner | null = null;
   private agentVault: AgentVault | null = null;
-  private upgradeManager: SessionUpgradeManager | null = null;
   private boundAgentId: string | null = null;
   private boundSessionId: string | null = null;
   private boundConfig: Pick<
@@ -91,11 +78,9 @@ export class SessionDataLayer {
     | "sqliteJournalMode"
     | "agentVaultMirrorEnabled"
     | "summaryMarkdownMirrorEnabled"
-    | "durableMarkdownMirrorEnabled"
+    | "memoryItemMarkdownMirrorEnabled"
     | "transcriptMirrorEnabled"
     | "knowledgeMarkdownEnabled"
-    | "sqlitePrimaryEnabled"
-    | "jsonPersistenceMode"
   > | null = null;
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private runtimeMirrorSignature: string | null = null;
@@ -110,7 +95,7 @@ export class SessionDataLayer {
       this.rawStore &&
       this.summaryStore &&
       this.observationStore &&
-      this.durableMemoryStore &&
+      this.memoryItemDraftStore &&
       this.evidenceAtomStore &&
       this.knowledgeRawStore &&
       this.knowledgeStore &&
@@ -127,22 +112,15 @@ export class SessionDataLayer {
       this.boundConfig?.sqliteJournalMode === config.sqliteJournalMode &&
       this.boundConfig?.agentVaultMirrorEnabled === config.agentVaultMirrorEnabled &&
       this.boundConfig?.summaryMarkdownMirrorEnabled === config.summaryMarkdownMirrorEnabled &&
-      this.boundConfig?.durableMarkdownMirrorEnabled === config.durableMarkdownMirrorEnabled &&
+      this.boundConfig?.memoryItemMarkdownMirrorEnabled === config.memoryItemMarkdownMirrorEnabled &&
       this.boundConfig?.transcriptMirrorEnabled === config.transcriptMirrorEnabled &&
-      this.boundConfig?.knowledgeMarkdownEnabled === config.knowledgeMarkdownEnabled &&
-      this.boundConfig?.sqlitePrimaryEnabled === config.sqlitePrimaryEnabled &&
-      this.boundConfig?.jsonPersistenceMode === config.jsonPersistenceMode
+      this.boundConfig?.knowledgeMarkdownEnabled === config.knowledgeMarkdownEnabled
     ) {
       return this.getStores();
     }
 
-    // Current ChaunyOMS runtime is SQLite-first and no longer treats legacy JSON
-    // migrations as a hot-path startup responsibility. Store classes below are
-    // initialized for current writes, Markdown assets, and operational mirrors;
-    // historical schema import/export remains an explicit offline concern.
-    this.schemaRegistry = null;
-    this.migrationRunner = null;
-    this.upgradeManager = null;
+    // Current ChaunyOMS runtime is SQLite-first. Historical JSON import/export
+    // remains an explicit offline admin concern, never a hot-path store mode.
     this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
     this.statsLogStore = new RuntimeStatsLogStore(config.dataDir);
     this.runtimeStore = new SQLiteRuntimeStore({
@@ -153,32 +131,22 @@ export class SessionDataLayer {
       journalMode: config.sqliteJournalMode,
     });
     await this.runtimeStore.init();
-    if (config.sqlitePrimaryEnabled) {
-      const runtimeStatus = this.runtimeStore.getStatus();
-      if (!runtimeStatus.enabled) {
-        throw new Error("SQLite primary storage is enabled but the SQLite runtime store is unavailable.");
-      }
-      this.rawStore = new SQLiteRawMessageRepository(this.runtimeStore);
-      this.summaryStore = new SQLiteSummaryRepository(this.runtimeStore);
-      this.observationStore = new SQLiteObservationRepository(this.runtimeStore, config.agentId);
-      this.durableMemoryStore = new SQLiteDurableMemoryRepository(this.runtimeStore);
-      this.evidenceAtomStore = new SQLiteEvidenceAtomRepository(this.runtimeStore);
-      this.knowledgeRawStore = new SQLiteKnowledgeRawRepository(this.runtimeStore, sessionId, config.agentId);
-      this.projectStore = new SQLiteProjectRegistryRepository(this.runtimeStore, config.agentId);
-    } else {
-      this.rawStore = new RawMessageStore(agentDataDir, config.agentId);
-      this.summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
-      this.observationStore = new ObservationStore(agentDataDir, config.agentId);
-      this.durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
-      this.evidenceAtomStore = new EvidenceAtomStore(agentDataDir, config.agentId);
-      this.knowledgeRawStore = new KnowledgeRawStore(agentDataDir, sessionId);
-      this.projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
+    const runtimeStatus = this.runtimeStore.getStatus();
+    if (!runtimeStatus.enabled) {
+      throw new Error("SQLite runtime store is unavailable.");
     }
+    this.rawStore = new SQLiteRawMessageRepository(this.runtimeStore);
+    this.summaryStore = new SQLiteSummaryRepository(this.runtimeStore);
+    this.observationStore = new SQLiteObservationRepository(this.runtimeStore, config.agentId);
+    this.memoryItemDraftStore = new SQLiteMemoryItemDraftRepository(this.runtimeStore);
+    this.evidenceAtomStore = new SQLiteEvidenceAtomRepository(this.runtimeStore);
+    this.knowledgeRawStore = new SQLiteKnowledgeRawRepository(this.runtimeStore, sessionId, config.agentId);
+    this.projectStore = new SQLiteProjectRegistryRepository(this.runtimeStore, config.agentId);
     this.agentVault = new AgentVault(config.memoryVaultDir, config.agentId);
     await this.rawStore.init();
     await this.summaryStore.init();
     await this.observationStore.init();
-    await this.durableMemoryStore.init();
+    await this.memoryItemDraftStore.init();
     await this.evidenceAtomStore.init();
     await this.knowledgeRawStore.init();
     await this.knowledgeStore.init();
@@ -197,11 +165,9 @@ export class SessionDataLayer {
       sqliteJournalMode: config.sqliteJournalMode,
       agentVaultMirrorEnabled: config.agentVaultMirrorEnabled,
       summaryMarkdownMirrorEnabled: config.summaryMarkdownMirrorEnabled,
-      durableMarkdownMirrorEnabled: config.durableMarkdownMirrorEnabled,
+      memoryItemMarkdownMirrorEnabled: config.memoryItemMarkdownMirrorEnabled,
       transcriptMirrorEnabled: config.transcriptMirrorEnabled,
       knowledgeMarkdownEnabled: config.knowledgeMarkdownEnabled,
-      sqlitePrimaryEnabled: config.sqlitePrimaryEnabled,
-      jsonPersistenceMode: config.jsonPersistenceMode,
     };
     this.runtimeMirrorSignature = null;
     this.runtimeMirrorDirty = false;
@@ -209,14 +175,14 @@ export class SessionDataLayer {
   }
 
   getStores(): SessionDataStores {
-    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.durableMemoryStore || !this.evidenceAtomStore || !this.knowledgeRawStore || !this.knowledgeStore || !this.projectStore) {
+    if (!this.rawStore || !this.summaryStore || !this.observationStore || !this.memoryItemDraftStore || !this.evidenceAtomStore || !this.knowledgeRawStore || !this.knowledgeStore || !this.projectStore) {
       throw new Error("SessionDataLayer stores are not initialized");
     }
     return {
       rawStore: this.rawStore,
       summaryStore: this.summaryStore,
       observationStore: this.observationStore,
-      durableMemoryStore: this.durableMemoryStore,
+      memoryItemDraftStore: this.memoryItemDraftStore,
       evidenceAtomStore: this.evidenceAtomStore,
       knowledgeRawStore: this.knowledgeRawStore,
       knowledgeStore: this.knowledgeStore,
@@ -226,7 +192,7 @@ export class SessionDataLayer {
 
   async appendRawMessage(message: RawMessage): Promise<void> {
     await this.rawStore?.append(message);
-    this.runtimeMirrorDirty = this.boundConfig?.sqlitePrimaryEnabled ? false : true;
+    this.runtimeMirrorDirty = false;
   }
 
   async appendRawMessages(messages: RawMessage[]): Promise<void> {
@@ -240,19 +206,16 @@ export class SessionDataLayer {
         await this.rawStore?.append(message);
       }
     }
-    this.runtimeMirrorDirty = this.boundConfig?.sqlitePrimaryEnabled ? false : true;
+    this.runtimeMirrorDirty = false;
   }
 
   async appendObservation(entry: ObservationEntry): Promise<void> {
     await this.getStores().observationStore.append(entry);
   }
 
-  async addDurableEntries(entries: DurableMemoryEntry[]): Promise<number> {
-    const durableMemoryStore = this.getStores().durableMemoryStore;
-    const added = await durableMemoryStore.addEntries(entries);
-    if (added > 0 && !this.boundConfig?.sqlitePrimaryEnabled) {
-      this.runtimeMirrorDirty = true;
-    }
+  async addMemoryItemDraftEntries(entries: MemoryItemDraftEntry[]): Promise<number> {
+    const memoryItemDraftStore = this.getStores().memoryItemDraftStore;
+    const added = await memoryItemDraftStore.addEntries(entries);
     return added;
   }
 
@@ -261,7 +224,7 @@ export class SessionDataLayer {
       return;
     }
     await this.getStores().evidenceAtomStore.upsertMany(entries);
-    this.runtimeMirrorDirty = this.boundConfig?.sqlitePrimaryEnabled ? false : true;
+    this.runtimeMirrorDirty = false;
   }
 
   async writeNavigationSnapshot(snapshot: string): Promise<string | null> {
@@ -283,16 +246,16 @@ export class SessionDataLayer {
     return await this.agentVault.appendSummary(entry);
   }
 
-  async writeDurableMemoryArtifacts(): Promise<void> {
+  async writeMemoryItemArtifacts(): Promise<void> {
     if (
       !this.boundConfig?.agentVaultMirrorEnabled ||
-      !this.boundConfig.durableMarkdownMirrorEnabled ||
+      !this.boundConfig.memoryItemMarkdownMirrorEnabled ||
       !this.agentVault
     ) {
       return;
     }
-    await this.agentVault.writeDurableMemoryMirror(
-      this.getStores().durableMemoryStore.getAll().filter((entry) => entry.recordStatus === "active"),
+    await this.agentVault.writeMemoryItemMirror(
+      this.getStores().memoryItemDraftStore.getAll().filter((entry) => entry.recordStatus === "active"),
     );
   }
 
@@ -348,10 +311,10 @@ export class SessionDataLayer {
         removed.push(`observations:${count}`);
       }
     }
-    if (this.durableMemoryStore?.removeSession) {
-      const count = await this.durableMemoryStore.removeSession(sessionId);
+    if (this.memoryItemDraftStore?.removeSession) {
+      const count = await this.memoryItemDraftStore.removeSession(sessionId);
       if (count > 0) {
-        removed.push(`durable_memories:${count}`);
+        removed.push(`memory_item_drafts:${count}`);
       }
     }
     if (this.evidenceAtomStore) {
@@ -436,12 +399,12 @@ export class SessionDataLayer {
   }
 
   async mirrorRuntimeState(): Promise<void> {
-    if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.durableMemoryStore || !this.evidenceAtomStore) {
+    if (!this.runtimeStore || !this.rawStore || !this.summaryStore || !this.memoryItemDraftStore || !this.evidenceAtomStore) {
       return;
     }
     const messages = this.rawStore.getAll();
     const summaries = this.summaryStore.getAllSummaries();
-    const memories = this.durableMemoryStore.getAll();
+    const memories = this.memoryItemDraftStore.getAll();
     const atoms = this.evidenceAtomStore.getAll();
     const signature = this.buildRuntimeMirrorSignature(messages, summaries, memories, atoms);
     if (!this.runtimeMirrorDirty && this.runtimeMirrorSignature === signature) {
@@ -530,7 +493,7 @@ export class SessionDataLayer {
   private buildRuntimeMirrorSignature(
     messages: RawMessage[],
     summaries: SummaryEntry[],
-    memories: DurableMemoryEntry[],
+    memories: MemoryItemDraftEntry[],
     atoms: EvidenceAtomEntry[],
   ): string {
     const lastMessage = messages[messages.length - 1];
@@ -565,43 +528,6 @@ export class SessionDataLayer {
     return config.knowledgeBaseDir;
   }
 
-  private async validateUpgradedState(
-    agentDataDir: string,
-    knowledgeDir: string,
-    config: BridgeConfig,
-  ): Promise<void> {
-    const rawStore = new RawMessageStore(agentDataDir, config.agentId);
-    const summaryStore = new SummaryIndexStore(agentDataDir, config.agentId);
-    const observationStore = new ObservationStore(agentDataDir, config.agentId);
-    const durableMemoryStore = new DurableMemoryStore(agentDataDir, config.agentId);
-    const knowledgeRawStore = new KnowledgeRawStore(agentDataDir, config.sessionId);
-    const knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
-    const projectStore = new ProjectRegistryStore(agentDataDir, config.agentId);
-    const vault = new AgentVault(config.memoryVaultDir, config.agentId);
-
-    await rawStore.init();
-    await summaryStore.init();
-    await observationStore.init();
-    await durableMemoryStore.init();
-    await knowledgeRawStore.init();
-    await knowledgeStore.init();
-    await projectStore.init();
-    await vault.ensureLayout();
-
-    for (const summary of summaryStore.getAllSummaries()) {
-      const startTurn = Number(summary.startTurn);
-      const endTurn = Number(summary.endTurn);
-      if (!Number.isFinite(startTurn) || !Number.isFinite(endTurn) || startTurn > endTurn) {
-        throw new Error(`Invalid summary turn range after upgrade for summary ${summary.id}`);
-      }
-    }
-
-    durableMemoryStore.getAll();
-    knowledgeRawStore.getAll();
-    projectStore.getAll();
-    knowledgeStore.searchRelatedDocuments("upgrade validation", 1);
-  }
-
   private async removePathIfPresent(target: string): Promise<boolean> {
     try {
       await rm(target, { recursive: true, force: true });
@@ -620,17 +546,14 @@ export class SessionDataLayer {
     this.rawStore = null;
     this.summaryStore = null;
     this.observationStore = null;
-    this.durableMemoryStore = null;
+    this.memoryItemDraftStore = null;
     this.evidenceAtomStore = null;
     this.knowledgeRawStore = null;
     this.knowledgeStore = null;
     this.projectStore = null;
     this.statsLogStore = null;
     this.runtimeStore = null;
-    this.schemaRegistry = null;
-    this.migrationRunner = null;
     this.agentVault = null;
-    this.upgradeManager = null;
     this.boundAgentId = null;
     this.boundSessionId = null;
     this.boundConfig = null;

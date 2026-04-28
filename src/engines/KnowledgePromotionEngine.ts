@@ -1,6 +1,5 @@
-﻿import { createHash } from "node:crypto";
-
-import {
+﻿import {
+  BridgeConfig,
   KnowledgeDocBucket,
   KnowledgePromotionDraft,
   KnowledgePromotionResult,
@@ -19,6 +18,7 @@ interface PromoteArgs {
   sessionId: string;
   summaryModel?: string;
   knowledgePromotionModel?: string;
+  config: Pick<BridgeConfig, "kbWriteEnabled" | "kbExportEnabled" | "emergencyBrake">;
   knowledgeStore: KnowledgeRepository;
 }
 
@@ -35,8 +35,17 @@ export class KnowledgePromotionEngine {
       sessionId,
       summaryModel,
       knowledgePromotionModel,
+      config,
       knowledgeStore,
     } = args;
+
+    const writePolicy = this.resolveWritePolicy(config);
+    if (!writePolicy.allowed) {
+      return {
+        status: "skipped",
+        reason: writePolicy.reason,
+      };
+    }
 
     await knowledgeStore.init();
     const existing = knowledgeStore.findPromotion(summaryEntry);
@@ -211,12 +220,18 @@ export class KnowledgePromotionEngine {
     }
   }
 
-  private slugify(value: string): string {
-    return value
-      .toLowerCase()
-      .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "-")
-      .replace(/-{2,}/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 80) || `knowledge-${createHash("sha256").update(value, "utf8").digest("hex").slice(0, 8)}`;
+  private resolveWritePolicy(
+    config: Pick<BridgeConfig, "kbWriteEnabled" | "kbExportEnabled" | "emergencyBrake">,
+  ): { allowed: true } | { allowed: false; reason: string } {
+    if (config.emergencyBrake) {
+      return { allowed: false, reason: "emergency_brake_disables_knowledge_writes" };
+    }
+    if (!config.kbWriteEnabled) {
+      return { allowed: false, reason: "kb_write_disabled" };
+    }
+    if (!config.kbExportEnabled) {
+      return { allowed: false, reason: "kb_export_disabled" };
+    }
+    return { allowed: true };
   }
 }

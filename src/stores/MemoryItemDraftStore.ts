@@ -1,21 +1,21 @@
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { DurableMemoryEntry } from "../types";
+import { MemoryItemDraftEntry } from "../types";
 import { atomicWriteFile } from "../utils/atomicFile";
 import { buildStableEventId } from "../utils/projectIdentity";
 
-interface DurableMemoryFileV3 {
+interface MemoryItemDraftFileV3 {
   schemaVersion: 3;
-  memories: DurableMemoryEntry[];
+  memories: MemoryItemDraftEntry[];
 }
 
-export class DurableMemoryStore {
+export class MemoryItemDraftStore {
   private readonly filePath: string;
-  private memories: DurableMemoryEntry[] = [];
+  private memories: MemoryItemDraftEntry[] = [];
 
   constructor(private readonly baseDir: string, private readonly sessionId: string) {
-    this.filePath = path.join(baseDir, `${sessionId}.durable-memory.json`);
+    this.filePath = path.join(baseDir, `${sessionId}.memory-item-drafts.json`);
   }
 
   async init(): Promise<void> {
@@ -23,7 +23,7 @@ export class DurableMemoryStore {
 
     try {
       const content = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(content) as DurableMemoryFileV3 | DurableMemoryEntry[];
+      const parsed = JSON.parse(content) as MemoryItemDraftFileV3 | MemoryItemDraftEntry[];
       const entries = Array.isArray(parsed) ? parsed : parsed.memories;
       this.memories = Array.isArray(entries) ? entries.map((entry) => this.normalizeEntry(entry)) : [];
     } catch (error) {
@@ -34,7 +34,7 @@ export class DurableMemoryStore {
     }
   }
 
-  async addEntries(entries: DurableMemoryEntry[]): Promise<number> {
+  async addEntries(entries: MemoryItemDraftEntry[]): Promise<number> {
     let added = 0;
     for (const rawEntry of entries) {
       const entry = this.normalizeEntry(rawEntry);
@@ -59,7 +59,7 @@ export class DurableMemoryStore {
     return added;
   }
 
-  async replaceAll(entries: DurableMemoryEntry[]): Promise<void> {
+  async replaceAll(entries: MemoryItemDraftEntry[]): Promise<void> {
     this.memories = entries
       .map((entry) => this.normalizeEntry(entry))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
@@ -76,7 +76,7 @@ export class DurableMemoryStore {
     return removed;
   }
 
-  search(query: string, limit = 5): DurableMemoryEntry[] {
+  search(query: string, limit = 5): MemoryItemDraftEntry[] {
     const terms = query
       .toLowerCase()
       .split(/[^a-z0-9\u4e00-\u9fff]+/i)
@@ -103,7 +103,7 @@ export class DurableMemoryStore {
       .map((item) => item.entry);
   }
 
-  getAll(): DurableMemoryEntry[] {
+  getAll(): MemoryItemDraftEntry[] {
     return [...this.memories];
   }
 
@@ -124,7 +124,7 @@ export class DurableMemoryStore {
     });
   }
 
-  private supersedeActiveFactEntry(entry: DurableMemoryEntry): void {
+  private supersedeActiveFactEntry(entry: MemoryItemDraftEntry): void {
     const factKey = this.factKey(entry);
     const factValue = this.factValue(entry);
     if (!factKey || !factValue) {
@@ -151,7 +151,7 @@ export class DurableMemoryStore {
     });
   }
 
-  private scoreEntry(entry: DurableMemoryEntry, terms: string[]): number {
+  private scoreEntry(entry: MemoryItemDraftEntry, terms: string[]): number {
     const haystack = `${entry.kind} ${entry.projectId ?? ""} ${entry.topicId ?? ""} ${entry.tags.join(" ")} ${entry.text}`.toLowerCase();
     let score = 0;
 
@@ -175,14 +175,14 @@ export class DurableMemoryStore {
     return score;
   }
 
-  private factKey(entry: DurableMemoryEntry): string | null {
+  private factKey(entry: MemoryItemDraftEntry): string | null {
     const value = entry.metadata?.factKey;
     return typeof value === "string" && value.trim().length > 0
       ? value.trim()
       : null;
   }
 
-  private factValue(entry: DurableMemoryEntry): string | null {
+  private factValue(entry: MemoryItemDraftEntry): string | null {
     const value = entry.metadata?.factValue;
     return typeof value === "string" && value.trim().length > 0
       ? value.trim()
@@ -190,14 +190,14 @@ export class DurableMemoryStore {
   }
 
   private async flush(): Promise<void> {
-    const payload: DurableMemoryFileV3 = {
+    const payload: MemoryItemDraftFileV3 = {
       schemaVersion: 3,
       memories: this.memories,
     };
     await atomicWriteFile(this.filePath, JSON.stringify(payload, null, 2));
   }
 
-  private normalizeEntry(entry: DurableMemoryEntry): DurableMemoryEntry {
+  private normalizeEntry(entry: MemoryItemDraftEntry): MemoryItemDraftEntry {
     return {
       ...entry,
       eventId: entry.eventId ?? buildStableEventId("memory", `${entry.id}|${entry.createdAt}`),

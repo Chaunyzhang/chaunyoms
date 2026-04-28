@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import {
-  DurableMemoryEntry,
+  MemoryItemDraftEntry,
   ProjectStateSnapshot,
   SummaryEntry,
 } from "../types";
@@ -12,7 +12,7 @@ interface AgentVaultPaths {
   coreDir: string;
   navigationDir: string;
   summariesDir: string;
-  durableDir: string;
+  memoryItemDir: string;
   transcriptsDir: string;
   navigationPath: string;
   memoryPath: string;
@@ -35,7 +35,7 @@ export class AgentVault {
       mkdir(paths.coreDir, { recursive: true }),
       mkdir(paths.navigationDir, { recursive: true }),
       mkdir(paths.summariesDir, { recursive: true }),
-      mkdir(paths.durableDir, { recursive: true }),
+      mkdir(paths.memoryItemDir, { recursive: true }),
       mkdir(paths.transcriptsDir, { recursive: true }),
     ]);
     return paths;
@@ -106,7 +106,7 @@ export class AgentVault {
     return filePath;
   }
 
-  async writeDurableMemoryMirror(entries: DurableMemoryEntry[]): Promise<void> {
+  async writeMemoryItemMirror(entries: MemoryItemDraftEntry[]): Promise<void> {
     const paths = await this.ensureLayout();
     const grouped = {
       facts: entries.filter((entry) => entry.kind === "user_fact" || entry.kind === "project_state"),
@@ -116,10 +116,10 @@ export class AgentVault {
     };
 
     await Promise.all([
-      this.writeDurableBucket(path.join(paths.durableDir, "facts.md"), "Facts", grouped.facts),
-      this.writeDurableBucket(path.join(paths.durableDir, "constraints.md"), "Constraints", grouped.constraints),
-      this.writeDurableBucket(path.join(paths.durableDir, "decisions.md"), "Decisions", grouped.decisions),
-      this.writeDurableBucket(path.join(paths.durableDir, "diagnostics.md"), "Diagnostics", grouped.diagnostics),
+      this.writeMemoryItemBucket(path.join(paths.memoryItemDir, "facts.md"), "Facts", grouped.facts),
+      this.writeMemoryItemBucket(path.join(paths.memoryItemDir, "constraints.md"), "Constraints", grouped.constraints),
+      this.writeMemoryItemBucket(path.join(paths.memoryItemDir, "decisions.md"), "Decisions", grouped.decisions),
+      this.writeMemoryItemBucket(path.join(paths.memoryItemDir, "diagnostics.md"), "Diagnostics", grouped.diagnostics),
     ]);
   }
 
@@ -145,7 +145,7 @@ export class AgentVault {
     return dir;
   }
 
-  private async writeDurableBucket(filePath: string, title: string, entries: DurableMemoryEntry[]): Promise<void> {
+  private async writeMemoryItemBucket(filePath: string, title: string, entries: MemoryItemDraftEntry[]): Promise<void> {
     const content = [
       `# ${title}`,
       "",
@@ -170,7 +170,7 @@ export class AgentVault {
       coreDir: path.join(agentRoot, "core"),
       navigationDir: path.join(agentRoot, "navigation"),
       summariesDir: path.join(agentRoot, "summaries"),
-      durableDir: path.join(agentRoot, "durable"),
+      memoryItemDir: path.join(agentRoot, "memory-items"),
       transcriptsDir: path.join(agentRoot, "transcripts"),
       navigationPath: path.join(agentRoot, "navigation", "NAVIGATION.md"),
       memoryPath: path.join(agentRoot, "core", "MEMORY.md"),
