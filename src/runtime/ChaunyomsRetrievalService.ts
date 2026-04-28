@@ -1,6 +1,3 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-
 import { ContextPlanner } from "../engines/ContextPlanner";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
@@ -10,7 +7,6 @@ import {
   ContextItem,
   EvidenceAtomEntry,
   FixedPrefixProvider,
-  KnowledgeDocumentIndexEntry,
   MemoryItemEntry,
   ProjectRecord,
   RecallResult,
@@ -36,7 +32,6 @@ interface ToolResponse {
 
 interface SemanticExpansionResult {
   candidates: SemanticCandidate[];
-  knowledgeHits: KnowledgeDocumentIndexEntry[];
   memoryItemHits: MemoryItemEntry[];
   summaryHits: SummaryEntry[];
   projectHit: ProjectRecord | null;
@@ -116,10 +111,6 @@ export class ChaunyomsRetrievalService {
       context,
       decision,
       memoryItems: runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
-      knowledgeHits: runtimeStore.searchKnowledgeAssets(
-        query,
-        context.config.semanticCandidateLimit,
-      ),
       summaryHits: stores.summaryStore.search(query, { sessionId: scopedSessionId }),
       projects: stores.projectStore.getAll().filter((project) => project.status !== "archived"),
       matchedProject: decision.matchedProjectId
@@ -135,6 +126,18 @@ export class ChaunyomsRetrievalService {
       semanticExpansion,
       configGuidance.warnings,
     );
+    if (decision.route === "knowledge") {
+      diagnostics.route = "recent_tail";
+      diagnostics.originalRoute = "knowledge";
+      diagnostics.explanation = "Knowledge/Markdown assets are export-only in authoritative ChaunyOMS mode; retrieval falls back to Source/BaseSummary/MemoryItem layers.";
+      diagnostics.fallbackTrace = [
+        {
+          from: "knowledge",
+          to: "recent_tail",
+          reason: "markdown_assets_not_hot_path",
+        },
+      ];
+    }
     return {
       content: [
         {
@@ -244,59 +247,6 @@ export class ChaunyomsRetrievalService {
       }, query, context, decision, emptyExpansion);
     }
 
-    const shouldCheckKnowledge = decision.route === "knowledge" ||
-      (decision.route === "recent_tail" && this.shouldProbeKnowledgeFallback(query, context));
-    const managedKnowledgeHits = shouldCheckKnowledge
-      ? runtimeStore.searchKnowledgeAssets(query, 6)
-      : [];
-    const knowledgeExpansion = managedKnowledgeHits.length > 0
-      ? await this.collectSemanticExpansion({
-        query,
-        context,
-        decision,
-        memoryItems: [],
-        knowledgeHits: managedKnowledgeHits,
-        summaryHits: [],
-        projects: [],
-        matchedProject,
-      })
-      : emptyExpansion;
-
-    if (decision.route === "knowledge" && managedKnowledgeHits.length > 0) {
-      return this.attachDiagnostics(
-        await this.buildUnifiedKnowledgeResult(
-          query,
-          managedKnowledgeHits,
-          decision,
-          context,
-        ),
-        query,
-        context,
-        decision,
-        knowledgeExpansion,
-      );
-    }
-
-    if (decision.route === "recent_tail" && managedKnowledgeHits.length > 0) {
-      const result = await this.buildUnifiedKnowledgeResult(
-        query,
-        managedKnowledgeHits,
-        decision,
-        context,
-      );
-      return this.attachDiagnostics({
-        ...result,
-        details: {
-          ...result.details,
-          fallbackTrace: [{
-            from: decision.route,
-            to: "knowledge",
-            reason: "reviewed_knowledge_candidate_hit",
-          }],
-        },
-      }, query, context, decision, knowledgeExpansion);
-    }
-
     if (this.shouldAutoRecall(decision, context)) {
       if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
         return this.attachDiagnostics(
@@ -402,7 +352,7 @@ export class ChaunyomsRetrievalService {
       return this.attachDiagnostics({
         content: [{
           type: "text",
-          text: `No SQLite knowledge assets matched query: ${query}. Run oms_asset_sync or oms_asset_reindex to mirror human-readable Markdown exports before retrieval.`,
+          text: `Knowledge/Markdown assets are export-only in authoritative ChaunyOMS mode; query "${query}" was not answered from Markdown. Promote/import source-backed MemoryItems first.`,
         }],
         details: {
           ok: true,
@@ -412,7 +362,7 @@ export class ChaunyomsRetrievalService {
           hitCount: 0,
           knowledgeHitCount: 0,
           topRecordType: null,
-          retrievalHitType: "knowledge",
+          retrievalHitType: "knowledge_export_only",
           autoRecall: false,
           autoRecallReason: null,
           routePlan: decision.routePlan,
@@ -421,10 +371,10 @@ export class ChaunyomsRetrievalService {
           fallbackTrace: [{
             from: decision.route,
             to: "none",
-            reason: "sqlite_knowledge_asset_miss",
+            reason: "markdown_assets_not_hot_path",
           }],
         },
-      }, query, context, decision, knowledgeExpansion);
+      }, query, context, decision, emptyExpansion);
     }
 
     const recentTail = rawStore.getRecentTail(3, { sessionId: context.sessionId });
@@ -447,6 +397,87 @@ export class ChaunyomsRetrievalService {
         }],
       },
     }, query, context, decision, emptyExpansion);
+  }
+
+  async executeOpenClawMemorySearch(args: unknown): Promise<ToolResponse> {
+    const normalizedArgs = this.normalizeOpenClawSearchArgs(args);
+    const result = await this.executeMemoryRetrieve(normalizedArgs);
+    return this.withOpenClawCompatibility(result, "memory_search", "memory_retrieve", {
+      markdownHotPath: false,
+      authoritativeSource: "ChaunyOMS SQLite MemoryItem/BaseSummary/Source",
+    });
+  }
+
+  async executeOpenClawMemoryGet(args: unknown): Promise<ToolResponse> {
+    const record = this.isRecord(args) ? { ...args } : {};
+    const ref =
+      this.getStringArg(record, "ref") ||
+      this.getStringArg(record, "id") ||
+      this.getStringArg(record, "memory_id") ||
+      this.getStringArg(record, "path");
+    if (!ref) {
+      return this.withOpenClawCompatibility(
+        this.buildMissingIdResponse("memory_get"),
+        "memory_get",
+        "oms_expand",
+        { markdownHotPath: false },
+      );
+    }
+
+    const normalizedArgs = {
+      ...record,
+      id: this.normalizeOpenClawMemoryRef(ref),
+      kind: this.resolveOpenClawMemoryRefKind(record, ref),
+    };
+    const result = await this.executeOmsExpand(normalizedArgs);
+    return this.withOpenClawCompatibility(result, "memory_get", "oms_expand", {
+      markdownHotPath: false,
+      authoritativeSource: "ChaunyOMS source_edges",
+      ref,
+    });
+  }
+
+  async executeOpenClawMemoryStatus(args: unknown): Promise<ToolResponse> {
+    const result = await this.executeOmsStatus(args);
+    return this.withOpenClawCompatibility(result, "memory_status", "oms_status", {
+      markdownHotPath: false,
+    });
+  }
+
+  async executeOpenClawMemoryIndex(args: unknown): Promise<ToolResponse> {
+    const result = await this.executeOmsAssetReindex(args);
+    return this.withOpenClawCompatibility(result, "memory_index", "oms_asset_reindex", {
+      markdownHotPath: false,
+      sourceRegenerated: false,
+      note: "Rebuilds SQLite asset indexes only; Source remains the canonical raw-message ledger.",
+    });
+  }
+
+  async executeOpenClawMemoryPromote(args: unknown): Promise<ToolResponse> {
+    if (this.getBooleanArg(args, "apply", false) && this.getStringArg(args, "id")) {
+      const result = await this.executeOmsKnowledgeReview({
+        ...(this.isRecord(args) ? args : {}),
+        action: "approve",
+      });
+      return this.withOpenClawCompatibility(result, "memory_promote", "oms_knowledge_review", {
+        markdownHotPath: false,
+        promotionGate: "manual_approval",
+      });
+    }
+
+    const result = await this.executeOmsKnowledgeCandidates(args);
+    return this.withOpenClawCompatibility(result, "memory_promote", "oms_knowledge_candidates", {
+      markdownHotPath: false,
+      applyRequires: "id + apply=true",
+    });
+  }
+
+  async executeOpenClawMemoryPromoteExplain(args: unknown): Promise<ToolResponse> {
+    const result = await this.executeOmsKnowledgeCandidates(args);
+    return this.withOpenClawCompatibility(result, "memory_promote_explain", "oms_knowledge_candidates", {
+      markdownHotPath: false,
+      explains: ["score", "recommendation", "status", "reviewState"],
+    });
   }
 
   async executeOmsGrep(args: unknown): Promise<ToolResponse> {
@@ -580,33 +611,58 @@ export class ChaunyomsRetrievalService {
   async executeOmsStatus(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const status = await this.runtime.getStatus(context, { scope: this.getScopeArg(args) });
-    return this.jsonToolResponse("oms_status", status, status.ok);
+    const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
+    return this.jsonToolResponse(
+      "oms_status",
+      { ...status, openClawCompatibility },
+      status.ok && openClawCompatibility.ok,
+    );
   }
 
   async executeOmsSetupGuide(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const status = await this.runtime.getStatus(context);
     const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
+    const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
     const recommendedConfig = {
-      configPreset: context.config.configPreset,
-      enableTools: true,
-      runtimeCaptureEnabled: true,
-      memoryItemEnabled: true,
-      autoRecallEnabled: context.config.configPreset !== "safe",
-      retrievalStrength: context.config.retrievalStrength,
-      knowledgePromotionEnabled: false,
-      knowledgePromotionManualReviewEnabled: true,
-      kbCandidateEnabled: true,
-      kbWriteEnabled: false,
-      kbPromotionMode: context.config.kbPromotionMode,
-      kbPromotionStrictness: context.config.kbPromotionStrictness,
-      kbExportEnabled: true,
-      knowledgeIntakeMode: context.config.knowledgeIntakeMode,
-      sqliteJournalMode: context.config.sqliteJournalMode,
+      plugins: {
+        slots: {
+          memory: "oms",
+          contextEngine: "oms",
+        },
+        entries: {
+          oms: {
+            enabled: true,
+            config: {
+              mode: "authoritative",
+              configPreset: context.config.configPreset,
+              enableTools: true,
+              runtimeCaptureEnabled: true,
+              memoryItemEnabled: true,
+              autoRecallEnabled: context.config.configPreset !== "safe",
+              retrievalStrength: context.config.retrievalStrength,
+              knowledgePromotionEnabled: false,
+              knowledgePromotionManualReviewEnabled: true,
+              kbCandidateEnabled: true,
+              kbWriteEnabled: false,
+              kbPromotionMode: context.config.kbPromotionMode,
+              kbPromotionStrictness: context.config.kbPromotionStrictness,
+              kbExportEnabled: true,
+              knowledgeIntakeMode: context.config.knowledgeIntakeMode,
+              sqliteJournalMode: context.config.sqliteJournalMode,
+            },
+          },
+          "memory-core": { enabled: false },
+          "active-memory": { enabled: false },
+          "memory-wiki": { enabled: false },
+          dreaming: { enabled: false },
+        },
+      },
     };
     const setup = {
       ok: status.ok,
       purpose: "Configure ChaunyOMS as a SQLite-first runtime with Markdown assets as reviewed human-readable output.",
+      openClawCompatibility,
       runtime: {
         adapter: status.runtimeStore.adapter,
         sqliteEnabled: status.runtimeStore.enabled,
@@ -623,6 +679,8 @@ export class ChaunyomsRetrievalService {
       recommendedConfig,
       checklist: [
         "Run oms_doctor after install; it verifies config, SQLite availability, source edges, and asset governance.",
+        "Bind both plugins.slots.memory and plugins.slots.contextEngine to oms before enabling authoritative mode.",
+        "Disable OpenClaw memory-core, active-memory, memory-wiki, and dreaming so no Markdown-first fact source coexists with ChaunyOMS.",
         "Keep sqliteJournalMode=delete unless the deployment needs concurrent reads/writes and supports WAL files reliably.",
         "Leave knowledgePromotionEnabled=false until raw recall/compaction are stable for the project.",
         "Enable knowledgePromotionManualReviewEnabled=true when promotion is enabled and the UI wants a review queue.",
@@ -631,6 +689,8 @@ export class ChaunyomsRetrievalService {
       ],
       warnings: [
         ...configGuidance.warnings,
+        ...openClawCompatibility.warnings,
+        ...openClawCompatibility.errors,
         ...(status.runtimeStore.enabled ? [] : ["node:sqlite is unavailable; pin a compatible Node version before production use."]),
         ...(context.config.knowledgePromotionEnabled && !context.config.knowledgePromotionManualReviewEnabled
           ? ["Automatic knowledge promotion is enabled without manual review; this is faster but gives the user less control."]
@@ -651,8 +711,10 @@ export class ChaunyomsRetrievalService {
     const status = await this.runtime.getStatus(context);
     const verify = await this.runtime.verify(context);
     const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
+    const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
     const warnings = [
       ...configGuidance.warnings,
+      ...openClawCompatibility.warnings,
       ...verify.warnings,
       ...(context.config.emergencyBrake ? ["emergencyBrake is enabled: automatic compaction/promotion paths are intentionally conservative."] : []),
       ...(status.runtimeStore.enabled ? [] : ["SQLite runtime is disabled; source recall tools will fall back to no-op results."]),
@@ -662,14 +724,15 @@ export class ChaunyomsRetrievalService {
       ...(status.runtimeStore.experimentalAdapter ? ["SQLite runtime is using Node's experimental node:sqlite adapter; pin a compatible Node version for production deployments."] : []),
       ...(context.config.knowledgePromotionEnabled ? [] : ["knowledgePromotionEnabled is false; Markdown asset promotion is opt-in/disabled."]),
     ];
-    const errors = [...verify.errors];
+    const errors = [...verify.errors, ...openClawCompatibility.errors];
     const doctor = {
       ok: errors.length === 0,
-      engineId: "chaunyoms",
-      activeRuntime: "sqlite-first runtime, markdown-first assets",
+      engineId: "oms",
+      activeRuntime: "sqlite-first runtime, markdown export-only assets",
       status,
       verify,
       configGuidance,
+      openClawCompatibility,
       warnings,
       errors,
       nextActions: errors.length > 0
@@ -1003,7 +1066,6 @@ export class ChaunyomsRetrievalService {
     context: LifecycleContext;
     decision: RetrievalDecision;
     memoryItems: MemoryItemEntry[];
-    knowledgeHits: KnowledgeDocumentIndexEntry[];
     summaryHits: SummaryEntry[];
     projects: ProjectRecord[];
     matchedProject: ProjectRecord | null;
@@ -1012,7 +1074,6 @@ export class ChaunyomsRetrievalService {
     if (!expansionEnabled) {
       return {
         candidates: [],
-        knowledgeHits: [],
         memoryItemHits: [],
         summaryHits: [],
         projectHit: args.matchedProject,
@@ -1020,29 +1081,6 @@ export class ChaunyomsRetrievalService {
     }
     const terms = this.semanticTerms(args.query);
     const candidates: SemanticCandidate[] = [];
-    const knowledgeHits = [...args.knowledgeHits]
-      .map((entry) => ({
-        entry,
-        score: this.scoreKnowledgeEntry(entry, terms, args.query),
-      }))
-      .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score || left.entry.title.localeCompare(right.entry.title))
-      .slice(0, Math.max(args.context.config.semanticCandidateLimit, 1));
-    for (const item of knowledgeHits) {
-      candidates.push({
-        kind: "knowledge",
-        id: item.entry.docId,
-        title: item.entry.title,
-        score: item.score,
-        reasons: [
-          `knowledge:${item.entry.bucket}`,
-          `origin:${item.entry.origin}`,
-          `status:${item.entry.status}`,
-        ],
-        authority: item.entry.status === "superseded" ? "hint" : "authoritative",
-        sourceRoute: "semantic_candidate_expansion",
-      });
-    }
 
     const memoryItemHits = [...args.memoryItems]
       .filter((entry) => entry.status === "active" && entry.contextPolicy !== "never")
@@ -1143,7 +1181,6 @@ export class ChaunyomsRetrievalService {
       candidates: [...candidates]
         .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
         .slice(0, Math.max(args.context.config.semanticCandidateLimit, 1)),
-      knowledgeHits: knowledgeHits.map((item) => item.entry),
       memoryItemHits: memoryItemHits.map((item) => item.entry),
       summaryHits: summaryHits.map((item) => item.entry),
       projectHit,
@@ -1153,7 +1190,6 @@ export class ChaunyomsRetrievalService {
   private emptySemanticExpansion(projectHit: ProjectRecord | null = null): SemanticExpansionResult {
     return {
       candidates: [],
-      knowledgeHits: [],
       memoryItemHits: [],
       summaryHits: [],
       projectHit,
@@ -1847,9 +1883,7 @@ export class ChaunyomsRetrievalService {
         3,
       )
       : [];
-    const hasKnowledgeHits = this.shouldProbeKnowledgeDecision(query, context)
-      ? runtimeStore.searchKnowledgeAssets(query, 1).length > 0
-      : false;
+    const hasKnowledgeHits = false;
     const decision = this.retrievalRouter.decide(query, {
       hasKnowledgeHits,
       hasKnowledgeRawHint: false,
@@ -2114,63 +2148,11 @@ export class ChaunyomsRetrievalService {
     return /(current|latest|now|currently|updated|correction|after correction|exact|parameter|constraint|decision|rule|setting|config|remember|must|当前|最新|修正后|参数|约束|决策|规则|配置|记住)/i.test(query);
   }
 
-  private shouldProbeKnowledgeDecision(query: string, context: LifecycleContext): boolean {
-    if (!context.config.semanticCandidateExpansionEnabled) {
-      return this.hasKnowledgeRouteTerms(query);
-    }
-    return this.hasKnowledgeRouteTerms(query);
-  }
-
-  private shouldProbeKnowledgeFallback(query: string, context: LifecycleContext): boolean {
-    if (!context.config.semanticCandidateExpansionEnabled) {
-      return false;
-    }
-    return this.hasKnowledgeRouteTerms(query);
-  }
-
-  private hasKnowledgeRouteTerms(query: string): boolean {
-    const terms = [
-      "knowledge[- ]?base",
-      "\\u77e5\\u8bc6\\u5e93",
-      "\\u6587\\u6863",
-      "\\u8d44\\u6599",
-      "topic-index",
-      "architecture docs?",
-      "\\u60f3\\u60f3",
-      "\\u53d1\\u6563",
-      "\\u7075\\u611f",
-      "\\u521b\\u9020\\u529b",
-      "\\u521b\\u610f",
-      "\\u77e5\\u8bc6\\u5e7f\\u5ea6",
-      "\\u7ecf\\u9a8c",
-      "\\u5b66\\u4e60",
-      "\\u501f\\u9274",
-      "\\u53c2\\u8003",
-      "\\u6700\\u4f73\\u5b9e\\u8df5",
-      "\\u6848\\u4f8b",
-      "\\u6a21\\u5f0f",
-      "lesson",
-      "learn",
-      "learning",
-      "experience",
-      "inspiration",
-      "creative",
-      "creativity",
-      "brainstorm",
-      "broaden",
-      "best practice",
-      "pattern",
-      "example",
-      "case study",
-    ];
-    return new RegExp(terms.join("|"), "i").test(query);
-  }
-
   private formatMemoryItemText(query: string, items: MemoryItemEntry[]): string {
     return [
       `MemoryItem hits for: ${query}`,
       ...items.map((item, index) =>
-        `${index + 1}. [${item.kind}/${item.sourceTable}] ${item.text}`),
+        `${index + 1}. [${item.kind}/${item.sourceTable}] ${item.content ?? item.text}`),
     ].join("\n");
   }
 
@@ -2240,10 +2222,10 @@ export class ChaunyomsRetrievalService {
       typeof metadata.factValue === "string" ? metadata.factValue : "",
       typeof metadata.draftKind === "string" ? metadata.draftKind : "",
       typeof metadata.evidenceDraftType === "string" ? metadata.evidenceDraftType : "",
-      entry.text,
+      entry.content ?? entry.text,
     ].join(" ").toLowerCase();
     let score = this.scoreHaystack(haystack, terms);
-    if (entry.evidenceLevel === "high") {
+    if (entry.evidenceLevel === "source_verified") {
       score += 3;
     } else if (entry.inferred) {
       score -= 1;
@@ -2287,49 +2269,6 @@ export class ChaunyomsRetrievalService {
       expanded.push(...(synonyms.get(term) ?? []));
     }
     return [...new Set(expanded)];
-  }
-
-  private scoreManagedKnowledge(
-    entry: KnowledgeDocumentIndexEntry,
-    terms: string[],
-  ): number {
-    const haystack = [
-      entry.slug,
-      entry.title,
-      entry.summary,
-      entry.canonicalKey,
-      entry.origin,
-      ...entry.tags,
-      ...entry.sourceRefs,
-    ].join(" ").toLowerCase();
-    return this.scoreHaystack(haystack, terms);
-  }
-
-  private scoreKnowledgeEntry(
-    entry: KnowledgeDocumentIndexEntry,
-    terms: string[],
-    query: string,
-  ): number {
-    let score = this.scoreManagedKnowledge(entry, terms);
-    if (entry.status === "active") {
-      score += 4;
-    } else if (entry.status === "draft") {
-      score += 1;
-    } else {
-      score -= 1;
-    }
-    if (entry.origin === "synthesized" || entry.origin === "native") {
-      score += 2;
-    }
-    if (entry.sourceRefs.length > 0) {
-      score += Math.min(entry.sourceRefs.length, 3);
-    }
-    score += this.scoreSemanticHaystack(
-      [entry.title, entry.summary, entry.canonicalKey, ...entry.tags].join(" "),
-      terms,
-      query,
-    );
-    return score;
   }
 
   private scoreSummaryEntry(
@@ -2405,67 +2344,6 @@ export class ChaunyomsRetrievalService {
       grams.add(normalized.slice(index, index + 3));
     }
     return grams;
-  }
-
-  private async buildUnifiedKnowledgeResult(
-    query: string,
-    managedHits: KnowledgeDocumentIndexEntry[],
-    decision: RetrievalDecision,
-    context: LifecycleContext,
-  ): Promise<ToolResponse> {
-    const terms = this.semanticTerms(query);
-    const unifiedHits = await Promise.all(managedHits
-      .map(async (entry) => ({
-        recordType: "knowledge_record" as const,
-        score: this.scoreKnowledgeEntry(entry, terms, query),
-        title: entry.title,
-        body: await this.resolveKnowledgeBody(entry, context),
-        metadata: [
-          `type: knowledge_record`,
-          `origin: ${entry.origin}`,
-          `bucket: ${entry.bucket}`,
-          `canonicalKey: ${entry.canonicalKey}`,
-          `status: ${entry.status}`,
-          `summary: ${entry.summary}`,
-          `versions: ${entry.versions.length}`,
-          `provenance refs: ${entry.sourceRefs.length}`,
-          `linked summaries: ${entry.linkedSummaryIds.join(", ") || "none"}`,
-          `source refs: ${entry.sourceRefs.join(", ") || "none"}`,
-        ],
-      })))
-      .then((hits) => hits
-      .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
-      .slice(0, 6));
-
-    const text = unifiedHits.length > 0
-      ? unifiedHits
-        .map((hit, index) => [
-          `${index + 1}. ${hit.title}`,
-          ...hit.metadata.map((line) => `   ${line}`),
-          "",
-          hit.body,
-        ].join("\n"))
-        .join("\n\n---\n\n")
-      : `No knowledge documents matched query: ${query}`;
-
-    return {
-      content: [{ type: "text", text }],
-      details: {
-        ok: true,
-        route: decision.route,
-        retrievalLabel: this.describeRetrievalRoute(decision),
-        query,
-        hitCount: unifiedHits.length,
-        knowledgeHitCount: managedHits.length,
-        topRecordType: unifiedHits[0]?.recordType ?? null,
-        retrievalHitType: "knowledge",
-        autoRecall: false,
-        autoRecallReason: null,
-        routePlan: decision.routePlan,
-        layerScores: decision.layerScores ?? [],
-        explanation: decision.explanation,
-      },
-    };
   }
 
   private buildMissingQueryResponse(toolName: string): ToolResponse {
@@ -2584,6 +2462,71 @@ export class ChaunyomsRetrievalService {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
 
+  private normalizeOpenClawSearchArgs(args: unknown): Record<string, unknown> {
+    const record = this.isRecord(args) ? { ...args } : {};
+    const query =
+      this.getStringArg(record, "query") ||
+      this.getStringArg(record, "q") ||
+      this.getStringArg(record, "text");
+    return {
+      ...record,
+      query,
+    };
+  }
+
+  private normalizeOpenClawMemoryRef(ref: string): string {
+    const normalized = ref.trim();
+    return normalized
+      .replace(/^memory_id:/i, "")
+      .replace(/^summary_id:/i, "")
+      .replace(/^source_id:/i, "")
+      .replace(/^message_id:/i, "")
+      .replace(/^asset_id:/i, "");
+  }
+
+  private resolveOpenClawMemoryRefKind(
+    args: Record<string, unknown>,
+    ref: string,
+  ): string {
+    const explicitKind = this.getStringArg(args, "kind").toLowerCase();
+    if (explicitKind === "message" || explicitKind === "summary" || explicitKind === "asset") {
+      return explicitKind;
+    }
+    if (explicitKind === "memory" || explicitKind === "memory_item") {
+      return "memory_item";
+    }
+    if (/^(memory_id:|memory-item:|mem_)/i.test(ref)) {
+      return "memory_item";
+    }
+    if (/^(summary_id:|summary-|summary_)/i.test(ref)) {
+      return "summary";
+    }
+    if (/^(asset_id:|asset:|doc_)/i.test(ref)) {
+      return "asset";
+    }
+    return "auto";
+  }
+
+  private withOpenClawCompatibility(
+    result: ToolResponse,
+    openClawTool: string,
+    canonicalTool: string,
+    metadata: Record<string, unknown> = {},
+  ): ToolResponse {
+    return {
+      ...result,
+      details: {
+        ...result.details,
+        toolCompatibility: {
+          openClawTool,
+          canonicalTool,
+          compatibilityLayer: "chaunyoms-openclaw-memory",
+          ...metadata,
+        },
+      },
+    };
+  }
+
   private shouldAutoRecall(decision: RetrievalDecision, context: LifecycleContext): boolean {
     if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
       return false;
@@ -2683,24 +2626,6 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  private async resolveKnowledgeBody(
-    entry: KnowledgeDocumentIndexEntry,
-    context: LifecycleContext,
-  ): Promise<string> {
-    const fallback = entry.summary.trim();
-    if (!entry.latestFile || !entry.bucket) {
-      return fallback;
-    }
-    try {
-      const filePath = path.join(context.config.knowledgeBaseDir, entry.bucket, entry.latestFile);
-      const content = await readFile(filePath, "utf8");
-      const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
-      return body || fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
   private matchProject(query: string, projects: ProjectRecord[]): ProjectRecord | null {
     const terms = query
       .toLowerCase()
@@ -2741,5 +2666,3 @@ export class ChaunyomsRetrievalService {
   }
 
 }
-
-

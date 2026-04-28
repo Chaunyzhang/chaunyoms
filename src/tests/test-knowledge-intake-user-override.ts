@@ -170,6 +170,7 @@ async function main(): Promise<void> {
     kbPromotionMode: "balanced_auto" as const,
     kbPromotionStrictness: "medium" as const,
     kbExportEnabled: true,
+    knowledgeMarkdownEnabled: true,
     knowledgeIntakeUserOverrideEnabled: true,
   };
 

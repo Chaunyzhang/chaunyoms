@@ -499,9 +499,18 @@ export type MemoryItemKind =
   | "kb_candidate"
   | "general";
 
-export type MemoryItemScope = "agent" | "session" | "project" | "global_principle" | "global";
+export type MemoryItemScope =
+  | "agent"
+  | "session"
+  | "project"
+  | "user_private_to_agent"
+  | "global_principle"
+  | "global";
 export type MemoryItemStatus = "candidate" | "active" | "superseded" | "rejected" | "archived" | "expired";
-export type MemoryItemEvidenceLevel = "none" | "low" | "medium" | "high" | "inferred";
+export type MemoryItemEvidenceLevel =
+  | "inferred"
+  | "stated"
+  | "source_verified";
 export type MemoryItemContextPolicy =
   | "never"
   | "on_demand"
@@ -513,6 +522,7 @@ export type MemoryItemStability = "low" | "medium" | "high";
 export type MemoryItemPromotionState =
   | "none"
   | "candidate"
+  | "kb_candidate"
   | "drafted"
   | "approved"
   | "exported"
@@ -529,10 +539,12 @@ export interface MemoryItemEntry {
   kind: MemoryItemKind;
   status: MemoryItemStatus;
   scope: MemoryItemScope;
+  scopeType?: MemoryItemScope;
   scopeId: string;
   evidenceLevel: MemoryItemEvidenceLevel;
   contextPolicy: MemoryItemContextPolicy;
   text: string;
+  content?: string;
   confidence: number;
   stability: MemoryItemStability;
   priority: number;

@@ -109,14 +109,14 @@ async function main(): Promise<void> {
   });
 
   const text = String(result.content[0]?.text ?? "");
-  assert(/Canonical retry and backoff policy/i.test(text), "expected explicit knowledge-base query to reach governed SQLite-mirrored knowledge");
-  assert(result.details.route === "knowledge", "expected explicit knowledge-base query to route directly");
-  assert(result.details.retrievalHitType === "knowledge", "expected explicit knowledge-base query to return governed knowledge");
+  assert(!/Canonical retry and backoff policy/i.test(text), "expected explicit knowledge-base query not to read Markdown-backed export content");
+  assert(result.details.route === "knowledge", "expected explicit knowledge-base query to stay classified as knowledge");
+  assert(result.details.retrievalHitType === "knowledge_export_only", "expected explicit knowledge-base query to refuse Markdown hot-path retrieval");
   assert(
-    Array.isArray(result.details.semanticCandidates) && result.details.semanticCandidates.length > 0,
-    "expected semantic candidates diagnostics",
+    !Array.isArray(result.details.semanticCandidates) || result.details.semanticCandidates.length === 0,
+    "expected no Markdown-derived semantic candidates in the runtime hot path",
   );
-  assert(!Array.isArray(result.details.fallbackTrace), "expected no fallback trace when knowledge is selected directly");
+  assert(Array.isArray(result.details.fallbackTrace), "expected fallback trace when knowledge is export-only");
 
   const advisoryResult = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
@@ -124,9 +124,9 @@ async function main(): Promise<void> {
     query: "From prior experience, think broadly about queue worker retry backoff.",
   });
   const advisoryText = String(advisoryResult.content[0]?.text ?? "");
-  assert(/Canonical retry and backoff policy/i.test(advisoryText), "expected experience/advisory query to reach governed SQLite-mirrored knowledge");
-  assert(advisoryResult.details.route === "knowledge", "expected experience/advisory query to route to knowledge");
-  assert(advisoryResult.details.reason === "knowledge_advisory_query", "expected advisory knowledge route reason");
+  assert(!/Canonical retry and backoff policy/i.test(advisoryText), "expected experience/advisory query not to read Markdown-backed export content");
+  assert(advisoryResult.details.route === "recent_tail", "expected advisory query without MemoryItem/Source authority to fall back to recent tail");
+  assert(advisoryResult.details.retrievalHitType === "recent_tail", "expected advisory query to avoid Markdown hot-path retrieval");
 
   await rm(dir, { recursive: true, force: true });
   console.log("test-semantic-candidate-expansion passed");

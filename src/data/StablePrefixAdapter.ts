@@ -14,11 +14,15 @@ export class StablePrefixAdapter implements FixedPrefixProvider, NavigationRepos
   }
 
   async getKnowledgeBaseHit(sharedDataDir: string, query: string) {
-    return await this.store.getKnowledgeBaseHit(sharedDataDir, query);
+    void sharedDataDir;
+    void query;
+    return null;
   }
 
   async hasKnowledgeBaseTopicHit(sharedDataDir: string, query: string) {
-    return await this.store.hasKnowledgeBaseTopicHit(sharedDataDir, query);
+    void sharedDataDir;
+    void query;
+    return false;
   }
 
   async getNavigationHit(workspaceDir: string, query: string) {

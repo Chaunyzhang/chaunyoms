@@ -39,6 +39,7 @@ async function runScenario(
       maxFreshTailTurns: 1,
       compactionBatchTurns: 2,
       summaryMaxOutputTokens: 160,
+      knowledgeMarkdownEnabled: true,
       strictCompaction: true,
       compactionBarrierEnabled: true,
     };

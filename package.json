@@ -1,7 +1,7 @@
 {
   "name": "chaunyoms",
   "version": "0.1.0",
-  "description": "Lightweight oms context engine plugin for OpenClaw.",
+  "description": "Authoritative OMS memory and contextEngine substrate plugin for OpenClaw.",
   "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

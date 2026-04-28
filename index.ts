@@ -5,10 +5,11 @@ import { OpenClawApiLike } from "./src/host/OpenClawHostTypes";
 const bridge = new OpenClawBridge();
 
 const plugin = {
-  id: "chaunyoms",
-  name: "Chaunyoms",
-  description: "Lightweight oms context engine plugin for OpenClaw",
-  kind: "context-engine",
+  id: "oms",
+  name: "ChaunyOMS",
+  description:
+    "Authoritative OpenClaw memory and contextEngine substrate backed by ChaunyOMS SQLite. Markdown is export-only, never a runtime fact source.",
+  kind: "memory",
   configSchema: pluginConfigSchema,
   register(api: OpenClawApiLike): void {
     bridge.register(api);

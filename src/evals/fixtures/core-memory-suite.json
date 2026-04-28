@@ -1,7 +1,7 @@
 {
   "suiteId": "core-memory-suite-v1",
   "title": "ChaunyOMS Core Memory Evaluation",
-  "description": "Formal evaluation suite for core memory behavior across exact recall, knowledge updates, project state, and unified knowledge.",
+  "description": "Formal evaluation suite for core memory behavior across exact recall, knowledge updates, project state, and Markdown export-only enforcement.",
   "cases": [
     {
       "id": "exact-fact-recall-long-history",
@@ -99,9 +99,9 @@
       }
     },
     {
-      "id": "unified-knowledge-hit",
-      "title": "Unified Knowledge Retrieval",
-      "description": "Knowledge-base queries should surface governed long-term knowledge with provenance-aware routing.",
+      "id": "knowledge-markdown-export-only",
+      "title": "Knowledge Markdown Is Export-Only",
+      "description": "Knowledge-base Markdown seed assets must not answer runtime facts in authoritative OMS mode; source-backed MemoryItems must be promoted/imported first.",
       "tags": ["knowledge", "route_accuracy"],
       "mode": "retrieve",
       "query": "check the knowledge base for the queue retry policy",
@@ -119,9 +119,10 @@
         }
       ],
       "expected": {
-        "mustInclude": ["capped exponential backoff"],
+        "mustInclude": ["Knowledge/Markdown assets are export-only"],
+        "mustNotInclude": ["capped exponential backoff"],
         "detailEquals": {
-          "retrievalHitType": "knowledge"
+          "retrievalHitType": "knowledge_export_only"
         }
       }
     }

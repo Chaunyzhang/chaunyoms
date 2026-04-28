@@ -121,7 +121,9 @@ export class SessionDataLayer {
 
     // Current ChaunyOMS runtime is SQLite-first. Historical JSON import/export
     // remains an explicit offline admin concern, never a hot-path store mode.
-    this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir);
+    this.knowledgeStore = new KnowledgeMarkdownStore(knowledgeDir, {
+      enabled: config.knowledgeMarkdownEnabled,
+    });
     this.statsLogStore = new RuntimeStatsLogStore(config.dataDir);
     this.runtimeStore = new SQLiteRuntimeStore({
       dbPath: path.join(agentDataDir, "chaunyoms-runtime.sqlite"),

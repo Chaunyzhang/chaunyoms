@@ -43,7 +43,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   summaryMarkdownMirrorEnabled: false,
   memoryItemMarkdownMirrorEnabled: false,
   transcriptMirrorEnabled: false,
-  knowledgeMarkdownEnabled: true,
+  knowledgeMarkdownEnabled: false,
   retrievalStrength: "auto",
   knowledgePromotionEnabled: false,
   knowledgePromotionManualReviewEnabled: true,

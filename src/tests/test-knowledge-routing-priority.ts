@@ -26,6 +26,7 @@ async function main(): Promise<void> {
     knowledgeBaseDir: path.join(dir, "shared", "knowledge-base"),
     sessionId: "knowledge-routing-session",
     knowledgePromotionEnabled: true,
+    knowledgeMarkdownEnabled: true,
   };
 
   await mkdir(path.join(config.workspaceDir, "memory"), { recursive: true });
@@ -129,7 +130,8 @@ async function main(): Promise<void> {
     config,
     query: "Check the knowledge base for the queue retry policy",
   });
-  assert(knowledgeRoute.details.route === "knowledge", "expected default knowledge queries to route to the unified knowledge corpus");
+  assert(knowledgeRoute.details.originalRoute === "knowledge", "expected default knowledge queries to be classified as knowledge requests first");
+  assert(knowledgeRoute.details.route === "recent_tail", "expected knowledge route diagnostics to show runtime fallback off Markdown");
 
   const knowledgeRetrieve = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
@@ -137,13 +139,12 @@ async function main(): Promise<void> {
     query: "Check the knowledge base for the queue retry policy",
   });
   const knowledgeText = String(knowledgeRetrieve.content[0]?.text ?? "");
-  assert(/Canonical retry policy for queue workers/i.test(knowledgeText), "expected retrieval to return unified SQLite-mirrored knowledge content");
-  assert(/Manual raw note for queue retry policy/i.test(knowledgeText), "expected retrieval to also return user-provided raw knowledge metadata mirrored into SQLite");
-  assert(knowledgeRetrieve.details.topRecordType === "knowledge_record", "expected unified knowledge query to return undifferentiated knowledge records");
+  assert(!/Canonical retry policy for queue workers/i.test(knowledgeText), "expected runtime retrieval not to return Markdown export content");
+  assert(!/Manual raw note for queue retry policy/i.test(knowledgeText), "expected runtime retrieval not to return user-provided raw Markdown metadata");
+  assert(knowledgeRetrieve.details.retrievalHitType === "knowledge_export_only", "expected knowledge route to be export-only in the runtime hot path");
   assert(
-    typeof knowledgeRetrieve.details.knowledgeHitCount === "number" &&
-      knowledgeRetrieve.details.knowledgeHitCount >= 2,
-    "expected managed and manual raw records to share the same knowledge hit path",
+    knowledgeRetrieve.details.knowledgeHitCount === 0,
+    "expected managed and manual raw records not to share a hot retrieval path",
   );
 
   const rawRoute = await retrieval.executeMemoryRoute({
@@ -151,7 +152,8 @@ async function main(): Promise<void> {
     config,
     query: "Look in raw knowledge in the knowledge base for the queue retry policy",
   });
-  assert(rawRoute.details.route === "knowledge", "expected raw knowledge queries to still use the unified knowledge route");
+  assert(rawRoute.details.originalRoute === "knowledge", "expected raw knowledge queries to be classified as knowledge requests first");
+  assert(rawRoute.details.route === "recent_tail", "expected raw knowledge route diagnostics to show runtime fallback off Markdown");
 
   const rawRetrieve = await retrieval.executeMemoryRetrieve({
     sessionId: config.sessionId,
@@ -159,7 +161,7 @@ async function main(): Promise<void> {
     query: "Look in raw knowledge in the knowledge base for the queue retry policy",
   });
   const rawText = String(rawRetrieve.content[0]?.text ?? "");
-  assert(/Manual raw note for queue retry policy/i.test(rawText), "expected raw knowledge queries to surface manual raw metadata through the unified SQLite corpus");
+  assert(!/Manual raw note for queue retry policy/i.test(rawText), "expected raw knowledge queries to avoid Markdown hot-path retrieval");
   assert(!("sourceClassHitCount" in rawRetrieve.details), "expected retrieval metadata to avoid source-class split counts");
 
   await rm(dir, { recursive: true, force: true });

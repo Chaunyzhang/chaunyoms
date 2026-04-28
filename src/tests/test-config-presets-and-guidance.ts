@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   assert(safeContext.config.summaryMarkdownMirrorEnabled === false, "expected summary Markdown mirrors to be disabled by default");
   assert(safeContext.config.memoryItemMarkdownMirrorEnabled === false, "expected MemoryItem Markdown mirrors to be disabled by default");
   assert(safeContext.config.transcriptMirrorEnabled === false, "expected transcript mirrors to be disabled by default");
-  assert(safeContext.config.knowledgeMarkdownEnabled === true, "expected curated Knowledge Markdown to remain enabled by default");
+  assert(safeContext.config.knowledgeMarkdownEnabled === false, "expected Knowledge Markdown hot-path assets to be disabled by default");
 
   const mirrorContext = adapter.resolveLifecycleContext({
     config: {
@@ -33,14 +33,14 @@ async function main(): Promise<void> {
       summaryMarkdownMirrorEnabled: true,
       memoryItemMarkdownMirrorEnabled: true,
       transcriptMirrorEnabled: true,
-      knowledgeMarkdownEnabled: false,
+      knowledgeMarkdownEnabled: true,
     },
   }, DEFAULT_BRIDGE_CONFIG);
   assert(mirrorContext.config.agentVaultMirrorEnabled === true, "expected explicit AgentVault mirror opt-in");
   assert(mirrorContext.config.summaryMarkdownMirrorEnabled === true, "expected explicit summary mirror opt-in");
   assert(mirrorContext.config.memoryItemMarkdownMirrorEnabled === true, "expected explicit MemoryItem mirror opt-in");
   assert(mirrorContext.config.transcriptMirrorEnabled === true, "expected explicit transcript mirror opt-in");
-  assert(mirrorContext.config.knowledgeMarkdownEnabled === false, "expected explicit Knowledge Markdown opt-out to parse");
+  assert(mirrorContext.config.knowledgeMarkdownEnabled === true, "expected explicit Knowledge Markdown export opt-in to parse");
 
   const enhancedContext = adapter.resolveLifecycleContext({
     config: {

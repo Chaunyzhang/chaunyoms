@@ -5,6 +5,10 @@ import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
 import { getOpenClawConfigPath, getOpenClawHomeDir } from "./HostPathResolver";
 import { HostRecord, isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
+import {
+  inspectOpenClawCompatibility,
+  OpenClawCompatibilityReport,
+} from "./OpenClawCompatibilityContract";
 
 export interface ToolConfigResult {
   enabled: boolean;
@@ -155,6 +159,10 @@ export class OpenClawPayloadAdapter {
     };
   }
 
+  inspectOpenClawCompatibility(): OpenClawCompatibilityReport {
+    return inspectOpenClawCompatibility(this.getApi());
+  }
+
   extractTextFromContent(content: unknown): string {
     if (typeof content === "string") {
       return content;
@@ -230,9 +238,9 @@ export class OpenClawPayloadAdapter {
       this.getApi()?.pluginConfig ??
         this.getApi()?.context?.pluginConfig ??
         this.getApi()?.runtime?.pluginConfig ??
-        this.getApi()?.config?.plugins?.entries?.chaunyoms?.config ??
-        this.getApi()?.context?.config?.plugins?.entries?.chaunyoms?.config ??
-        this.getApi()?.runtime?.config?.plugins?.entries?.chaunyoms?.config ??
+        this.getApi()?.config?.plugins?.entries?.oms?.config ??
+        this.getApi()?.context?.config?.plugins?.entries?.oms?.config ??
+        this.getApi()?.runtime?.config?.plugins?.entries?.oms?.config ??
         this.getApi()?.config,
     ) ?? {};
     const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
@@ -1475,7 +1483,7 @@ export class OpenClawPayloadAdapter {
     try {
       const configPath = getOpenClawConfigPath();
       const parsed = JSON.parse(readFileSync(configPath, "utf8"));
-      return parsed?.plugins?.entries?.chaunyoms?.config?.enableTools;
+      return parsed?.plugins?.entries?.oms?.config?.enableTools;
     } catch (error) {
       this.getLogger().warn("tool_config_file_read_failed", {
         error: error instanceof Error ? error.message : String(error),

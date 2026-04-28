@@ -25,15 +25,25 @@ export const pluginConfigSchema = {
     },
     memoryVaultDir: {
       type: "string",
-      description: "Git-friendly Markdown memory vault root. Defaults to sharedDataDir/vaults/chaunyoms.",
+      description: "Optional human-readable Markdown export/stub root. Defaults to sharedDataDir/vaults/chaunyoms; SQLite remains the runtime memory source.",
     },
     knowledgeBaseDir: {
       type: "string",
-      description: "Unified markdown knowledge directory. AI promotions and user-provided raw/ files are indexed as one corpus with provenance metadata only.",
+      description: "Optional human-readable/export knowledge directory. It is never scanned as the AI runtime fact source in authoritative OMS mode.",
     },
     enableTools: {
       type: "boolean",
       description: "Register the standard ChaunyOMS tool surface: memory_retrieve plus raw/source trace utilities.",
+    },
+    mode: {
+      type: "string",
+      enum: ["advisory", "authoritative"],
+      description: "OpenClaw compatibility enforcement mode. authoritative fail-fasts when OpenClaw native memory slots/plugins would create a second fact source.",
+    },
+    openClawCompatibilityMode: {
+      type: "string",
+      enum: ["advisory", "authoritative"],
+      description: "Alias for mode, kept for explicit OpenClaw compatibility configuration.",
     },
     contextWindow: {
       type: "number",
@@ -93,7 +103,7 @@ export const pluginConfigSchema = {
     },
     agentVaultMirrorEnabled: {
       type: "boolean",
-      description: "Enable optional AgentVault human-readable Markdown mirrors. Disabled by default; SQLite and KnowledgeMarkdownStore remain the runtime source paths.",
+      description: "Enable optional AgentVault human-readable Markdown mirrors. Disabled by default; SQLite remains the only authoritative runtime source.",
     },
     summaryMarkdownMirrorEnabled: {
       type: "boolean",
@@ -109,7 +119,7 @@ export const pluginConfigSchema = {
     },
     knowledgeMarkdownEnabled: {
       type: "boolean",
-      description: "Keep the curated KnowledgeMarkdownStore enabled as the default human-readable knowledge layer. Enabled by default.",
+      description: "Opt in to curated KnowledgeMarkdownStore export/index maintenance. Disabled by default in the final shape; Markdown never becomes a runtime fact source.",
     },
     retrievalStrength: {
       type: "string",

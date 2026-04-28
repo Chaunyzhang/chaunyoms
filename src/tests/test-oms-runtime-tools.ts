@@ -26,6 +26,8 @@ async function main(): Promise<void> {
       enableTools: true,
     };
     const tools = new Map<string, { execute: (toolCallId: string, args: unknown) => Promise<unknown> }>();
+    const contextEngineIds: string[] = [];
+    const memoryCapabilities: Record<string, unknown>[] = [];
     const bridge = new OpenClawBridge();
     bridge.register({
       config: { enableTools: true },
@@ -34,8 +36,28 @@ async function main(): Promise<void> {
       registerTool(tool: { name: string; execute: (toolCallId: string, args: unknown) => Promise<unknown> }): void {
         tools.set(tool.name, tool);
       },
-      registerContextEngine(): void {},
+      registerContextEngine(id: string): void {
+        contextEngineIds.push(id);
+      },
+      registerMemoryCapability(capability: unknown): void {
+        if (capability && typeof capability === "object" && !Array.isArray(capability)) {
+          memoryCapabilities.push(capability as Record<string, unknown>);
+        }
+      },
     });
+    assert(contextEngineIds.length === 1, "only the final docs-exact oms context engine should be registered");
+    assert(contextEngineIds.includes("oms"), "oms context engine should be registered for docs-compatible slot binding");
+    assert(memoryCapabilities.length === 1, "OpenClaw memory capability should be registered exactly once");
+    const memoryCapability = memoryCapabilities[0] as Record<string, unknown>;
+    assert(memoryCapability.id === "oms", "memory capability should bind the docs-exact oms memory slot");
+    assert(memoryCapability.pluginId === "oms", "memory capability should use the docs-exact OpenClaw plugin id");
+    assert(memoryCapability.markdownHotPath === false, "memory capability must reject Markdown hot-path ownership");
+    const memoryRuntime = memoryCapability.runtime as Record<string, unknown> | undefined;
+    assert(typeof memoryRuntime?.search === "function", "memory capability should expose runtime.search");
+    assert(typeof memoryRuntime?.get === "function", "memory capability should expose runtime.get");
+    const memoryRuntimeRecord = memoryRuntime as Record<string, unknown>;
+    assert(typeof memoryCapability.promptBuilder === "function", "memory capability should expose a prompt section builder");
+    assert(typeof memoryCapability.flushPlanResolver === "function", "memory capability should expose a flush plan resolver");
 
     await bridge.ingest({
       sessionId: config.sessionId,
@@ -95,8 +117,10 @@ async function main(): Promise<void> {
       config,
     }) as { details?: Record<string, unknown> } | undefined;
     const statusCounts = status?.details?.counts as Record<string, unknown> | undefined;
+    const compatibility = status?.details?.openClawCompatibility as Record<string, unknown> | undefined;
     assert(status?.details?.scope === "agent", "oms_status should default to agent scope");
     assert(statusCounts?.rawMessages === 2, "agent-scoped oms_status should report agent-wide raw message count");
+    assert(compatibility?.mode === "advisory", "oms_status should expose OpenClaw compatibility contract state");
 
     const verify = await tools.get("oms_verify")?.execute("tool-4", {
       sessionId: config.sessionId,
@@ -109,13 +133,21 @@ async function main(): Promise<void> {
       sessionId: config.sessionId,
       config,
     }) as { details?: Record<string, unknown> } | undefined;
-    assert(doctor?.details?.engineId === "chaunyoms", "oms_doctor should identify the engine");
+    assert(doctor?.details?.engineId === "oms", "oms_doctor should identify the engine");
 
     const setup = await tools.get("oms_setup_guide")?.execute("tool-setup", {
       sessionId: config.sessionId,
       config,
     }) as { details?: Record<string, unknown> } | undefined;
     assert(setup?.details?.purpose === "Configure ChaunyOMS as a SQLite-first runtime with Markdown assets as reviewed human-readable output.", "oms_setup_guide should explain setup intent");
+    const recommendedConfig = setup?.details?.recommendedConfig as Record<string, unknown> | undefined;
+    const recommendedPlugins = recommendedConfig?.plugins as Record<string, unknown> | undefined;
+    assert(Boolean(recommendedPlugins), "oms_setup_guide should emit OpenClaw dual-slot plugin config");
+    const recommendedSlots = recommendedPlugins?.slots as Record<string, unknown> | undefined;
+    const recommendedEntries = recommendedPlugins?.entries as Record<string, unknown> | undefined;
+    assert(recommendedSlots?.memory === "oms", "oms_setup_guide should recommend docs-exact memory slot binding");
+    assert(recommendedSlots?.contextEngine === "oms", "oms_setup_guide should recommend docs-exact contextEngine slot binding");
+    assert(Boolean(recommendedEntries?.oms), "oms_setup_guide should recommend an oms plugin entry");
 
     const assetSync = await tools.get("oms_asset_sync")?.execute("tool-asset-sync", {
       sessionId: config.sessionId,
@@ -236,9 +268,58 @@ async function main(): Promise<void> {
     assert(tools.has("qa_cancel"), "qa_cancel should be registered");
     assert(tools.has("qa"), "qa should be registered");
     assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
+    assert(tools.has("memory_search"), "OpenClaw-compatible memory_search should be registered");
+    assert(tools.has("memory_get"), "OpenClaw-compatible memory_get should be registered");
+    assert(tools.has("memory_status"), "OpenClaw-compatible memory_status should be registered");
+    assert(tools.has("memory_index"), "OpenClaw-compatible memory_index should be registered");
+    assert(tools.has("memory_promote"), "OpenClaw-compatible memory_promote should be registered");
+    assert(tools.has("memory_promote_explain"), "OpenClaw-compatible memory_promote_explain should be registered");
     assert(!tools.has("memory_route"), "memory_route should not be registered on the standard tool surface");
     assert(!tools.has("recall_detail"), "recall_detail should not be registered on the standard tool surface");
     assert(!tools.has("lcm_grep"), "legacy lcm aliases should not be registered on the standard tool surface");
+
+    const memorySearch = await tools.get("memory_search")?.execute("memory-search", {
+      sessionId: "tools-session-2",
+      config: { ...config, sessionId: "tools-session-2" },
+      q: "TRACE_PORT=19090",
+      scope: "session",
+      retrievalStrength: "strict",
+    }) as { details?: Record<string, unknown> } | undefined;
+    const searchCompatibility = memorySearch?.details?.toolCompatibility as Record<string, unknown> | undefined;
+    assert(searchCompatibility?.openClawTool === "memory_search", "memory_search should identify its OpenClaw compatibility tool name");
+    assert(searchCompatibility?.markdownHotPath === false, "memory_search must not use Markdown as a hot fact source");
+
+    const slotSearch = await (memoryRuntimeRecord.search as (args?: unknown) => Promise<unknown>)({
+      sessionId: "tools-session-2",
+      config: { ...config, sessionId: "tools-session-2" },
+      query: "TRACE_PORT=19090",
+      scope: "session",
+      retrievalStrength: "strict",
+    }) as { details?: Record<string, unknown> };
+    const slotSearchCompatibility = slotSearch.details?.toolCompatibility as Record<string, unknown> | undefined;
+    assert(slotSearchCompatibility?.openClawTool === "memory_search", "memory slot runtime search should route to the OpenClaw-compatible search facade");
+    assert(slotSearchCompatibility?.markdownHotPath === false, "memory slot runtime search must not use Markdown as a hot fact source");
+
+    const slotPrompt = await (memoryCapability.promptBuilder as (args?: unknown) => Promise<Record<string, unknown>>)({
+      sessionId: config.sessionId,
+      config,
+    });
+    assert(String(slotPrompt.content ?? "").includes("Do not read or write MEMORY.md"), "memory prompt section should warn off Markdown memory hot paths");
+
+    const slotFlushPlan = await (memoryCapability.flushPlanResolver as (args?: unknown) => Promise<Record<string, unknown>>)({
+      sessionId: config.sessionId,
+      config,
+    });
+    assert(slotFlushPlan.markdownHotPath === false, "memory flush plan should suppress Markdown hot-path writes");
+
+    const memoryGet = await tools.get("memory_get")?.execute("memory-get", {
+      sessionId: "tools-session-2",
+      config: { ...config, sessionId: "tools-session-2" },
+      ref: "message_id:tool-message-2",
+    }) as { details?: Record<string, unknown> } | undefined;
+    const getCompatibility = memoryGet?.details?.toolCompatibility as Record<string, unknown> | undefined;
+    assert(getCompatibility?.openClawTool === "memory_get", "memory_get should identify its OpenClaw compatibility tool name");
+    assert(memoryGet?.details?.targetFound === true, "memory_get should resolve source/message refs through OMS");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

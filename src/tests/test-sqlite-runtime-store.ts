@@ -136,7 +136,9 @@ async function main(): Promise<void> {
     }
     assert(memoryItemItem.kind === "constraint", "MemoryItem constraints should map to MemoryItem kind=constraint");
     assert(memoryItemItem.scope === "agent" && memoryItemItem.scopeId === "agent-1", "memoryItem MemoryItem should expose document-style scope fields");
-    assert(memoryItemItem.evidenceLevel === "high", "raw-message memoryItem MemoryItem should carry high evidence level");
+    assert(memoryItemItem.scopeType === "agent", "MemoryItem should expose document-style scope_type alias");
+    assert(memoryItemItem.content === memoryItemItem.text, "MemoryItem should expose document-style content field");
+    assert(memoryItemItem.evidenceLevel === "source_verified", "raw-message memoryItem MemoryItem should carry source-verified evidence level");
     assert(memoryItemItem.contextPolicy === "default", "memoryItem MemoryItem should use the document's context_policy vocabulary");
     assert(memoryItemItem.confidence === 0.9 && memoryItemItem.priority === 10, "memoryItem MemoryItem should expose confidence and priority as fields");
     assert(memoryItemItem.sourceRefs?.some((ref) => ref.messageId === "m-1"), "memoryItem MemoryItem should expose source refs");
@@ -172,7 +174,7 @@ async function main(): Promise<void> {
       }
     }
 
-    assert(atomItem.evidenceLevel === "high", "evidence atom MemoryItem should retain high evidence level");
+    assert(atomItem.evidenceLevel === "source_verified", "evidence atom MemoryItem should retain source-verified evidence level");
     assert(atomItem.contextPolicy === "strict_only", "evidence atom MemoryItem should only enter strict fact contexts by policy");
     assert(atomItem.sourceIds.includes("summary-1") && atomItem.sourceIds.includes("m-1"), "evidence atom MemoryItem should carry summary and raw source ids");
     assert(atomItem.sourceRefs?.some((ref) => ref.messageId === "m-1"), "evidence atom MemoryItem should expose source refs");
@@ -207,6 +209,7 @@ async function main(): Promise<void> {
     assert(kbItem.promotionState === "candidate", "pending knowledge raw should retain candidate promotion state");
     assert(kbItem.contextPolicy === "never", "kb_candidate MemoryItems should not enter the hot context path by default");
     assert(kbItem.scope === "agent" && kbItem.scopeId === "agent-1", "knowledge raw MemoryItem should expose document-style scope fields");
+    assert(kbItem.content === "Deployment port belongs in reviewed knowledge.", "knowledge raw MemoryItem should expose content field");
     assert(kbItem.sourceIds.includes("summary-1") && kbItem.supports.includes("summary-1"), "knowledge raw MemoryItem should expose source/support fields");
     assert(kbItem.priority === 80, "knowledge raw MemoryItem should be a low hot-path priority candidate field");
     assert(store.trace("memory_item", "memory-item:knowledge-raw-1").some((edge) => edge.targetId === "summary-1"), "knowledge raw MemoryItem should trace to source summary");

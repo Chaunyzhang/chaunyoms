@@ -77,11 +77,11 @@ async function main(): Promise<void> {
     query: "something related to architecture docs in the knowledge base",
   });
 
-  assert(result.details.route === "knowledge", "expected knowledge queries to stay in the unified knowledge route");
-  assert(result.details.retrievalHitType === "knowledge", "expected no vector hit or Markdown fallback in the standard runtime path");
+  assert(result.details.route === "knowledge", "expected knowledge queries to stay classified as knowledge requests");
+  assert(result.details.retrievalHitType === "knowledge_export_only", "expected no vector hit or Markdown fallback in the standard runtime path");
   assert(
-    String(result.content[0]?.text ?? "").includes("No SQLite knowledge assets matched"),
-    "expected SQLite-first knowledge miss text when no reviewed knowledge exists",
+    String(result.content[0]?.text ?? "").includes("Knowledge/Markdown assets are export-only"),
+    "expected export-only knowledge text when Markdown is outside the hot path",
   );
 
   await rm(dir, { recursive: true, force: true });

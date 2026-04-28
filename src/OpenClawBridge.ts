@@ -10,6 +10,10 @@ import {
 } from "./host/OpenClawPayloadAdapter";
 import { OpenClawApiLike } from "./host/OpenClawHostTypes";
 import {
+  formatOpenClawCompatibilityFailure,
+  OPENCLAW_COMPATIBILITY_PLUGIN_IDS,
+} from "./host/OpenClawCompatibilityContract";
+import {
   ChaunyomsSessionRuntime,
 } from "./runtime/ChaunyomsSessionRuntime";
 import { createRuntimeLayerDependencies } from "./runtime/createRuntimeLayerDependencies";
@@ -50,8 +54,31 @@ export class OpenClawBridge {
       this.runtime.getConfig(),
     ).config;
     const configGuidance = this.payloadAdapter.describeConfigGuidance(resolvedConfig);
+    const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
 
     const toolConfig = this.payloadAdapter.resolveToolConfig();
+    this.logger.info("openclaw_compatibility_resolved", {
+      ok: openClawCompatibility.ok,
+      mode: openClawCompatibility.mode,
+      enforcement: openClawCompatibility.enforcement,
+      selectedSlots: openClawCompatibility.selectedSlots,
+      errors: openClawCompatibility.errors,
+      warnings: openClawCompatibility.warnings,
+    });
+    for (const warning of openClawCompatibility.warnings) {
+      this.logger.warn("openclaw_compatibility_warning", { warning });
+    }
+    if (
+      openClawCompatibility.enforcement === "fail_fast" &&
+      !openClawCompatibility.ok
+    ) {
+      const message = formatOpenClawCompatibilityFailure(openClawCompatibility);
+      this.logger.error("openclaw_compatibility_failed", {
+        errors: openClawCompatibility.errors,
+      });
+      throw new Error(message);
+    }
+
     this.logger.info("tool_config_resolved", {
       toolsEnabled: toolConfig.enabled,
       source: toolConfig.source,
@@ -76,20 +103,24 @@ export class OpenClawBridge {
       });
     }
 
+    this.registerMemorySlot(api);
+
     if (typeof api?.registerContextEngine === "function") {
-      api.registerContextEngine("chaunyoms", () => ({
-        info: {
-          id: "chaunyoms",
-          name: "Chaunyoms",
-          version: "0.1.0",
-          ownsCompaction: true,
-        },
-        bootstrap: this.bootstrap.bind(this),
-        ingest: this.ingest.bind(this),
-        assemble: this.assemble.bind(this),
-        compact: this.compact.bind(this),
-        afterTurn: this.afterTurn.bind(this),
-      }));
+      for (const id of OPENCLAW_COMPATIBILITY_PLUGIN_IDS) {
+        api.registerContextEngine(id, () => ({
+          info: {
+            id,
+            name: id === "oms" ? "OMS" : "Chaunyoms",
+            version: "0.1.0",
+            ownsCompaction: true,
+          },
+          bootstrap: this.bootstrap.bind(this),
+          ingest: this.ingest.bind(this),
+          assemble: this.assemble.bind(this),
+          compact: this.compact.bind(this),
+          afterTurn: this.afterTurn.bind(this),
+        }));
+      }
     }
   }
 
@@ -178,6 +209,164 @@ export class OpenClawBridge {
     return { ok: true };
   }
 
+  private registerMemorySlot(api: OpenClawApiLike): void {
+    const capability = this.buildOpenClawMemoryCapability();
+    const promptBuilder = capability.promptBuilder;
+    const flushPlanResolver = capability.flushPlanResolver;
+    const runtime = capability.runtime;
+    const registered = {
+      memoryCapability: false,
+      promptSection: false,
+      flushPlan: false,
+      runtime: false,
+    };
+
+    if (typeof api.registerMemoryCapability === "function") {
+      api.registerMemoryCapability(capability);
+      registered.memoryCapability = true;
+    }
+    if (typeof api.registerMemoryPromptSection === "function") {
+      api.registerMemoryPromptSection(promptBuilder);
+      registered.promptSection = true;
+    }
+    if (typeof api.registerMemoryFlushPlan === "function") {
+      api.registerMemoryFlushPlan(flushPlanResolver);
+      registered.flushPlan = true;
+    }
+    if (typeof api.registerMemoryRuntime === "function") {
+      api.registerMemoryRuntime(runtime);
+      registered.runtime = true;
+    }
+
+    const anyRegistered = Object.values(registered).some(Boolean);
+    if (anyRegistered) {
+      this.logger.info("openclaw_memory_slot_registered", {
+        id: capability.id,
+        pluginId: capability.pluginId,
+        registered,
+        markdownHotPath: false,
+      });
+    } else {
+      this.logger.warn("openclaw_memory_slot_registration_unavailable", {
+        id: capability.id,
+        pluginId: capability.pluginId,
+        reason: "host_missing_memory_plugin_registration_api",
+      });
+    }
+  }
+
+  private buildOpenClawMemoryCapability(): {
+    id: string;
+    pluginId: string;
+    kind: string;
+    name: string;
+    version: string;
+    description: string;
+    ownsLongTermMemory: boolean;
+    ownsCompaction: boolean;
+    ownsMarkdownHotPath: boolean;
+    markdownHotPath: boolean;
+    promptBuilder: (payload?: unknown) => Promise<Record<string, unknown>>;
+    buildPromptSection: (payload?: unknown) => Promise<Record<string, unknown>>;
+    flushPlanResolver: (payload?: unknown) => Promise<Record<string, unknown>>;
+    resolveFlushPlan: (payload?: unknown) => Promise<Record<string, unknown>>;
+    runtime: Record<string, unknown>;
+    publicArtifacts: Record<string, unknown>;
+    tools: Record<string, unknown>;
+    memorySearch: (args?: unknown) => Promise<unknown>;
+    memoryGet: (args?: unknown) => Promise<unknown>;
+  } {
+    const memorySearch = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemorySearch(this.normalizeMemoryRuntimeArgs(args, "query"));
+    const memoryGet = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemoryGet(this.normalizeMemoryRuntimeArgs(args, "ref"));
+    const memoryStatus = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemoryStatus(args);
+    const memoryIndex = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemoryIndex(args);
+    const memoryPromote = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemoryPromote(args);
+    const memoryPromoteExplain = async (args?: unknown) =>
+      await this.retrieval.executeOpenClawMemoryPromoteExplain(args);
+    const promptBuilder = async (_payload?: unknown) => ({
+      id: "oms",
+      pluginId: "oms",
+      title: "ChaunyOMS durable memory",
+      role: "memory",
+      source: "chaunyoms",
+      markdownHotPath: false,
+      content: [
+        "ChaunyOMS owns this agent's durable memory and context substrate.",
+        "Use the OMS memory runtime/search/get surfaces for recall.",
+        "Do not read or write MEMORY.md, DREAMS.md, daily notes, or Obsidian Markdown as live memory facts.",
+      ].join("\n"),
+    });
+    const flushPlanResolver = async (_payload?: unknown) => ({
+      id: "oms",
+      pluginId: "oms",
+      ok: true,
+      markdownHotPath: false,
+      writes: [],
+      operations: [],
+      reason:
+        "ChaunyOMS handles compaction, MemoryItem promotion, and source-backed recall in SQLite; OpenClaw Markdown memory flushes are intentionally suppressed.",
+    });
+    const publicArtifacts = {
+      listArtifacts: async () => [],
+      list: async () => [],
+    };
+    const runtime = {
+      id: "oms",
+      pluginId: "oms",
+      kind: "memory-runtime",
+      markdownHotPath: false,
+      search: memorySearch,
+      memorySearch,
+      searchMemories: memorySearch,
+      get: memoryGet,
+      memoryGet,
+      getMemory: memoryGet,
+      status: memoryStatus,
+      memoryStatus,
+      index: memoryIndex,
+      reindex: memoryIndex,
+      memoryIndex,
+      promote: memoryPromote,
+      memoryPromote,
+      promoteExplain: memoryPromoteExplain,
+      memoryPromoteExplain,
+    };
+    return {
+      id: "oms",
+      pluginId: "oms",
+      kind: "memory",
+      name: "ChaunyOMS Memory",
+      version: "0.1.0",
+      description:
+        "Authoritative OpenClaw memory slot backed by ChaunyOMS SQLite MemoryItem/BaseSummary/Source data; Markdown is export-only.",
+      ownsLongTermMemory: true,
+      ownsCompaction: true,
+      ownsMarkdownHotPath: false,
+      markdownHotPath: false,
+      promptBuilder,
+      buildPromptSection: promptBuilder,
+      flushPlanResolver,
+      resolveFlushPlan: flushPlanResolver,
+      runtime,
+      publicArtifacts,
+      tools: runtime,
+      memorySearch,
+      memoryGet,
+    };
+  }
+
+  private normalizeMemoryRuntimeArgs(
+    args: unknown,
+    stringField: "query" | "ref",
+  ): unknown {
+    return typeof args === "string" ? { [stringField]: args } : args;
+  }
+
   private registerTools(api: OpenClawApiLike): void {
     const register = (
       name: string,
@@ -225,6 +414,105 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeMemoryRetrieve(args),
+    );
+
+    register(
+      "memory_search",
+      "OpenClaw-compatible memory search facade backed by ChaunyOMS MemoryItem/BaseSummary/Source retrieval. Does not read Markdown memory files.",
+      {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query." },
+          q: { type: "string", description: "Alias for query." },
+          text: { type: "string", description: "Alias for query." },
+          limit: { type: "number", description: "Optional maximum result hint." },
+          scope: { type: "string", enum: ["agent", "session"] },
+          retrievalStrength: {
+            type: "string",
+            enum: ["off", "light", "auto", "strict", "forensic"],
+          },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemorySearch(args),
+    );
+
+    register(
+      "memory_get",
+      "OpenClaw-compatible memory get facade. Resolves memory_id, summary_id, source/message id, trace id, or asset id through ChaunyOMS source edges.",
+      {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "OpenClaw-style memory reference." },
+          id: { type: "string", description: "Alias for ref." },
+          memory_id: { type: "string", description: "Alias for ref." },
+          kind: { type: "string", enum: ["auto", "message", "summary", "memory", "asset"] },
+          full: { type: "boolean", description: "Return a larger source window." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemoryGet(args),
+    );
+
+    register(
+      "memory_status",
+      "OpenClaw-compatible memory status facade for ChaunyOMS database, index, planner, and compatibility-contract health.",
+      {
+        type: "object",
+        properties: {
+          scope: { type: "string", enum: ["agent", "session"] },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemoryStatus(args),
+    );
+
+    register(
+      "memory_index",
+      "OpenClaw-compatible memory index facade. Rebuilds ChaunyOMS SQLite asset indexes without regenerating Source or reading Markdown in the hot path.",
+      {
+        type: "object",
+        properties: {
+          force: { type: "boolean", description: "Compatibility flag; ChaunyOMS reindex is explicit and deterministic." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemoryIndex(args),
+    );
+
+    register(
+      "memory_promote",
+      "OpenClaw-compatible memory promote facade. Previews ChaunyOMS governed knowledge candidates, or approves a specific candidate with apply=true and id.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Candidate id to approve when apply=true." },
+          apply: { type: "boolean", description: "Approve the specified candidate." },
+          limit: { type: "number", description: "Preview limit." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemoryPromote(args),
+    );
+
+    register(
+      "memory_promote_explain",
+      "OpenClaw-compatible memory promote explanation facade. Shows ChaunyOMS candidate scores, statuses, and review state.",
+      {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "Optional candidate status filter." },
+          limit: { type: "number", description: "Maximum candidates to show." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOpenClawMemoryPromoteExplain(args),
     );
 
     register(

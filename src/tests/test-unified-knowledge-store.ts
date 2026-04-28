@@ -34,7 +34,7 @@ function buildSummary(): SummaryEntry {
 
 async function main(): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-knowledge-store-"));
-  const store = new KnowledgeMarkdownStore(dir);
+  const store = new KnowledgeMarkdownStore(dir, { enabled: true });
   await store.init();
 
   const summary = buildSummary();

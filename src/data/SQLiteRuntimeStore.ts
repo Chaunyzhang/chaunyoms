@@ -1870,6 +1870,7 @@ export class SQLiteRuntimeStore {
 
   private upsertMemoryItem(item: MemoryItemEntry): void {
     const metadata = item.metadata ?? {};
+    const content = item.content ?? item.text;
     this.prepare(`
       INSERT INTO memory_items (
         id, memory_id, source_table, source_id, session_id, agent_id, project_id,
@@ -1926,12 +1927,12 @@ export class SQLiteRuntimeStore {
       item.kind,
       item.status,
       item.scope,
-      item.scope,
+      item.scopeType ?? item.scope,
       item.scopeId,
       item.evidenceLevel,
       item.contextPolicy,
       item.text,
-      item.text,
+      content,
       item.confidence,
       item.stability,
       item.priority,
@@ -1951,7 +1952,11 @@ export class SQLiteRuntimeStore {
       item.createdAt,
       item.updatedAt,
       this.stringify(metadata),
-      this.stringify(item),
+      this.stringify({
+        ...item,
+        content,
+        scopeType: item.scopeType ?? item.scope,
+      }),
     );
   }
 
@@ -1979,10 +1984,12 @@ export class SQLiteRuntimeStore {
       kind: kindByDraft[memory.kind] ?? "general",
       status: memory.recordStatus ?? "active",
       scope,
+      scopeType: scope,
       scopeId: this.memoryItemScopeId(scope, memory),
-      evidenceLevel: memory.sourceType === "raw_message" ? "high" : memory.sourceType === "snapshot" ? "medium" : "low",
+      evidenceLevel: memory.sourceType === "raw_message" ? "source_verified" : memory.sourceType === "snapshot" ? "stated" : "inferred",
       contextPolicy: memory.projectId ? "project_active" : "default",
       text: memory.text,
+      content: memory.text,
       confidence: this.numberFromUnknown(metadata.confidence, memory.sourceType === "raw_message" ? 0.8 : 0.5),
       stability: this.stabilityFromUnknown(metadata.stability),
       priority: this.numberFromUnknown(metadata.priority, memory.projectId ? 20 : 30),
@@ -2043,10 +2050,12 @@ export class SQLiteRuntimeStore {
       kind,
       status: atom.recordStatus ?? "active",
       scope,
+      scopeType: scope,
       scopeId: this.memoryItemScopeId(scope, atom),
-      evidenceLevel: atom.sourceTraceComplete ? "high" : "medium",
+      evidenceLevel: atom.sourceTraceComplete ? "source_verified" : "stated",
       contextPolicy: "strict_only",
       text: atom.text,
+      content: atom.text,
       confidence: atom.confidence,
       stability: this.memoryItemStabilityFromScore(atom.stability),
       priority: this.priorityFromEvidenceAtom(atom),
@@ -2110,7 +2119,7 @@ export class SQLiteRuntimeStore {
     if (scope === "project" && entry.projectId) {
       return entry.projectId;
     }
-    if (scope === "agent" && entry.agentId) {
+    if ((scope === "agent" || scope === "user_private_to_agent") && entry.agentId) {
       return entry.agentId;
     }
     if ((scope === "global" || scope === "global_principle") && entry.projectId) {
@@ -2204,14 +2213,16 @@ export class SQLiteRuntimeStore {
       kind: "kb_candidate",
       status: rejected ? "rejected" : settled ? "active" : "candidate",
       scope,
+      scopeType: scope,
       scopeId: this.memoryItemScopeId(scope, {
         sessionId: entry.sessionId || summary.sessionId,
         agentId: entry.agentId ?? summary.agentId,
         projectId: summary.projectId,
       }),
-      evidenceLevel: summary.sourceHash || entry.sourceBinding || summary.sourceBinding ? "high" : "inferred",
+      evidenceLevel: summary.sourceHash || entry.sourceBinding || summary.sourceBinding ? "source_verified" : "inferred",
       contextPolicy: "never",
       text: entry.oneLineSummary?.trim() || summary.summary,
+      content: entry.oneLineSummary?.trim() || summary.summary,
       confidence: this.numberFromUnknown(entry.score?.total, summary.quality?.confidence ?? 0.5),
       stability: "medium",
       priority: 80,
@@ -2990,16 +3001,21 @@ export class SQLiteRuntimeStore {
   }
 
   private normalizeMemoryItemEntry(entry: MemoryItemEntry): MemoryItemEntry {
-    const scope = this.normalizeMemoryItemScope(entry.scope);
+    const scope = this.normalizeMemoryItemScope(entry.scope ?? entry.scopeType);
     const contextPolicy = this.normalizeMemoryItemContextPolicy(entry.contextPolicy);
     const promotionState = this.normalizeMemoryItemPromotionState(entry.promotionState);
+    const content = entry.content ?? entry.text;
     return {
       ...entry,
       kind: this.normalizeMemoryItemKind(entry.kind),
       status: this.normalizeMemoryItemStatus(entry.status),
       scope,
+      scopeType: this.normalizeMemoryItemScope(entry.scopeType ?? scope),
       scopeId: entry.scopeId ?? this.memoryItemScopeId(scope, entry),
+      evidenceLevel: this.normalizeMemoryItemEvidenceLevel(entry.evidenceLevel),
       contextPolicy,
+      text: entry.text ?? content,
+      content,
       confidence: this.numberFromUnknown(entry.confidence, 0.5),
       stability: this.stabilityFromUnknown(entry.stability),
       priority: this.numberFromUnknown(entry.priority, 50),
@@ -3106,7 +3122,7 @@ export class SQLiteRuntimeStore {
       confidence: item.confidence,
       importance: typeof metadata.importance === "number" ? metadata.importance : Math.max(0.1, Math.min(1, (100 - item.priority) / 100)),
       stability: typeof metadata.stability === "number" ? metadata.stability : item.stability === "high" ? 0.9 : item.stability === "low" ? 0.25 : 0.5,
-      sourceTraceComplete: item.evidenceLevel === "high" && !item.inferred,
+      sourceTraceComplete: item.evidenceLevel === "source_verified" && !item.inferred,
       sourceSummaryId: summaryId ?? "",
       sourceBinding,
       sourceMessageIds,
@@ -3150,10 +3166,27 @@ export class SQLiteRuntimeStore {
 
   private normalizeMemoryItemScope(scope: string): MemoryItemScope {
     if (scope === "agent" || scope === "session" || scope === "project" ||
-      scope === "global_principle" || scope === "global") {
+      scope === "user_private_to_agent" || scope === "global_principle" || scope === "global") {
       return scope;
     }
     return "session";
+  }
+
+  private normalizeMemoryItemEvidenceLevel(value: string): MemoryItemEntry["evidenceLevel"] {
+    switch (value) {
+      case "source_verified":
+      case "high":
+        return "source_verified";
+      case "stated":
+      case "medium":
+      case "low":
+        return "stated";
+      case "inferred":
+      case "none":
+        return "inferred";
+      default:
+        return "inferred";
+    }
   }
 
   private normalizeMemoryItemContextPolicy(value: string): MemoryItemEntry["contextPolicy"] {
@@ -3187,6 +3220,7 @@ export class SQLiteRuntimeStore {
         return "rejected";
       case "none":
       case "candidate":
+      case "kb_candidate":
       case "drafted":
       case "approved":
       case "exported":

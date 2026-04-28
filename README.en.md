@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**A production-minded context engine plugin for OpenClaw**
+**An authoritative memory + contextEngine substrate plugin for OpenClaw**
 
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-context--engine-6f42c1)](./README.md)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6)](https://www.typescriptlang.org/)
@@ -11,18 +11,18 @@
 
 </div>
 
-> ChaunyOMS is a **runtime-first memory and context orchestration layer** for OpenClaw.  
+> ChaunyOMS is a **runtime-first memory and context orchestration layer** for OpenClaw.
 > It is designed to stay useful before compaction, disciplined during compaction, and extensible toward future wiki-style knowledge workflows.
 
 ---
 
 ## Current architecture in one sentence
 
-**ChaunyOMS is a SQLite-driven long-context runtime with Markdown as the long-term knowledge asset layer.**
+**ChaunyOMS is a SQLite-driven OpenClaw memory + contextEngine substrate. Markdown is export-only, never the runtime fact source.**
 
-SQLite owns runtime truth: raw messages, summaries, source edges, memories, asset index, context-run audit logs, and retrieval candidates. Markdown owns human-readable assets: decisions, patterns, facts, incidents, and reviewed notes. Runtime retrieval is raw-first for facts, asset-aware for reviewed knowledge, and always gated by ContextPlanner budget/authority rules.
+SQLite owns runtime truth: Source/raw messages, BaseSummary, MemoryItem, source edges, asset indexes, context-run audit logs, and retrieval candidates. `MEMORY.md`, daily notes, `DREAMS.md`, and Obsidian/knowledge Markdown are human-readable exports or migration/debug artifacts only; they are not scanned on every turn and do not feed authoritative recall. Runtime retrieval is source-first, MemoryItem/BaseSummary-backed, and always gated by ContextPlanner budget/authority rules.
 
-Use `memory_retrieve` as the primary entrypoint. Use `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, and `oms_why_recalled` when you need setup guidance, evidence, operations, or explainability.
+Use `memory_retrieve` as the primary OMS entrypoint and the OpenClaw-compatible `memory_search` / `memory_get` facades when the host expects native memory tools. Use `oms_setup_guide`, `oms_grep`, `oms_expand`, `oms_trace`, `oms_replay`, `oms_status`, `oms_doctor`, `oms_verify`, `oms_backup`, `oms_restore`, `oms_asset_sync`, `oms_asset_reindex`, `oms_asset_verify`, `oms_inspect_context`, and `oms_why_recalled` when you need setup guidance, evidence, operations, or explainability.
 
 ---
 
@@ -75,7 +75,7 @@ Set `sqliteJournalMode` to `"wal"` only when the host runtime benefits from conc
 
 Run `oms_setup_guide` after install to see the active data paths, Node `node:sqlite` adapter status, safe defaults, and the recommended knowledge-promotion/manual-review posture for the current host configuration.
 
-Markdown assets are synchronized explicitly rather than scanned on every model turn:
+Markdown assets are explicit export/index artifacts, not hot-path memory. When you opt into maintaining them, synchronize them deliberately:
 
 - `oms_asset_sync` updates SQLite's runtime asset index from Markdown after normal edits.
 - `oms_asset_reindex` rebuilds the runtime asset index from Markdown after migrations or suspected drift.
@@ -85,7 +85,7 @@ Markdown assets are synchronized explicitly rather than scanned on every model t
 
 ## Knowledge candidate review
 
-Knowledge promotion can stay fully automatic, or it can pause in a scored review queue before Markdown writes:
+Knowledge promotion is review-first by default in the final shape. If you opt into Markdown export writes, candidates can pause in a scored review queue before any export:
 
 ```json
 {
@@ -145,7 +145,7 @@ Most systems eventually blur these concerns:
 
 ChaunyOMS tries to resist that drift.
 
-It is not “bigger memory.”  
+It is not “bigger memory.”
 It is an attempt to make a long-running OpenClaw agent behave like a system with:
 
 - a **source layer**
@@ -242,7 +242,7 @@ This distinction is central.
 - **Durable memory** = early structured memory entries such as constraints, decisions, diagnostics, and project-state hints.
 - **Summary** = compaction output over a range of historical turns.
 
-Durable memory exists *before* compaction.  
+Durable memory exists *before* compaction.
 Summary exists *because of* compaction.
 
 ### 3. Knowledge should have a staging area
@@ -431,23 +431,29 @@ Add this under your OpenClaw config:
 {
   "plugins": {
     "slots": {
-      "contextEngine": "chaunyoms"
+      "memory": "oms",
+      "contextEngine": "oms"
     },
     "entries": {
-      "chaunyoms": {
+      "oms": {
         "enabled": true,
         "config": {
           "dataDir": "C:\\openclaw-data\\data\\chaunyoms",
           "sharedDataDir": "C:\\openclaw-data",
           "memoryVaultDir": "C:\\openclaw-data\\vaults\\chaunyoms",
           "knowledgeBaseDir": "C:\\openclaw-data\\knowledge-base",
-          "enableTools": false,
+          "mode": "authoritative",
+          "enableTools": true,
           "contextThreshold": 0.70,
           "strictCompaction": true,
           "compactionBarrierEnabled": true,
           "knowledgePromotionEnabled": false
         }
-      }
+      },
+      "memory-core": { "enabled": false },
+      "active-memory": { "enabled": false },
+      "memory-wiki": { "enabled": false },
+      "dreaming": { "enabled": false }
     }
   }
 }
@@ -475,14 +481,14 @@ Important schema options:
 - `strictCompaction`
 - `compactionBarrierEnabled`
 - `runtimeCaptureEnabled`
-- `durableMemoryEnabled`
+- `memoryItemEnabled`
 - `autoRecallEnabled`
 - `knowledgePromotionEnabled`
 - `emergencyBrake`
 
 ### Notes
 
-- plugin config belongs under `plugins.entries.chaunyoms.config`
+- plugin config belongs under `plugins.entries.oms.config`
 - if `sharedDataDir` is overridden and other dirs are omitted, ChaunyOMS derives paths under that shared root
 - if assembly fails, ChaunyOMS falls back to recent-tail behavior
 

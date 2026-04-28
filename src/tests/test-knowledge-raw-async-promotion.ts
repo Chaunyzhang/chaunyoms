@@ -37,6 +37,7 @@ async function main(): Promise<void> {
     kbPromotionMode: "balanced_auto" as const,
     kbPromotionStrictness: "medium" as const,
     kbExportEnabled: true,
+    knowledgeMarkdownEnabled: true,
   };
 
   await mkdir(path.join(config.workspaceDir, "memory"), { recursive: true });

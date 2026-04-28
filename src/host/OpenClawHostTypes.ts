@@ -41,7 +41,8 @@ export interface HostConfigLike extends HostRecord {
     providers?: Record<string, HostProviderConfig>;
   };
   plugins?: {
-    entries?: Record<string, { config?: HostRecord }>;
+    slots?: Record<string, unknown>;
+    entries?: Record<string, { config?: HostRecord; enabled?: unknown }>;
   };
 }
 
@@ -61,6 +62,10 @@ export interface OpenClawApiLike extends HostRecord {
   memorySearch?: HostFunctionContainer;
   pluginConfig?: unknown;
   registerContextEngine?: (id: string, factory: () => unknown) => void;
+  registerMemoryCapability?: (capability: unknown) => void;
+  registerMemoryFlushPlan?: (resolver: unknown) => void;
+  registerMemoryPromptSection?: (builder: unknown) => void;
+  registerMemoryRuntime?: (runtime: unknown) => void;
   registerTool?: (tool: OpenClawToolDefinition) => void;
   runtime?: HostContextNamespace;
   session?: HostRecord;

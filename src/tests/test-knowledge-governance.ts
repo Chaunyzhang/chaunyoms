@@ -34,7 +34,7 @@ function buildSummary(id: string, summary: string): SummaryEntry {
 
 async function main(): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-knowledge-governance-"));
-  const store = new KnowledgeMarkdownStore(dir);
+  const store = new KnowledgeMarkdownStore(dir, { enabled: true });
   await store.init();
 
   const summaryA = buildSummary("summary-a", "Retry policy was standardized for worker jobs.");

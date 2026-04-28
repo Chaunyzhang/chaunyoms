@@ -15,10 +15,10 @@
     "kind": "standard_no_authority",
     "query": "something related to architecture docs in the knowledge base",
     "expectedTextIncludes": [
-      "No SQLite knowledge assets matched query"
+      "Knowledge/Markdown assets are export-only"
     ],
     "expectedDetails": {
-      "retrievalHitType": "knowledge"
+      "retrievalHitType": "knowledge_export_only"
     }
   }
 ]

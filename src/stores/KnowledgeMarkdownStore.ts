@@ -28,18 +28,22 @@ interface PromotionLedgerFileV1 {
   entries: PromotionLedgerEntry[];
 }
 
+interface KnowledgeMarkdownStoreOptions {
+  enabled?: boolean;
+}
+
 const README_CONTENT = `# ChaunyOMS Unified Knowledge
 
-This directory stores the unified ChaunyOMS knowledge corpus.
+This directory stores human-readable ChaunyOMS knowledge exports.
 
-- raw/: user-provided raw knowledge notes; files dropped here are indexed with the same retrieval weight as AI-promoted knowledge
+- raw/: user-provided raw knowledge notes for explicit import/review only; files here are never an AI hot-path fact source
 - raw/system/: system intake artifacts written before AI-generated promotions are finalized
 - decisions/: versioned decision records
 - patterns/: reusable engineering patterns
 - facts/: stable facts and constraints
 - incidents/: incident write-ups and postmortems
 - indexes/: promotion ledger and document index
-- origin is provenance metadata only; retrieval does not split knowledge by source-class weights
+- Markdown here is export/admin material. Runtime retrieval must use SQLite Source/BaseSummary/MemoryItem records, not this directory.
 `;
 
 const VERSIONED_BUCKETS: Exclude<KnowledgeDocBucket, "raw">[] = [
@@ -58,10 +62,17 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   private readonly ledgerPath: string;
   private readonly documentIndexPath: string;
 
-  constructor(private readonly baseDir: string) {
+  constructor(
+    private readonly baseDir: string,
+    private readonly options: KnowledgeMarkdownStoreOptions = {},
+  ) {
     this.indexesDir = path.join(baseDir, "indexes");
     this.ledgerPath = path.join(this.indexesDir, "promotion-ledger.json");
     this.documentIndexPath = path.join(this.indexesDir, "document-index.json");
+  }
+
+  private isEnabled(): boolean {
+    return this.options.enabled === true;
   }
 
   async init(): Promise<void> {
@@ -91,11 +102,26 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   }
 
   getIndexedDocuments(): KnowledgeDocumentIndexEntry[] {
+    if (!this.isEnabled()) {
+      return [];
+    }
     return this.normalizeDocuments(this.documents);
   }
 
   async syncAssetIndex(mode: "sync" | "reindex" = "sync"): Promise<KnowledgeAssetSyncReport> {
     await this.init();
+    if (!this.isEnabled()) {
+      return {
+        ok: true,
+        mode,
+        beforeCount: 0,
+        afterCount: 0,
+        added: [],
+        removed: [],
+        updated: [],
+        warnings: ["Knowledge Markdown export/indexing is disabled; Markdown remains outside the runtime hot path."],
+      };
+    }
     const before = this.normalizeDocuments(this.documents);
     const rebuilt = await this.rebuildDocumentsFromFilesystem();
     const beforeById = new Map(before.map((entry) => [entry.docId, entry]));
@@ -129,6 +155,18 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
 
   async verifyAssetIndex(): Promise<KnowledgeAssetVerifyReport> {
     await this.init();
+    if (!this.isEnabled()) {
+      return {
+        ok: true,
+        indexedCount: 0,
+        filesystemCount: 0,
+        missingFiles: [],
+        missingProvenance: [],
+        duplicateCanonicalKeys: [],
+        staleIndex: false,
+        warnings: ["Knowledge Markdown export/indexing is disabled; Markdown remains outside the runtime hot path."],
+      };
+    }
     const indexed = this.normalizeDocuments(this.documents);
     const rebuilt = await this.rebuildDocumentsFromFilesystem();
     const indexedById = new Map(indexed.map((entry) => [entry.docId, entry]));
@@ -201,6 +239,9 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
   }
 
   searchRelatedDocuments(query: string, limit = 3): KnowledgeDocumentIndexEntry[] {
+    if (!this.isEnabled()) {
+      return [];
+    }
     this.refreshManualRawDocuments();
     const terms = this.queryTerms(query);
     if (terms.length === 0) {
@@ -308,17 +349,17 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
     return {
       owner: "chaunyoms",
       layer: "unified_knowledge",
-      writable: true,
+      writable: this.isEnabled(),
       versioned: true,
       requiresProvenance: true,
       notes: [
-        "This repository stores AI-promoted and user-provided knowledge as one unified corpus.",
-        "Origin is tracked as provenance metadata only; retrieval does not split imported/manual/system content into separate weights.",
-        "User raw files can be dropped into raw/ and are indexed as first-class knowledge.",
-        "AI-generated promotions write a system raw intake artifact before the final versioned document is committed.",
+        "This repository stores human-readable exports and import candidates, not runtime facts.",
+        "Markdown is disabled by default and never participates in ChaunyOMS hot-path retrieval.",
+        "User raw files can be dropped into raw/ only as explicit import/review inputs.",
+        "AI-generated promotions write Markdown only when export is explicitly enabled.",
         "Documents must keep provenance back to summaries and source references.",
         "Knowledge can be superseded, reconciled, and version-audited.",
-        "Search ranking prefers active, provenance-rich, better-governed records over weaker duplicates.",
+        "Runtime search must use SQLite Source/BaseSummary/MemoryItem records.",
         "Semantic duplicate detection links new evidence onto existing records before creating another near-clone.",
       ],
     };
@@ -336,6 +377,12 @@ export class KnowledgeMarkdownStore implements KnowledgeRepository {
     },
   ): Promise<KnowledgePromotionResult> {
     await this.init();
+    if (!this.isEnabled()) {
+      return {
+        status: "skipped",
+        reason: "knowledge_markdown_export_disabled",
+      };
+    }
     await this.writePromotionRawIntake(summary, draft, metadata);
 
     const existingPromotion = this.findPromotion(summary);
