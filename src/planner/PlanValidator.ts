@@ -72,6 +72,70 @@ export class PlanValidator {
       });
     }
 
+    if (executablePlan) {
+      const repairedSteps = executablePlan.retrieval.routePlan.map((step, index) => {
+        if (step.layer === "rag_candidates" && step.action !== "retrieve") {
+          repaired = true;
+          violations.push({
+            code: "rag_candidate_only_repair",
+            severity: "warning",
+            message: "RAG is candidate discovery only and must use retrieve.",
+            repair: "Set rag_candidates action to retrieve.",
+          });
+          return { ...step, action: "retrieve" as const, order: step.order ?? index + 1 };
+        }
+        if (step.layer === "graph_neighbors" && step.action !== "expand") {
+          repaired = true;
+          violations.push({
+            code: "graph_candidate_only_repair",
+            severity: "warning",
+            message: "Graph is candidate/provenance expansion only and must use expand.",
+            repair: "Set graph_neighbors action to expand.",
+          });
+          return { ...step, action: "expand" as const, order: step.order ?? index + 1 };
+        }
+        if (step.layer === "rerank" && step.action !== "order") {
+          repaired = true;
+          violations.push({
+            code: "rerank_order_only_repair",
+            severity: "warning",
+            message: "Rerank may only order existing candidates and must use order.",
+            repair: "Set rerank action to order.",
+          });
+          return { ...step, action: "order" as const, order: step.order ?? index + 1 };
+        }
+        return { ...step, order: step.order ?? index + 1 };
+      });
+      executablePlan = {
+        ...executablePlan,
+        retrieval: {
+          ...executablePlan.retrieval,
+          routePlan: repairedSteps,
+        },
+      };
+    }
+
+    if (
+      plan.retrieval.candidateLayers.includes("rerank") &&
+      !(executablePlan?.retrieval.routePlan ?? []).some((step) => step.layer === "rerank" && step.action === "order")
+    ) {
+      violations.push({
+        code: "rerank_layer_without_order_step",
+        severity: "error",
+        message: "Candidate rerank layer must include a rerank.order route step before final context selection.",
+      });
+    }
+
+    for (const step of plan.retrieval.routePlan) {
+      if ((step.layer === "rag_candidates" || step.layer === "graph_neighbors") && step.action === "verify") {
+        violations.push({
+          code: "heavy_candidate_lane_as_authority",
+          severity: "error",
+          message: `${step.layer} is candidate-only and cannot be used as a final verification authority.`,
+        });
+      }
+    }
+
     if (plan.safety.destructive && !plan.safety.requiresDryRun && executablePlan) {
       executablePlan = {
         ...executablePlan,

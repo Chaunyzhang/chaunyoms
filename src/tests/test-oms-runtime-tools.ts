@@ -260,6 +260,12 @@ async function main(): Promise<void> {
     assert(tools.has("oms_expand"), "oms_expand should be registered");
     assert(tools.has("oms_trace"), "oms_trace should be registered");
     assert(tools.has("oms_status"), "oms_status should be registered");
+    assert(tools.has("oms_brainpack_export"), "oms_brainpack_export should be registered");
+    assert(tools.has("oms_brainpack_status"), "oms_brainpack_status should be registered");
+    assert(tools.has("oms_native_policy_status"), "oms_native_policy_status should be registered");
+    assert(tools.has("oms_native_absorb"), "oms_native_absorb should be registered");
+    assert(tools.has("oms_benchmark_report"), "oms_benchmark_report should be registered");
+    assert(tools.has("oms_recall_feedback"), "oms_recall_feedback should be registered");
     assert(tools.has("oms_setup_guide"), "oms_setup_guide should be registered");
     assert(tools.has("oms_doctor"), "oms_doctor should be registered");
     assert(tools.has("oms_verify"), "oms_verify should be registered");
@@ -337,6 +343,27 @@ async function main(): Promise<void> {
     const getCompatibility = memoryGet?.details?.toolCompatibility as Record<string, unknown> | undefined;
     assert(getCompatibility?.openClawTool === "memory_get", "memory_get should identify its OpenClaw compatibility tool name");
     assert(memoryGet?.details?.targetFound === true, "memory_get should resolve source/message refs through OMS");
+
+    const nativeAbsorb = await tools.get("oms_native_absorb")?.execute("native-absorb", {
+      sessionId: config.sessionId,
+      config: { ...config, openClawNativeMode: "absorbed" },
+      feature: "dreaming",
+      sourceId: "dream-tool-1",
+      content: "Native dream candidate from tool surface.",
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(nativeAbsorb?.details?.absorbed === true, "oms_native_absorb should route absorbed native output into OMS candidate flow");
+    assert(nativeAbsorb?.details?.becomesMemoryItem === false, "native absorb tool must not directly create MemoryItem authority");
+
+    const benchmarkReport = await tools.get("oms_benchmark_report")?.execute("benchmark-report", {
+      sessionId: config.sessionId,
+      config,
+      suite: "locomo-small",
+      scope: "development_sample",
+      systems: ["chaunyoms"],
+      metrics: { accuracy: 0.75 },
+    }) as { details?: Record<string, unknown> } | undefined;
+    assert(benchmarkReport?.details?.claimLevel === "regression_only", "oms_benchmark_report should guard development samples as regression-only");
+    assert(benchmarkReport?.details?.publicComparableAllowed === false, "development sample reports must not be public-comparable");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

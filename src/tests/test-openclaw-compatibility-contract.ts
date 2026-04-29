@@ -103,6 +103,42 @@ async function main(): Promise<void> {
   assert(invalid.errors.some((error) => error.includes("memory-core")), "enabled memory-core should be reported");
   assert(invalid.errors.some((error) => error.includes("memory plugin registration API")), "missing memory slot provider should be reported");
 
+  const coexistNative = inspectOpenClawCompatibility({
+    config: {
+      plugins: {
+        slots: { memory: "oms", contextEngine: "oms" },
+        entries: {
+          oms: { enabled: true, config: { mode: "authoritative", openClawNativeMode: "coexist" } },
+          "memory-core": { enabled: true },
+          "active-memory": { enabled: true },
+          "memory-wiki": { enabled: true },
+          dreaming: { enabled: true, config: { dreaming: { enabled: true } } },
+        },
+      },
+    },
+    registerContextEngine(): void {},
+    registerMemoryCapability(): void {},
+  });
+  assert(coexistNative.ok, "coexist native mode should allow OpenClaw native plugins without authoritatively trusting them");
+  assert(coexistNative.nativeMode === "coexist", "native mode should be reported");
+  assert(coexistNative.warnings.some((warning) => warning.includes("external advisory signal")), "coexist mode should explain advisory-only native output");
+
+  const absorbedNative = inspectOpenClawCompatibility({
+    config: {
+      plugins: {
+        slots: { memory: "oms", contextEngine: "oms" },
+        entries: {
+          oms: { enabled: true, config: { mode: "authoritative", openClawNativeMode: "absorbed" } },
+          dreaming: { enabled: true, config: { dreaming: { enabled: true } } },
+        },
+      },
+    },
+    registerContextEngine(): void {},
+    registerMemoryCapability(): void {},
+  });
+  assert(absorbedNative.ok, "absorbed native mode should allow native outputs through OMS candidate pipeline");
+  assert(absorbedNative.warnings.some((warning) => warning.includes("observation/candidate/validation/promotion")), "absorbed mode should document the validation pipeline");
+
   const legacyMemoryApis = inspectOpenClawCompatibility({
     config: {
       plugins: {

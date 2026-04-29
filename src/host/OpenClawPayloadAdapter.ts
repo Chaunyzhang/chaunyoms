@@ -223,6 +223,30 @@ export class OpenClawPayloadAdapter {
     if (config.kbPromotionMode === "aggressive_auto") {
       warnings.push("kbPromotionMode=aggressive_auto is research-only; manual, assisted, or conservative_auto is safer for production knowledge-vault writes.");
     }
+    if (config.openClawNativeMode !== "disabled") {
+      warnings.push(`openClawNativeMode=${config.openClawNativeMode}; native OpenClaw outputs are non-authoritative unless they pass OMS validation/promotion.`);
+    }
+    if (config.graphEnabled && config.graphProvider === "none") {
+      warnings.push("graphEnabled=true but graphProvider=none; graph enhancement will stay inactive.");
+    }
+    if (config.ragEnabled && config.ragProvider === "none") {
+      warnings.push("ragEnabled=true but ragProvider=none; RAG enhancement will stay inactive.");
+    }
+    if (config.ragEnabled && config.ragProvider === "sqlite_vec" && !config.ragFallbackToBruteForce && !config.vectorExtensionPath) {
+      warnings.push("ragProvider=sqlite_vec has no vectorExtensionPath and ragFallbackToBruteForce=false; vector search will be unavailable on hosts without a bundled extension.");
+    }
+    if (config.ragEnabled && !config.embeddingEnabled) {
+      warnings.push("ragEnabled=true while embeddingEnabled=false; existing vectors can be read, but new source chunks will not be embedded.");
+    }
+    if (config.graphEnabled && !config.graphBuilderEnabled) {
+      warnings.push("graphEnabled=true while graphBuilderEnabled=false; existing graph edges can be read, but new associative edges will not be built.");
+    }
+    if (config.rerankEnabled && config.rerankProvider === "none") {
+      warnings.push("rerankEnabled=true but rerankProvider=none; rerank enhancement will stay inactive.");
+    }
+    if (config.rerankEnabled && ["llm", "specialist", "model", "external"].includes(config.rerankProvider) && !config.rerankFallbackToDeterministic) {
+      warnings.push("rerank provider is model/external without deterministic fallback; optional rerank failure may reduce recall ordering reliability.");
+    }
     return {
       preset: config.configPreset,
       warnings,
@@ -491,6 +515,110 @@ export class OpenClawPayloadAdapter {
       baseConfig.sqliteJournalMode,
     ) as BridgeConfig["sqliteJournalMode"];
 
+    const usageFeedbackEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.usageFeedbackEnabled,
+            pluginConfig.recallUsageFeedbackEnabled,
+            this.inverseBoolean(pluginConfig.disableUsageFeedback),
+          ],
+          baseConfig.usageFeedbackEnabled,
+        );
+
+    const brainPackEnabled = this.resolveBooleanFlag(
+      [
+        pluginConfig.brainPackEnabled,
+        pluginConfig.agentBrainPackEnabled,
+        this.inverseBoolean(pluginConfig.disableBrainPack),
+      ],
+      baseConfig.brainPackEnabled,
+    );
+    const brainPackMode = this.resolveStringEnum(
+      [pluginConfig.brainPackMode, pluginConfig.agentBrainPackMode],
+      ["manual", "scheduled"],
+      baseConfig.brainPackMode,
+    ) as BridgeConfig["brainPackMode"];
+    const brainPackOutputDir = this.resolveDirectoryValue(
+      pluginConfig.brainPackOutputDir,
+      pluginConfig.agentBrainPackDir,
+      pluginConfig.brainpackOutputDir,
+      baseConfig.brainPackOutputDir || path.join(workspaceDir, "agent-brainpack"),
+    );
+    const brainPackRedactionMode = this.resolveStringEnum(
+      [pluginConfig.brainPackRedactionMode, pluginConfig.redactionMode],
+      ["strict", "redact", "report_only"],
+      baseConfig.brainPackRedactionMode,
+    ) as BridgeConfig["brainPackRedactionMode"];
+    const brainPackIncludeRawTranscript = this.resolveStringEnum(
+      [pluginConfig.brainPackIncludeRawTranscript, pluginConfig.includeRawTranscript],
+      ["never", "redacted_excerpt", "private_archive_only"],
+      baseConfig.brainPackIncludeRawTranscript,
+    ) as BridgeConfig["brainPackIncludeRawTranscript"];
+    const brainPackIncludeToolOutputs = this.resolveStringEnum(
+      [pluginConfig.brainPackIncludeToolOutputs, pluginConfig.includeToolOutputs],
+      ["never", "redacted_excerpt", "private_archive_only"],
+      baseConfig.brainPackIncludeToolOutputs,
+    ) as BridgeConfig["brainPackIncludeToolOutputs"];
+
+    const openClawNativeMode = this.resolveStringEnum(
+      [pluginConfig.openClawNativeMode, pluginConfig.nativeMemoryMode, pluginConfig.openclawNativeMode],
+      ["disabled", "coexist", "absorbed"],
+      baseConfig.openClawNativeMode,
+    ) as BridgeConfig["openClawNativeMode"];
+    const graphEnabled = this.resolveBooleanFlag(
+      [pluginConfig.graphEnabled, pluginConfig.retrievalGraphEnabled, this.inverseBoolean(pluginConfig.disableGraph)],
+      baseConfig.graphEnabled,
+    );
+    const ragEnabled = this.resolveBooleanFlag(
+      [pluginConfig.ragEnabled, pluginConfig.retrievalRagEnabled, this.inverseBoolean(pluginConfig.disableRag)],
+      baseConfig.ragEnabled,
+    );
+    const rerankEnabled = this.resolveBooleanFlag(
+      [pluginConfig.rerankEnabled, pluginConfig.retrievalRerankEnabled, this.inverseBoolean(pluginConfig.disableRerank)],
+      baseConfig.rerankEnabled,
+    );
+    const heavyRetrievalPolicy = this.resolveStringEnum(
+      [pluginConfig.heavyRetrievalPolicy],
+      ["disabled", "planner_only"],
+      baseConfig.heavyRetrievalPolicy,
+    ) as BridgeConfig["heavyRetrievalPolicy"];
+    const ragPlannerPolicy = this.resolveStringEnum(
+      [pluginConfig.ragPlannerPolicy, pluginConfig.ragRetrievalPolicy],
+      ["disabled", "planner_only"],
+      baseConfig.ragPlannerPolicy,
+    ) as BridgeConfig["ragPlannerPolicy"];
+    const graphPlannerPolicy = this.resolveStringEnum(
+      [pluginConfig.graphPlannerPolicy, pluginConfig.graphRetrievalPolicy],
+      ["disabled", "planner_only"],
+      baseConfig.graphPlannerPolicy,
+    ) as BridgeConfig["graphPlannerPolicy"];
+    const rerankPlannerPolicy = this.resolveStringEnum(
+      [pluginConfig.rerankPlannerPolicy, pluginConfig.rerankRetrievalPolicy],
+      ["disabled", "planner_only", "candidate_overload_required"],
+      baseConfig.rerankPlannerPolicy,
+    ) as BridgeConfig["rerankPlannerPolicy"];
+    const embeddingEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.embeddingEnabled,
+            pluginConfig.retrievalEmbeddingEnabled,
+            this.inverseBoolean(pluginConfig.disableEmbedding),
+          ],
+          baseConfig.embeddingEnabled,
+        );
+    const graphBuilderEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.graphBuilderEnabled,
+            pluginConfig.retrievalGraphBuilderEnabled,
+            this.inverseBoolean(pluginConfig.disableGraphBuilder),
+          ],
+          baseConfig.graphBuilderEnabled,
+        );
+
     return this.validateConfig({
       dataDir,
       sessionId: this.resolveSessionId(payload, identityBaseConfig),
@@ -630,6 +758,184 @@ export class OpenClawPayloadAdapter {
           pluginConfig.maxSemanticCandidates,
         ],
         presetDefaults.semanticCandidateLimit,
+      ),
+      usageFeedbackEnabled,
+      brainPackEnabled,
+      brainPackMode,
+      brainPackTurnInterval: this.resolveNumberConfig(
+        [pluginConfig.brainPackTurnInterval, pluginConfig.brainPackConversationTurnInterval],
+        baseConfig.brainPackTurnInterval,
+      ),
+      brainPackIntervalHours: this.resolveNumberConfig(
+        [pluginConfig.brainPackIntervalHours, pluginConfig.brainPackSnapshotIntervalHours],
+        baseConfig.brainPackIntervalHours,
+      ),
+      brainPackOutputDir,
+      brainPackGitEnabled: this.resolveBooleanFlag(
+        [pluginConfig.brainPackGitEnabled, pluginConfig.brainPackAutoGitEnabled],
+        baseConfig.brainPackGitEnabled,
+      ),
+      brainPackGitRemote: this.resolveOptionalString(pluginConfig.brainPackGitRemote, baseConfig.brainPackGitRemote),
+      brainPackGitBranch: this.resolveOptionalString(pluginConfig.brainPackGitBranch, baseConfig.brainPackGitBranch),
+      brainPackCommitMessageTemplate: this.resolveOptionalString(
+        pluginConfig.brainPackCommitMessageTemplate,
+        baseConfig.brainPackCommitMessageTemplate,
+      ),
+      brainPackRedactionMode,
+      brainPackIncludeRawTranscript,
+      brainPackIncludeToolOutputs,
+      brainPackDeterministicOrdering: this.resolveBooleanFlag(
+        [pluginConfig.brainPackDeterministicOrdering, pluginConfig.deterministicBrainPackOrdering],
+        baseConfig.brainPackDeterministicOrdering,
+      ),
+      openClawNativeMode,
+      openClawNativeMemoryCoreMode: this.resolveOptionalStringEnum(
+        [pluginConfig.openClawNativeMemoryCoreMode, pluginConfig.memoryCoreNativeMode],
+        ["disabled", "coexist", "absorbed"],
+        baseConfig.openClawNativeMemoryCoreMode,
+      ) as BridgeConfig["openClawNativeMemoryCoreMode"],
+      openClawNativeActiveMemoryMode: this.resolveOptionalStringEnum(
+        [pluginConfig.openClawNativeActiveMemoryMode, pluginConfig.activeMemoryNativeMode],
+        ["disabled", "coexist", "absorbed"],
+        baseConfig.openClawNativeActiveMemoryMode,
+      ) as BridgeConfig["openClawNativeActiveMemoryMode"],
+      openClawNativeMemoryWikiMode: this.resolveOptionalStringEnum(
+        [pluginConfig.openClawNativeMemoryWikiMode, pluginConfig.memoryWikiNativeMode],
+        ["disabled", "coexist", "absorbed"],
+        baseConfig.openClawNativeMemoryWikiMode,
+      ) as BridgeConfig["openClawNativeMemoryWikiMode"],
+      openClawNativeDreamingMode: this.resolveOptionalStringEnum(
+        [pluginConfig.openClawNativeDreamingMode, pluginConfig.dreamingNativeMode],
+        ["disabled", "coexist", "absorbed"],
+        baseConfig.openClawNativeDreamingMode,
+      ) as BridgeConfig["openClawNativeDreamingMode"],
+      graphEnabled,
+      ragEnabled,
+      rerankEnabled,
+      graphProvider: this.resolveStringEnum(
+        [pluginConfig.graphProvider, pluginConfig.retrievalGraphProvider],
+        ["none", "sqlite_graph", "sqlite_edges", "external"],
+        baseConfig.graphProvider,
+      ) as BridgeConfig["graphProvider"],
+      ragProvider: this.resolveStringEnum(
+        [pluginConfig.ragProvider, pluginConfig.retrievalRagProvider],
+        ["none", "sqlite_vec", "brute_force", "embedding", "external"],
+        baseConfig.ragProvider,
+      ) as BridgeConfig["ragProvider"],
+      rerankProvider: this.resolveStringEnum(
+        [pluginConfig.rerankProvider, pluginConfig.retrievalRerankProvider],
+        ["none", "deterministic", "llm", "specialist", "model", "external"],
+        baseConfig.rerankProvider,
+      ) as BridgeConfig["rerankProvider"],
+      embeddingEnabled,
+      embeddingProvider: this.resolveStringEnum(
+        [pluginConfig.embeddingProvider, pluginConfig.retrievalEmbeddingProvider],
+        ["none", "local_hash", "external"],
+        baseConfig.embeddingProvider,
+      ) as BridgeConfig["embeddingProvider"],
+      embeddingModel: this.resolveOptionalString(
+        pluginConfig.embeddingModel,
+        baseConfig.embeddingModel,
+      ) ?? baseConfig.embeddingModel,
+      embeddingDimensions: this.resolveNumberConfig(
+        [pluginConfig.embeddingDimensions, pluginConfig.vectorDimensions],
+        baseConfig.embeddingDimensions,
+      ),
+      embeddingAsync: this.resolveBooleanFlag(
+        [pluginConfig.embeddingAsync, pluginConfig.embeddingJobsAsync],
+        baseConfig.embeddingAsync,
+      ),
+      embeddingJobMaxBatch: this.resolveNumberConfig(
+        [pluginConfig.embeddingJobMaxBatch, pluginConfig.embeddingBatchSize],
+        baseConfig.embeddingJobMaxBatch,
+      ),
+      embeddingJobMaxRetries: this.resolveNumberConfig(
+        [pluginConfig.embeddingJobMaxRetries, pluginConfig.embeddingMaxRetries],
+        baseConfig.embeddingJobMaxRetries,
+      ),
+      vectorExtensionPath: this.resolveOptionalString(
+        pluginConfig.vectorExtensionPath,
+        baseConfig.vectorExtensionPath,
+      ),
+      vectorSearchMaxCandidates: this.resolveNumberConfig(
+        [pluginConfig.vectorSearchMaxCandidates, pluginConfig.ragVectorCandidateLimit],
+        baseConfig.vectorSearchMaxCandidates,
+      ),
+      bruteForceVectorMaxRows: this.resolveNumberConfig(
+        [pluginConfig.bruteForceVectorMaxRows, pluginConfig.ragBruteForceMaxRows],
+        baseConfig.bruteForceVectorMaxRows,
+      ),
+      ragFallbackToBruteForce: this.resolveBooleanFlag(
+        [pluginConfig.ragFallbackToBruteForce, pluginConfig.vectorFallbackToBruteForce],
+        baseConfig.ragFallbackToBruteForce,
+      ),
+      graphBuilderEnabled,
+      graphBuilderProvider: this.resolveStringEnum(
+        [pluginConfig.graphBuilderProvider, pluginConfig.retrievalGraphBuilderProvider],
+        ["none", "deterministic", "llm", "external"],
+        baseConfig.graphBuilderProvider,
+      ) as BridgeConfig["graphBuilderProvider"],
+      graphMaxDepth: this.resolveNumberConfig(
+        [pluginConfig.graphMaxDepth],
+        baseConfig.graphMaxDepth,
+      ),
+      graphMaxFanout: this.resolveNumberConfig(
+        [pluginConfig.graphMaxFanout],
+        baseConfig.graphMaxFanout,
+      ),
+      graphMinConfidence: this.resolveNumberConfig(
+        [pluginConfig.graphMinConfidence],
+        baseConfig.graphMinConfidence,
+      ),
+      graphAllowedRelations: this.resolveStringList(
+        pluginConfig.graphAllowedRelations,
+        baseConfig.graphAllowedRelations,
+      ),
+      graphCandidateLimit: this.resolveNumberConfig(
+        [pluginConfig.graphCandidateLimit, pluginConfig.graphMaxCandidates],
+        baseConfig.graphCandidateLimit,
+      ),
+      rerankModel: this.resolveOptionalString(pluginConfig.rerankModel, baseConfig.rerankModel),
+      rerankTimeoutMs: this.resolveNumberConfig(
+        [pluginConfig.rerankTimeoutMs, pluginConfig.rerankMaxLatencyMs],
+        baseConfig.rerankTimeoutMs,
+      ),
+      rerankFallbackToDeterministic: this.resolveBooleanFlag(
+        [pluginConfig.rerankFallbackToDeterministic],
+        baseConfig.rerankFallbackToDeterministic,
+      ),
+      featureIsolationMode: this.resolveStringEnum(
+        [pluginConfig.featureIsolationMode, pluginConfig.optionalFeatureIsolationMode],
+        ["fail_closed", "isolate_optional"],
+        baseConfig.featureIsolationMode,
+      ) as BridgeConfig["featureIsolationMode"],
+      heavyRetrievalPolicy,
+      ragPlannerPolicy,
+      graphPlannerPolicy,
+      rerankPlannerPolicy,
+      candidateRerankThreshold: this.resolveNumberConfig(
+        [pluginConfig.candidateRerankThreshold, pluginConfig.rerankCandidateThreshold],
+        baseConfig.candidateRerankThreshold,
+      ),
+      laneCandidateRerankThreshold: this.resolveNumberConfig(
+        [pluginConfig.laneCandidateRerankThreshold, pluginConfig.rerankLaneCandidateThreshold],
+        baseConfig.laneCandidateRerankThreshold,
+      ),
+      candidateAmbiguityMargin: this.resolveNumberConfig(
+        [pluginConfig.candidateAmbiguityMargin, pluginConfig.rerankAmbiguityMargin],
+        baseConfig.candidateAmbiguityMargin,
+      ),
+      strictModeRequiresRerankOnConflict: this.resolveBooleanFlag(
+        [pluginConfig.strictModeRequiresRerankOnConflict, pluginConfig.strictRerankOnConflict],
+        baseConfig.strictModeRequiresRerankOnConflict,
+      ),
+      maxEnhancementLatencyMs: this.resolveNumberConfig(
+        [pluginConfig.maxEnhancementLatencyMs, pluginConfig.retrievalEnhancementMaxLatencyMs],
+        baseConfig.maxEnhancementLatencyMs,
+      ),
+      maxRerankCandidates: this.resolveNumberConfig(
+        [pluginConfig.maxRerankCandidates, pluginConfig.rerankCandidateLimit],
+        baseConfig.maxRerankCandidates,
       ),
       emergencyBrake,
       sqliteJournalMode,
@@ -1403,13 +1709,14 @@ export class OpenClawPayloadAdapter {
     const errors: string[] = [];
     const pathFields: Array<keyof Pick<
       BridgeConfig,
-      "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir"
+      "dataDir" | "workspaceDir" | "sharedDataDir" | "knowledgeBaseDir" | "memoryVaultDir" | "brainPackOutputDir"
     >> = [
       "dataDir",
       "workspaceDir",
       "sharedDataDir",
       "knowledgeBaseDir",
       "memoryVaultDir",
+      "brainPackOutputDir",
     ];
 
     for (const field of pathFields) {
@@ -1456,6 +1763,127 @@ export class OpenClawPayloadAdapter {
     if (!["off", "shadow", "auto"].includes(config.llmPlannerMode)) {
       errors.push("llmPlannerMode must be off, shadow, or auto");
     }
+    if (!["manual", "scheduled"].includes(config.brainPackMode)) {
+      errors.push("brainPackMode must be manual or scheduled");
+    }
+    if (!Number.isFinite(config.brainPackTurnInterval) || config.brainPackTurnInterval <= 0 || !Number.isInteger(config.brainPackTurnInterval)) {
+      errors.push("brainPackTurnInterval must be a positive integer");
+    }
+    if (!Number.isFinite(config.brainPackIntervalHours) || config.brainPackIntervalHours <= 0) {
+      errors.push("brainPackIntervalHours must be a positive number");
+    }
+    if (!["strict", "redact", "report_only"].includes(config.brainPackRedactionMode)) {
+      errors.push("brainPackRedactionMode must be strict, redact, or report_only");
+    }
+    if (!["never", "redacted_excerpt", "private_archive_only"].includes(config.brainPackIncludeRawTranscript)) {
+      errors.push("brainPackIncludeRawTranscript must be never, redacted_excerpt, or private_archive_only");
+    }
+    if (!["never", "redacted_excerpt", "private_archive_only"].includes(config.brainPackIncludeToolOutputs)) {
+      errors.push("brainPackIncludeToolOutputs must be never, redacted_excerpt, or private_archive_only");
+    }
+    if (!["disabled", "coexist", "absorbed"].includes(config.openClawNativeMode)) {
+      errors.push("openClawNativeMode must be disabled, coexist, or absorbed");
+    }
+    for (const [field, value] of Object.entries({
+      openClawNativeMemoryCoreMode: config.openClawNativeMemoryCoreMode,
+      openClawNativeActiveMemoryMode: config.openClawNativeActiveMemoryMode,
+      openClawNativeMemoryWikiMode: config.openClawNativeMemoryWikiMode,
+      openClawNativeDreamingMode: config.openClawNativeDreamingMode,
+    })) {
+      if (value !== undefined && !["disabled", "coexist", "absorbed"].includes(value)) {
+        errors.push(`${field} must be disabled, coexist, or absorbed`);
+      }
+    }
+    if (!["none", "sqlite_graph", "sqlite_edges", "external"].includes(config.graphProvider)) {
+      errors.push("graphProvider must be none, sqlite_graph, sqlite_edges, or external");
+    }
+    if (!["none", "sqlite_vec", "brute_force", "embedding", "external"].includes(config.ragProvider)) {
+      errors.push("ragProvider must be none, sqlite_vec, brute_force, embedding, or external");
+    }
+    if (!["none", "deterministic", "llm", "specialist", "model", "external"].includes(config.rerankProvider)) {
+      errors.push("rerankProvider must be none, deterministic, llm, specialist, model, or external");
+    }
+    if (!["none", "local_hash", "external"].includes(config.embeddingProvider)) {
+      errors.push("embeddingProvider must be none, local_hash, or external");
+    }
+    if (!Number.isFinite(config.embeddingDimensions) || config.embeddingDimensions < 16 || !Number.isInteger(config.embeddingDimensions)) {
+      errors.push("embeddingDimensions must be an integer of at least 16");
+    }
+    if (!Number.isFinite(config.embeddingJobMaxBatch) || config.embeddingJobMaxBatch < 1 || !Number.isInteger(config.embeddingJobMaxBatch)) {
+      errors.push("embeddingJobMaxBatch must be a positive integer");
+    }
+    if (!Number.isFinite(config.embeddingJobMaxRetries) || config.embeddingJobMaxRetries < 0 || !Number.isInteger(config.embeddingJobMaxRetries)) {
+      errors.push("embeddingJobMaxRetries must be a non-negative integer");
+    }
+    if (!Number.isFinite(config.vectorSearchMaxCandidates) || config.vectorSearchMaxCandidates < 1 || !Number.isInteger(config.vectorSearchMaxCandidates)) {
+      errors.push("vectorSearchMaxCandidates must be a positive integer");
+    }
+    if (!Number.isFinite(config.bruteForceVectorMaxRows) || config.bruteForceVectorMaxRows < 1 || !Number.isInteger(config.bruteForceVectorMaxRows)) {
+      errors.push("bruteForceVectorMaxRows must be a positive integer");
+    }
+    if (!["none", "deterministic", "llm", "external"].includes(config.graphBuilderProvider)) {
+      errors.push("graphBuilderProvider must be none, deterministic, llm, or external");
+    }
+    if (!Number.isFinite(config.graphMaxDepth) || config.graphMaxDepth < 1 || !Number.isInteger(config.graphMaxDepth)) {
+      errors.push("graphMaxDepth must be a positive integer");
+    }
+    if (!Number.isFinite(config.graphMaxFanout) || config.graphMaxFanout < 1 || !Number.isInteger(config.graphMaxFanout)) {
+      errors.push("graphMaxFanout must be a positive integer");
+    }
+    if (!Number.isFinite(config.graphMinConfidence) || config.graphMinConfidence < 0 || config.graphMinConfidence > 1) {
+      errors.push("graphMinConfidence must be between 0 and 1");
+    }
+    if (!Array.isArray(config.graphAllowedRelations) || config.graphAllowedRelations.some((relation) => typeof relation !== "string" || relation.trim().length === 0)) {
+      errors.push("graphAllowedRelations must be a list of non-empty relation names");
+    }
+    if (!Number.isFinite(config.graphCandidateLimit) || config.graphCandidateLimit < 1 || !Number.isInteger(config.graphCandidateLimit)) {
+      errors.push("graphCandidateLimit must be a positive integer");
+    }
+    if (!Number.isFinite(config.rerankTimeoutMs) || config.rerankTimeoutMs < 0) {
+      errors.push("rerankTimeoutMs must be a finite non-negative number");
+    }
+    if (!["fail_closed", "isolate_optional"].includes(config.featureIsolationMode)) {
+      errors.push("featureIsolationMode must be fail_closed or isolate_optional");
+    }
+    if (!["disabled", "planner_only"].includes(config.heavyRetrievalPolicy)) {
+      errors.push("heavyRetrievalPolicy must be disabled or planner_only");
+    }
+    if (!["disabled", "planner_only"].includes(config.ragPlannerPolicy)) {
+      errors.push("ragPlannerPolicy must be disabled or planner_only");
+    }
+    if (!["disabled", "planner_only"].includes(config.graphPlannerPolicy)) {
+      errors.push("graphPlannerPolicy must be disabled or planner_only");
+    }
+    if (!["disabled", "planner_only", "candidate_overload_required"].includes(config.rerankPlannerPolicy)) {
+      errors.push("rerankPlannerPolicy must be disabled, planner_only, or candidate_overload_required");
+    }
+    if (
+      !Number.isFinite(config.candidateRerankThreshold) ||
+      config.candidateRerankThreshold < 1 ||
+      !Number.isInteger(config.candidateRerankThreshold)
+    ) {
+      errors.push("candidateRerankThreshold must be a positive integer");
+    }
+    if (
+      !Number.isFinite(config.laneCandidateRerankThreshold) ||
+      config.laneCandidateRerankThreshold < 1 ||
+      !Number.isInteger(config.laneCandidateRerankThreshold)
+    ) {
+      errors.push("laneCandidateRerankThreshold must be a positive integer");
+    }
+    if (
+      !Number.isFinite(config.candidateAmbiguityMargin) ||
+      config.candidateAmbiguityMargin < 0 ||
+      config.candidateAmbiguityMargin >= 1
+    ) {
+      errors.push("candidateAmbiguityMargin must be greater than or equal to 0 and less than 1");
+    }
+    if (!Number.isFinite(config.maxEnhancementLatencyMs) || config.maxEnhancementLatencyMs < 0) {
+      errors.push("maxEnhancementLatencyMs must be a finite non-negative number");
+    }
+    if (!Number.isFinite(config.maxRerankCandidates) || config.maxRerankCandidates < 0 || !Number.isInteger(config.maxRerankCandidates)) {
+      errors.push("maxRerankCandidates must be a non-negative integer");
+    }
     if (!["delete", "wal"].includes(config.sqliteJournalMode)) {
       errors.push("sqliteJournalMode must be either delete or wal");
     }
@@ -1466,6 +1894,30 @@ export class OpenClawPayloadAdapter {
     }
 
     return config;
+  }
+
+  private resolveOptionalString(value: unknown, fallback?: string): string | undefined {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+    return fallback;
+  }
+
+  private resolveOptionalStringEnum(
+    candidates: unknown[],
+    allowed: string[],
+    fallback?: string,
+  ): string | undefined {
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") {
+        continue;
+      }
+      const normalized = candidate.trim().toLowerCase();
+      if (allowed.includes(normalized)) {
+        return normalized;
+      }
+    }
+    return fallback;
   }
 
   private resolveStringEnum(

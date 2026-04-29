@@ -11,17 +11,20 @@ export const OPENCLAW_COMPATIBILITY_PLUGIN_IDS = [
 ] as const;
 
 export type OpenClawCompatibilityMode = "advisory" | "authoritative";
+export type OpenClawNativeMode = "disabled" | "coexist" | "absorbed";
 
 export interface OpenClawNativePluginStatus {
   id: "memory-core" | "active-memory" | "memory-wiki" | "dreaming";
   present: boolean;
   enabled: boolean | null;
+  mode: OpenClawNativeMode;
   dreamingEnabled?: boolean | null;
 }
 
 export interface OpenClawCompatibilityReport {
   ok: boolean;
   mode: OpenClawCompatibilityMode;
+  nativeMode: OpenClawNativeMode;
   enforcement: "warn_only" | "fail_fast";
   expectedPluginIds: string[];
   selectedSlots: {
@@ -50,6 +53,7 @@ export function inspectOpenClawCompatibility(
   const entries = asRecord(config?.plugins?.entries);
   const pluginConfig = resolveOmsPluginConfig(api, entries);
   const mode = resolveCompatibilityMode(pluginConfig);
+  const nativeMode = resolveNativeMode(pluginConfig);
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -61,17 +65,29 @@ export function inspectOpenClawCompatibility(
   validateSlot("memory", selectedSlots.memory, mode, errors, warnings);
   validateSlot("contextEngine", selectedSlots.contextEngine, mode, errors, warnings);
 
-  const nativePlugins = inspectNativePlugins(entries);
+  const nativePlugins = inspectNativePlugins(entries, pluginConfig, nativeMode);
   for (const plugin of nativePlugins) {
-    if (plugin.enabled === true) {
-      errors.push(
-        `plugins.entries["${plugin.id}"].enabled must be false when ChaunyOMS is the authoritative memory/context substrate.`,
-      );
-    }
-    if (plugin.dreamingEnabled === true) {
-      errors.push(
-        `plugins.entries["${plugin.id}"].config.dreaming.enabled must be false; Dreaming must not write MEMORY.md/DREAMS.md in the hot path.`,
-      );
+    if (plugin.enabled === true || plugin.dreamingEnabled === true) {
+      if (plugin.mode === "disabled") {
+        if (plugin.enabled === true) {
+          errors.push(
+            `plugins.entries["${plugin.id}"].enabled must be false when ChaunyOMS native policy is disabled.`,
+          );
+        }
+        if (plugin.dreamingEnabled === true) {
+          errors.push(
+            `plugins.entries["${plugin.id}"].config.dreaming.enabled must be false when native policy is disabled; Dreaming must not write MEMORY.md/DREAMS.md in the hot path.`,
+          );
+        }
+      } else if (plugin.mode === "coexist") {
+        warnings.push(
+          `plugins.entries["${plugin.id}"] is enabled under coexist; ChaunyOMS will treat native output only as external advisory signal, never SQLite authoritative fact.`,
+        );
+      } else {
+        warnings.push(
+          `plugins.entries["${plugin.id}"] is enabled under absorbed; native output must enter OMS observation/candidate/validation/promotion before becoming MemoryItem or knowledge_raw.`,
+        );
+      }
     }
     if (mode === "authoritative" && !plugin.present) {
       warnings.push(
@@ -128,6 +144,7 @@ export function inspectOpenClawCompatibility(
   return {
     ok: errors.length === 0,
     mode,
+    nativeMode,
     enforcement: mode === "authoritative" ? "fail_fast" : "warn_only",
     expectedPluginIds: [...OPENCLAW_COMPATIBILITY_PLUGIN_IDS],
     selectedSlots,
@@ -175,7 +192,11 @@ function validateSlot(
   }
 }
 
-function inspectNativePlugins(entries: HostRecord | undefined): OpenClawNativePluginStatus[] {
+function inspectNativePlugins(
+  entries: HostRecord | undefined,
+  pluginConfig: HostRecord | undefined,
+  defaultMode: OpenClawNativeMode,
+): OpenClawNativePluginStatus[] {
   return (["memory-core", "active-memory", "memory-wiki", "dreaming"] as const)
     .map((id) => {
       const entry = asRecord(entries?.[id]);
@@ -184,6 +205,7 @@ function inspectNativePlugins(entries: HostRecord | undefined): OpenClawNativePl
         id,
         present: Boolean(entry),
         enabled: entry ? entryEnabled(entry) : null,
+        mode: resolveNativeFeatureMode(pluginConfig, id, defaultMode),
         dreamingEnabled: resolveDreamingEnabled(config),
       };
     });
@@ -240,6 +262,38 @@ function resolveCompatibilityMode(
       ? pluginConfig.openClawCompatibilityMode.trim().toLowerCase()
       : "";
   return mode === "authoritative" ? "authoritative" : "advisory";
+}
+
+function resolveNativeMode(pluginConfig: HostRecord | undefined): OpenClawNativeMode {
+  const value = typeof pluginConfig?.openClawNativeMode === "string"
+    ? pluginConfig.openClawNativeMode
+    : typeof pluginConfig?.nativeMemoryMode === "string"
+      ? pluginConfig.nativeMemoryMode
+      : "disabled";
+  return normalizeNativeMode(value, "disabled");
+}
+
+function resolveNativeFeatureMode(
+  pluginConfig: HostRecord | undefined,
+  id: OpenClawNativePluginStatus["id"],
+  fallback: OpenClawNativeMode,
+): OpenClawNativeMode {
+  const key = id === "memory-core"
+    ? "openClawNativeMemoryCoreMode"
+    : id === "active-memory"
+      ? "openClawNativeActiveMemoryMode"
+      : id === "memory-wiki"
+        ? "openClawNativeMemoryWikiMode"
+        : "openClawNativeDreamingMode";
+  const value = pluginConfig?.[key];
+  return typeof value === "string" ? normalizeNativeMode(value, fallback) : fallback;
+}
+
+function normalizeNativeMode(value: string, fallback: OpenClawNativeMode): OpenClawNativeMode {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "disabled" || normalized === "coexist" || normalized === "absorbed"
+    ? normalized
+    : fallback;
 }
 
 function firstHostRecord(...values: unknown[]): HostRecord | undefined {

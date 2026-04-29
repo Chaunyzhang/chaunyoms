@@ -17,6 +17,10 @@ export function buildLLMPlannerPrompt(args: {
     "- Markdown/Obsidian/AgentVault never becomes a runtime fact source.",
     "- Current user instruction and recent tail must be protected.",
     "- Destructive operations require dry-run by default.",
+    "- Heavy retrieval lanes (rag_candidates, graph_neighbors, rerank) are tools scheduled by LLMPlanner, not independent brains.",
+    "- RAG and Graph produce candidates only; they cannot become final authority without MemoryItem/Summary/Raw source verification.",
+    "- Rerank orders overloaded or ambiguous candidates; it cannot create facts.",
+    "- Candidate overload must include a rerank.order step before final context selection or answer formation.",
     "",
     "Use this JSON shape:",
     JSON.stringify({
@@ -27,7 +31,7 @@ export function buildLLMPlannerPrompt(args: {
       },
       retrieval: {
         sourceTraceRequired: true,
-        candidateLayers: ["memory_items", "base_summaries", "raw_sources"],
+        candidateLayers: ["memory_items", "base_summaries", "raw_sources", "rerank"],
         progressive: true,
         stopCondition: "sufficient_source_backed_answer",
       },

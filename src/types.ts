@@ -309,6 +309,19 @@ export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
 export type RetrievalStrength = "off" | "light" | "auto" | "strict" | "forensic";
 export type LlmPlannerMode = "off" | "shadow" | "auto";
+export type OpenClawNativeMode = "disabled" | "coexist" | "absorbed";
+export type RetrievalGraphProvider = "none" | "sqlite_graph" | "sqlite_edges" | "external";
+export type RetrievalRagProvider = "none" | "sqlite_vec" | "brute_force" | "embedding" | "external";
+export type RetrievalRerankProvider = "none" | "deterministic" | "llm" | "specialist" | "model" | "external";
+export type EmbeddingProvider = "none" | "local_hash" | "external";
+export type GraphBuilderProvider = "none" | "deterministic" | "llm" | "external";
+export type FeatureIsolationMode = "fail_closed" | "isolate_optional";
+export type HeavyRetrievalPolicy = "disabled" | "planner_only";
+export type HeavyRetrievalLanePolicy = "disabled" | "planner_only";
+export type RerankPlannerPolicy = "disabled" | "planner_only" | "candidate_overload_required";
+export type BrainPackMode = "manual" | "scheduled";
+export type BrainPackRedactionMode = "strict" | "redact" | "report_only";
+export type BrainPackPrivateDataPolicy = "never" | "redacted_excerpt" | "private_archive_only";
 export type KbPromotionMode =
   | "manual"
   | "assisted"
@@ -806,9 +819,66 @@ export interface BridgeConfig {
   knowledgeIntakeUserOverridePatterns: string[];
   semanticCandidateExpansionEnabled: boolean;
   semanticCandidateLimit: number;
+  usageFeedbackEnabled: boolean;
   llmPlannerMode: LlmPlannerMode;
   plannerDebugEnabled: boolean;
   llmPlannerModel?: string;
+  brainPackEnabled: boolean;
+  brainPackMode: BrainPackMode;
+  brainPackTurnInterval: number;
+  brainPackIntervalHours: number;
+  brainPackOutputDir: string;
+  brainPackGitEnabled: boolean;
+  brainPackGitRemote?: string;
+  brainPackGitBranch?: string;
+  brainPackCommitMessageTemplate?: string;
+  brainPackRedactionMode: BrainPackRedactionMode;
+  brainPackIncludeRawTranscript: BrainPackPrivateDataPolicy;
+  brainPackIncludeToolOutputs: BrainPackPrivateDataPolicy;
+  brainPackDeterministicOrdering: boolean;
+  openClawNativeMode: OpenClawNativeMode;
+  openClawNativeMemoryCoreMode?: OpenClawNativeMode;
+  openClawNativeActiveMemoryMode?: OpenClawNativeMode;
+  openClawNativeMemoryWikiMode?: OpenClawNativeMode;
+  openClawNativeDreamingMode?: OpenClawNativeMode;
+  graphEnabled: boolean;
+  ragEnabled: boolean;
+  rerankEnabled: boolean;
+  graphProvider: RetrievalGraphProvider;
+  ragProvider: RetrievalRagProvider;
+  rerankProvider: RetrievalRerankProvider;
+  embeddingEnabled: boolean;
+  embeddingProvider: EmbeddingProvider;
+  embeddingModel: string;
+  embeddingDimensions: number;
+  embeddingAsync: boolean;
+  embeddingJobMaxBatch: number;
+  embeddingJobMaxRetries: number;
+  vectorExtensionPath?: string;
+  vectorSearchMaxCandidates: number;
+  bruteForceVectorMaxRows: number;
+  ragFallbackToBruteForce: boolean;
+  graphBuilderEnabled: boolean;
+  graphBuilderProvider: GraphBuilderProvider;
+  graphMaxDepth: number;
+  graphMaxFanout: number;
+  graphMinConfidence: number;
+  graphAllowedRelations: string[];
+  graphCandidateLimit: number;
+  rerankModel?: string;
+  rerankTimeoutMs: number;
+  rerankFallbackToDeterministic: boolean;
+  featureIsolationMode: FeatureIsolationMode;
+  heavyRetrievalPolicy: HeavyRetrievalPolicy;
+  ragPlannerPolicy: HeavyRetrievalLanePolicy;
+  graphPlannerPolicy: HeavyRetrievalLanePolicy;
+  rerankPlannerPolicy: RerankPlannerPolicy;
+  candidateRerankThreshold: number;
+  laneCandidateRerankThreshold: number;
+  candidateAmbiguityMargin: number;
+  strictModeRequiresRerankOnConflict: boolean;
+  maxEnhancementLatencyMs: number;
+  maxRerankCandidates: number;
   emergencyBrake: boolean;
   sqliteJournalMode: "delete" | "wal";
 }
@@ -828,6 +898,7 @@ export interface ProgressiveRetrievalStepRecord {
   stepIndex: number;
   layer: string;
   action: string;
+  order?: number;
   reason?: string;
   stopIf?: string;
   budgetTokens?: number;
@@ -938,6 +1009,7 @@ export interface RetrievalDecision {
     routeSteps: Array<{
       layer: string;
       action: string;
+      order?: number;
       reason: string;
       stopIf?: string;
       budgetTokens?: number;
@@ -957,6 +1029,20 @@ export interface RetrievalLayerScore {
   route: RetrievalRoute;
   score: number;
   reasons: string[];
+}
+
+export interface SummarySourceTraceCoverage {
+  total: number;
+  traceable: number;
+  missing: string[];
+}
+
+export interface SummarySourceTraceReport {
+  ok: boolean;
+  baseSummaries: SummarySourceTraceCoverage;
+  branchSummaries: SummarySourceTraceCoverage;
+  navigationOnlySummaryIds: string[];
+  warnings: string[];
 }
 
 export type SemanticCandidateKind =

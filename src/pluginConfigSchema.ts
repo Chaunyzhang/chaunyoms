@@ -202,6 +202,257 @@ export const pluginConfigSchema = {
       minimum: 0,
       description: "Maximum number of semantic candidates to surface in retrieval diagnostics.",
     },
+    usageFeedbackEnabled: {
+      type: "boolean",
+      description: "Record bounded recall usage feedback events/stats for candidate_seen, context_selected, answer_used, verified_answer_used, rejected, and negative_feedback. Default true and safe to disable.",
+    },
+    brainPackEnabled: {
+      type: "boolean",
+      description: "Enable Git-safe BrainPack projection support. SQLite remains the runtime source of truth.",
+    },
+    brainPackMode: {
+      type: "string",
+      enum: ["manual", "scheduled"],
+      description: "BrainPack trigger mode. manual is the default; scheduled only evaluates turn/interval gates.",
+    },
+    brainPackTurnInterval: {
+      type: "number",
+      minimum: 1,
+      description: "Conversation-turn interval for scheduled BrainPack snapshots. Default 500.",
+    },
+    brainPackIntervalHours: {
+      type: "number",
+      exclusiveMinimum: 0,
+      description: "Wall-clock interval in hours for scheduled BrainPack snapshots. Default 24.",
+    },
+    brainPackOutputDir: {
+      type: "string",
+      description: "Output directory for the Git-safe agent-brainpack projection. Defaults to <workspace>/agent-brainpack.",
+    },
+    brainPackGitEnabled: {
+      type: "boolean",
+      description: "Opt-in flag for future BrainPack git automation. Default false; export can run without git.",
+    },
+    brainPackRedactionMode: {
+      type: "string",
+      enum: ["strict", "redact", "report_only"],
+      description: "SecretScanner/RedactionGate mode for BrainPack projection. strict/redact sanitize content; report_only blocks git on findings.",
+    },
+    brainPackIncludeRawTranscript: {
+      type: "string",
+      enum: ["never", "redacted_excerpt", "private_archive_only"],
+      description: "Raw transcript inclusion policy. Default never for Git-safe projection.",
+    },
+    brainPackIncludeToolOutputs: {
+      type: "string",
+      enum: ["never", "redacted_excerpt", "private_archive_only"],
+      description: "Tool-output inclusion policy. Default never for Git-safe projection.",
+    },
+    openClawNativeMode: {
+      type: "string",
+      enum: ["disabled", "coexist", "absorbed"],
+      description: "Policy for OpenClaw native memory/dreaming features: disabled, coexist as advisory-only, or absorbed through OMS validation/promotion.",
+    },
+    openClawNativeMemoryCoreMode: {
+      type: "string",
+      enum: ["disabled", "coexist", "absorbed"],
+      description: "Optional feature-level override for OpenClaw memory-core.",
+    },
+    openClawNativeActiveMemoryMode: {
+      type: "string",
+      enum: ["disabled", "coexist", "absorbed"],
+      description: "Optional feature-level override for OpenClaw active-memory.",
+    },
+    openClawNativeMemoryWikiMode: {
+      type: "string",
+      enum: ["disabled", "coexist", "absorbed"],
+      description: "Optional feature-level override for OpenClaw memory-wiki.",
+    },
+    openClawNativeDreamingMode: {
+      type: "string",
+      enum: ["disabled", "coexist", "absorbed"],
+      description: "Optional feature-level override for OpenClaw dreaming.",
+    },
+    graphEnabled: {
+      type: "boolean",
+      description: "Enable optional graph enhancement lane. Default false; graph hits are candidates only, not facts.",
+    },
+    ragEnabled: {
+      type: "boolean",
+      description: "Enable optional RAG enhancement lane. Default false; RAG hits are candidates only, not facts.",
+    },
+    rerankEnabled: {
+      type: "boolean",
+      description: "Enable optional rerank lane. Default false; rerank only orders candidates.",
+    },
+    graphProvider: {
+      type: "string",
+      enum: ["none", "sqlite_graph", "sqlite_edges", "external"],
+      description: "Graph provider. sqlite_graph is the local associative graph; sqlite_edges remains a compatibility alias.",
+    },
+    ragProvider: {
+      type: "string",
+      enum: ["none", "sqlite_vec", "brute_force", "embedding", "external"],
+      description: "RAG provider. sqlite_vec is the preferred local vector path; brute_force is the isolated fallback when extensions are unavailable.",
+    },
+    rerankProvider: {
+      type: "string",
+      enum: ["none", "deterministic", "llm", "specialist", "model", "external"],
+      description: "Rerank provider. deterministic is local fallback; llm/specialist/external are optional heavier orderers.",
+    },
+    embeddingEnabled: {
+      type: "boolean",
+      description: "Enable embedding writes/jobs for RAG. Default false so existing hot path stays unchanged.",
+    },
+    embeddingProvider: {
+      type: "string",
+      enum: ["none", "local_hash", "external"],
+      description: "Embedding generator. local_hash is deterministic and dependency-free; external is reserved for model-backed embeddings.",
+    },
+    embeddingModel: {
+      type: "string",
+      description: "Embedding model identifier used for vector index compatibility.",
+    },
+    embeddingDimensions: {
+      type: "number",
+      minimum: 16,
+      description: "Embedding dimensions used by local_hash or external providers.",
+    },
+    embeddingAsync: {
+      type: "boolean",
+      description: "Queue embedding jobs instead of making writes wait on optional RAG indexing.",
+    },
+    embeddingJobMaxBatch: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum embedding jobs processed per indexing batch.",
+    },
+    embeddingJobMaxRetries: {
+      type: "number",
+      minimum: 0,
+      description: "Retry cap for optional embedding jobs.",
+    },
+    vectorExtensionPath: {
+      type: "string",
+      description: "Optional path to a SQLite vector extension. Missing or failing extension falls back when ragFallbackToBruteForce=true.",
+    },
+    vectorSearchMaxCandidates: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum RAG candidates returned from local vector search.",
+    },
+    bruteForceVectorMaxRows: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum rows scanned by the TypeScript brute-force vector fallback.",
+    },
+    ragFallbackToBruteForce: {
+      type: "boolean",
+      description: "If sqlite_vec is unavailable, fall back to local TypeScript cosine search instead of failing the main OMS path.",
+    },
+    graphBuilderEnabled: {
+      type: "boolean",
+      description: "Enable local graph edge construction. Graph read path can stay enabled independently.",
+    },
+    graphBuilderProvider: {
+      type: "string",
+      enum: ["none", "deterministic", "llm", "external"],
+      description: "Graph edge builder. deterministic is local safe default; llm/external are optional.",
+    },
+    graphMaxDepth: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum graph traversal depth for associative recall.",
+    },
+    graphMaxFanout: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum graph neighbors expanded per node.",
+    },
+    graphMinConfidence: {
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+      description: "Minimum confidence for graph edges to participate in recall.",
+    },
+    graphAllowedRelations: {
+      type: "array",
+      items: { type: "string" },
+      description: "Allowed graph relation vocabulary for local associative graph edges.",
+    },
+    graphCandidateLimit: {
+      type: "number",
+      minimum: 1,
+      description: "Maximum graph candidates returned to the planner.",
+    },
+    rerankModel: {
+      type: "string",
+      description: "Optional model id for llm/specialist rerank providers.",
+    },
+    rerankTimeoutMs: {
+      type: "number",
+      minimum: 0,
+      description: "Timeout budget for optional model/external rerank.",
+    },
+    rerankFallbackToDeterministic: {
+      type: "boolean",
+      description: "Use deterministic local rerank if llm/specialist/external rerank is unavailable.",
+    },
+    featureIsolationMode: {
+      type: "string",
+      enum: ["fail_closed", "isolate_optional"],
+      description: "Optional-feature fault policy. isolate_optional keeps the main OMS path alive when RAG/Graph/Rerank fail.",
+    },
+    heavyRetrievalPolicy: {
+      type: "string",
+      enum: ["disabled", "planner_only"],
+      description: "Global heavy-retrieval policy. planner_only keeps RAG/Graph/model rerank under LLMPlanner control; default planner_only.",
+    },
+    ragPlannerPolicy: {
+      type: "string",
+      enum: ["disabled", "planner_only"],
+      description: "RAG lane scheduling policy. planner_only means semantic candidates are considered only when LLMPlanner routes them.",
+    },
+    graphPlannerPolicy: {
+      type: "string",
+      enum: ["disabled", "planner_only"],
+      description: "Graph lane scheduling policy. planner_only means relation/provenance traversal is considered only when LLMPlanner routes it.",
+    },
+    rerankPlannerPolicy: {
+      type: "string",
+      enum: ["disabled", "planner_only", "candidate_overload_required"],
+      description: "Rerank scheduling policy. candidate_overload_required forces deterministic rerank fallback whenever candidate pools are crowded or ambiguous.",
+    },
+    candidateRerankThreshold: {
+      type: "number",
+      minimum: 1,
+      description: "Total candidate count threshold that forces a rerank path before final context selection. Default 20.",
+    },
+    laneCandidateRerankThreshold: {
+      type: "number",
+      minimum: 1,
+      description: "Per-lane candidate count threshold that forces rerank. Default 10.",
+    },
+    candidateAmbiguityMargin: {
+      type: "number",
+      minimum: 0,
+      maximum: 0.999,
+      description: "Score-close ambiguity margin that forces rerank when top candidates are too close. Default 0.08.",
+    },
+    strictModeRequiresRerankOnConflict: {
+      type: "boolean",
+      description: "Require a rerank/expand/refuse path when strict or forensic mode has conflicting source-backed candidates. Default true.",
+    },
+    maxEnhancementLatencyMs: {
+      type: "number",
+      minimum: 0,
+      description: "Latency budget for optional enhancement lanes.",
+    },
+    maxRerankCandidates: {
+      type: "number",
+      minimum: 0,
+      description: "Maximum candidates sent to optional rerank providers.",
+    },
     emergencyBrake: {
       type: "boolean",
       description: "Emergency stop: disables runtime capture, MemoryItem writes, auto recall, and knowledge promotion.",

@@ -48,6 +48,7 @@ import {
   buildProjectStateSnapshot,
   formatProjectStateSnapshot,
 } from "../utils/projectState";
+import { SecretIngressGate } from "./SecretIngressGate";
 import {
   deriveProjectIdentityFromSnapshot,
   deriveProjectIdentityFromSummary,
@@ -149,6 +150,37 @@ export interface OmsRuntimeStatus {
     | "kbExportEnabled"
     | "semanticCandidateExpansionEnabled"
     | "semanticCandidateLimit"
+    | "graphEnabled"
+    | "ragEnabled"
+    | "rerankEnabled"
+    | "graphProvider"
+    | "ragProvider"
+    | "rerankProvider"
+    | "embeddingEnabled"
+    | "embeddingProvider"
+    | "embeddingModel"
+    | "embeddingDimensions"
+    | "vectorSearchMaxCandidates"
+    | "bruteForceVectorMaxRows"
+    | "ragFallbackToBruteForce"
+    | "graphBuilderEnabled"
+    | "graphBuilderProvider"
+    | "graphMaxDepth"
+    | "graphMaxFanout"
+    | "graphMinConfidence"
+    | "graphCandidateLimit"
+    | "rerankModel"
+    | "rerankTimeoutMs"
+    | "rerankFallbackToDeterministic"
+    | "featureIsolationMode"
+    | "heavyRetrievalPolicy"
+    | "ragPlannerPolicy"
+    | "graphPlannerPolicy"
+    | "rerankPlannerPolicy"
+    | "candidateRerankThreshold"
+    | "laneCandidateRerankThreshold"
+    | "candidateAmbiguityMargin"
+    | "strictModeRequiresRerankOnConflict"
     | "emergencyBrake"
     | "sqliteJournalMode"
   >;
@@ -163,6 +195,7 @@ export interface OmsVerifyReport {
   agentId: string;
   summaryDag: DagIntegrityReport;
   summaryIntegrity: SummaryIntegrityInspection;
+  summarySourceTrace: ReturnType<SQLiteRuntimeStore["inspectSummarySourceTrace"]>;
   runtimeStore: ReturnType<SQLiteRuntimeStore["verifyIntegrity"]>;
   warnings: string[];
   errors: string[];
@@ -290,6 +323,7 @@ export class ChaunyomsSessionRuntime {
   private readonly sourceMessageResolver = new SourceMessageResolver();
   private readonly dagIntegrityInspector = new SummaryDagIntegrityInspector();
   private readonly evidenceAtomEngine = new EvidenceAtomEngine();
+  private readonly secretIngressGate = new SecretIngressGate();
   private llmCaller: LlmCaller | null;
   private lastCompactionDiagnostics: CompactionDiagnostics | null = null;
   private navigationSnapshotPending = false;
@@ -433,18 +467,23 @@ export class ChaunyomsSessionRuntime {
       metadata: payload.metadata,
     });
     if (ingressDecision.storageTarget === "observation") {
+      const sanitizedObservation = this.secretIngressGate.sanitize(
+        `observation:${payload.sessionId}:${payload.id}`,
+        ingressDecision.normalizedText,
+        payload.metadata ?? {},
+      );
       await this.sessionData.appendObservation({
         id: `observation-${payload.id}`,
         sessionId: payload.sessionId,
         agentId: payload.config.agentId,
         role: payload.role,
         classification: ingressDecision.classification,
-        content: ingressDecision.normalizedText,
+        content: sanitizedObservation.text,
         sourceKey: payload.id,
         createdAt: new Date().toISOString(),
-        tokenCount: estimateTokens(ingressDecision.normalizedText),
+        tokenCount: estimateTokens(sanitizedObservation.text),
         metadata: {
-          ...(payload.metadata ?? {}),
+          ...sanitizedObservation.metadata,
           reason: ingressDecision.reason,
           sourceBoundary: "runtime_event_not_source",
         },
@@ -456,22 +495,27 @@ export class ChaunyomsSessionRuntime {
       return { ingested: false };
     }
 
+    const sanitized = this.secretIngressGate.sanitize(
+      `ingest:${payload.sessionId}:${payload.id}`,
+      ingressDecision.normalizedText,
+      payload.metadata ?? {},
+    );
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
     const knowledgeIntent = payload.role === "user"
-      ? await this.knowledgeIntentClassifier.classifyUserMessage(ingressDecision.normalizedText, payload.config)
+      ? await this.knowledgeIntentClassifier.classifyUserMessage(sanitized.text, payload.config)
       : null;
     const message: RawMessage = {
       id: payload.id,
       sessionId: payload.sessionId,
       agentId: payload.config.agentId,
       role: payload.role,
-      content: ingressDecision.normalizedText,
+      content: sanitized.text,
       turnNumber,
       createdAt: new Date().toISOString(),
-      tokenCount: estimateTokens(ingressDecision.normalizedText),
+      tokenCount: estimateTokens(sanitized.text),
       compacted: false,
       metadata: {
-        ...(payload.metadata ?? {}),
+        ...sanitized.metadata,
         ingressClassification: ingressDecision.classification,
         ingressReason: ingressDecision.reason,
         ...(knowledgeIntent ? { knowledgeIntent } : {}),
@@ -541,6 +585,12 @@ export class ChaunyomsSessionRuntime {
         totalBudget: context.totalBudget,
         intent: activeQuery ? "assemble_sqlite_with_active_query" : "assemble_sqlite",
         plan: result.plan,
+        metadata: {
+          query: activeQuery,
+          route: "assemble",
+          retrievalStrength: context.config.retrievalStrength,
+          usageFeedbackEnabled: context.config.usageFeedbackEnabled,
+        },
       });
       return {
         items: result.items,

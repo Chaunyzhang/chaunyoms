@@ -13,6 +13,7 @@ import {
 import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { KnowledgeIntentClassifier } from "../engines/KnowledgeIntentClassifier";
 import { SessionDataStores } from "../data/SessionDataLayer";
+import { SecretIngressGate } from "./SecretIngressGate";
 
 interface RuntimeIngressDependencies {
   runtimeIngress: RuntimeMessageIngress;
@@ -27,6 +28,8 @@ interface RuntimeIngressDependencies {
 }
 
 export class RuntimeIngressService {
+  private readonly secretIngressGate = new SecretIngressGate();
+
   constructor(private readonly deps: RuntimeIngressDependencies) {}
 
   async syncRuntimeMessages(
@@ -85,22 +88,27 @@ export class RuntimeIngressService {
 
     for (let index = 0; index < pendingRawMessages.length; index += 1) {
       const message = pendingRawMessages[index];
+      const sanitized = this.secretIngressGate.sanitize(
+        `runtime-message:${message.sourceKey}`,
+        message.text,
+        message.metadata ?? {},
+      );
       currentTurn = this.resolveRuntimeTurnNumber(currentTurn, message.role);
       const knowledgeIntent = message.role === "user"
-        ? await this.deps.knowledgeIntentClassifier.classifyUserMessage(message.text, config)
+        ? await this.deps.knowledgeIntentClassifier.classifyUserMessage(sanitized.text, config)
         : null;
       const rawMessage: RawMessage = {
-        id: message.id ?? this.buildRuntimeMessageId(sessionId, message.role, message.text, currentTurn, overlap + index),
+        id: message.id ?? this.buildRuntimeMessageId(sessionId, message.role, sanitized.text, currentTurn, overlap + index),
         sessionId,
         agentId: config.agentId,
         role: message.role,
-        content: message.text,
+        content: sanitized.text,
         turnNumber: currentTurn,
         createdAt: this.resolveRuntimeTimestamp(message.timestamp),
-        tokenCount: estimateTokens(message.text),
+        tokenCount: estimateTokens(sanitized.text),
         compacted: false,
         metadata: {
-          ...(message.metadata ?? {}),
+          ...sanitized.metadata,
           importedFromRuntimeMessages: true,
           importedSourceKey: message.sourceKey,
           runtimeIndex: overlap + index,
@@ -153,7 +161,12 @@ export class RuntimeIngressService {
       if (!message.text.trim()) {
         continue;
       }
-      const tokenCount = Math.max(estimateTokens(message.text), 1);
+      const sanitized = this.secretIngressGate.sanitize(
+        `runtime-tail:${message.sourceKey}`,
+        message.text,
+        message.metadata ?? {},
+      );
+      const tokenCount = Math.max(estimateTokens(sanitized.text), 1);
       if (selected.length > 0 && consumed + tokenCount > Math.min(availableBudget, freshTailTokens)) {
         break;
       }
@@ -161,9 +174,9 @@ export class RuntimeIngressService {
         kind: "message",
         tokenCount,
         role: message.role,
-        content: message.text,
+        content: sanitized.text,
         metadata: {
-          ...(message.metadata ?? {}),
+          ...sanitized.metadata,
           source: "runtime_tail_fallback",
           sourceKey: message.sourceKey,
         },

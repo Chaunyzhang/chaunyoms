@@ -26,6 +26,11 @@ async function main(): Promise<void> {
   assert(safeContext.config.memoryItemMarkdownMirrorEnabled === false, "expected MemoryItem Markdown mirrors to be disabled by default");
   assert(safeContext.config.transcriptMirrorEnabled === false, "expected transcript mirrors to be disabled by default");
   assert(safeContext.config.knowledgeMarkdownEnabled === false, "expected Knowledge Markdown hot-path assets to be disabled by default");
+  assert(safeContext.config.usageFeedbackEnabled === true, "expected usage feedback to stay enabled even in safe preset because it is bounded audit metadata");
+  assert(safeContext.config.brainPackEnabled === true, "expected BrainPack projection support to be available by default");
+  assert(safeContext.config.brainPackGitEnabled === false, "expected BrainPack git automation to remain opt-in");
+  assert(safeContext.config.openClawNativeMode === "disabled", "expected OpenClaw native capabilities to be disabled by default");
+  assert(safeContext.config.graphEnabled === false && safeContext.config.ragEnabled === false && safeContext.config.rerankEnabled === false, "expected RAG/graph/rerank enhancements to be off by default");
 
   const mirrorContext = adapter.resolveLifecycleContext({
     config: {

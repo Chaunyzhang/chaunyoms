@@ -101,6 +101,37 @@ export class OmsAdminService {
         kbExportEnabled: context.config.kbExportEnabled,
         semanticCandidateExpansionEnabled: context.config.semanticCandidateExpansionEnabled,
         semanticCandidateLimit: context.config.semanticCandidateLimit,
+        graphEnabled: context.config.graphEnabled,
+        ragEnabled: context.config.ragEnabled,
+        rerankEnabled: context.config.rerankEnabled,
+        graphProvider: context.config.graphProvider,
+        ragProvider: context.config.ragProvider,
+        rerankProvider: context.config.rerankProvider,
+        embeddingEnabled: context.config.embeddingEnabled,
+        embeddingProvider: context.config.embeddingProvider,
+        embeddingModel: context.config.embeddingModel,
+        embeddingDimensions: context.config.embeddingDimensions,
+        vectorSearchMaxCandidates: context.config.vectorSearchMaxCandidates,
+        bruteForceVectorMaxRows: context.config.bruteForceVectorMaxRows,
+        ragFallbackToBruteForce: context.config.ragFallbackToBruteForce,
+        graphBuilderEnabled: context.config.graphBuilderEnabled,
+        graphBuilderProvider: context.config.graphBuilderProvider,
+        graphMaxDepth: context.config.graphMaxDepth,
+        graphMaxFanout: context.config.graphMaxFanout,
+        graphMinConfidence: context.config.graphMinConfidence,
+        graphCandidateLimit: context.config.graphCandidateLimit,
+        rerankModel: context.config.rerankModel,
+        rerankTimeoutMs: context.config.rerankTimeoutMs,
+        rerankFallbackToDeterministic: context.config.rerankFallbackToDeterministic,
+        featureIsolationMode: context.config.featureIsolationMode,
+        heavyRetrievalPolicy: context.config.heavyRetrievalPolicy,
+        ragPlannerPolicy: context.config.ragPlannerPolicy,
+        graphPlannerPolicy: context.config.graphPlannerPolicy,
+        rerankPlannerPolicy: context.config.rerankPlannerPolicy,
+        candidateRerankThreshold: context.config.candidateRerankThreshold,
+        laneCandidateRerankThreshold: context.config.laneCandidateRerankThreshold,
+        candidateAmbiguityMargin: context.config.candidateAmbiguityMargin,
+        strictModeRequiresRerankOnConflict: context.config.strictModeRequiresRerankOnConflict,
         emergencyBrake: context.config.emergencyBrake,
         sqliteJournalMode: context.config.sqliteJournalMode,
       },
@@ -120,7 +151,11 @@ export class OmsAdminService {
       ? await this.deps.inspectDag(context)
       : this.deps.inspectAgentDag(context);
     const summaryIntegrity = this.deps.sessionData.inspectSummaryIntegrity();
-    const runtimeStore = this.deps.sessionData.getRuntimeStore().verifyIntegrity();
+    const runtimeStoreInstance = this.deps.sessionData.getRuntimeStore();
+    const summarySourceTrace = runtimeStoreInstance.inspectSummarySourceTrace(
+      scope === "session" ? { sessionId: context.sessionId } : {},
+    );
+    const runtimeStore = runtimeStoreInstance.verifyIntegrity();
     const errors = [
       ...(summaryDag.ok ? [] : summaryDag.issues.filter((issue) => issue.severity === "error").map((issue) => `${issue.code}: ${issue.message}`)),
       ...(summaryIntegrity.mismatched > 0 ? [`${summaryIntegrity.mismatched} summaries failed source hash verification.`] : []),
@@ -129,6 +164,7 @@ export class OmsAdminService {
     const warnings = [
       ...summaryDag.issues.filter((issue) => issue.severity === "warning").map((issue) => `${issue.code}: ${issue.message}`),
       ...(summaryIntegrity.unchecked > 0 ? [`${summaryIntegrity.unchecked} summaries have no source hash to verify.`] : []),
+      ...summarySourceTrace.warnings,
       ...runtimeStore.warnings,
     ];
     return {
@@ -138,6 +174,7 @@ export class OmsAdminService {
       agentId: context.config.agentId,
       summaryDag,
       summaryIntegrity,
+      summarySourceTrace,
       runtimeStore,
       warnings,
       errors,

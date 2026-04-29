@@ -288,6 +288,8 @@ export class OpenClawBridge {
       await this.retrieval.executeOpenClawMemoryPromote(args);
     const memoryPromoteExplain = async (args?: unknown) =>
       await this.retrieval.executeOpenClawMemoryPromoteExplain(args);
+    const nativeAbsorb = async (args?: unknown) =>
+      await this.retrieval.executeOmsNativeAbsorb(args);
     const promptBuilder = async (_payload?: unknown) => ({
       id: "oms",
       pluginId: "oms",
@@ -335,6 +337,8 @@ export class OpenClawBridge {
       memoryPromote,
       promoteExplain: memoryPromoteExplain,
       memoryPromoteExplain,
+      nativeAbsorb,
+      absorbNative: nativeAbsorb,
     };
     return {
       id: "oms",
@@ -544,6 +548,115 @@ export class OpenClawBridge {
       },
       async (_toolCallId: string, args: unknown) =>
         await this.retrieval.executeOmsStatus(args),
+    );
+
+    register(
+      "oms_brainpack_export",
+      "Export a Git-safe ChaunyOMS agent brainpack projection after SecretScanner/RedactionGate processing. SQLite remains the runtime source of truth.",
+      {
+        type: "object",
+        properties: {
+          reason: { type: "string", enum: ["manual", "turn_count", "interval", "major_change", "before_upgrade", "before_wipe", "release_gate"], description: "Snapshot reason. Defaults to manual." },
+          outputDir: { type: "string", description: "Optional output directory override for this export." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsBrainPackExport(args),
+    );
+
+    register(
+      "oms_brainpack_status",
+      "Inspect BrainPack snapshot policy, turn/interval schedule, Git opt-in state, and redaction settings without exporting.",
+      {
+        type: "object",
+        properties: {
+          currentTurn: { type: "number", description: "Optional current conversation turn for schedule simulation." },
+          lastSnapshotTurn: { type: "number", description: "Optional previous snapshot turn for schedule simulation." },
+          lastSnapshotAt: { type: "string", description: "Optional previous snapshot timestamp." },
+          manual: { type: "boolean", description: "When true, report the manual trigger decision." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsBrainPackStatus(args),
+    );
+
+    register(
+      "oms_native_policy_status",
+      "Show OpenClaw native feature policy: disabled, coexist, or absorbed, with feature-level overrides and compatibility warnings.",
+      {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsNativePolicyStatus(args),
+    );
+
+    register(
+      "oms_native_absorb",
+      "Absorb OpenClaw native outputs (memory-core/active-memory/memory-wiki/dreaming) into the OMS observation -> candidate -> validation -> promotion-pending flow when native mode is absorbed.",
+      {
+        type: "object",
+        properties: {
+          feature: { type: "string", enum: ["memory_core", "active_memory", "memory_wiki", "dreaming", "unknown"], description: "Native OpenClaw feature source." },
+          pluginId: { type: "string", description: "Native OpenClaw plugin id, for example dreaming." },
+          sourceId: { type: "string", description: "Explicit native event/source id. Required before absorbed candidates can pass MemoryOperation validation." },
+          nativeEventId: { type: "string", description: "Alias for sourceId." },
+          content: { type: "string", description: "Native output text to absorb as an observation/candidate." },
+          text: { type: "string", description: "Alias for content." },
+          output: { type: "string", description: "Alias for content." },
+          createdBy: { type: "string", enum: ["llm", "rule", "user", "system"], description: "Who produced the native operation proposal. Defaults to llm for absorbed mode." },
+          confidence: { type: "number", description: "Native output confidence from 0 to 1." },
+          apply: { type: "boolean", description: "Reserved explicit promotion request; the current path still writes candidate only until manual promotion." },
+          metadata: { type: "object", description: "Additional source metadata." },
+        },
+        additionalProperties: true,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsNativeAbsorb(args),
+    );
+
+    register(
+      "oms_benchmark_report",
+      "Create a guarded benchmark report envelope. Development/sample runs are forced to regression_only and cannot be presented as public-comparable rankings.",
+      {
+        type: "object",
+        properties: {
+          suite: { type: "string", description: "Benchmark suite name." },
+          scope: { type: "string", enum: ["development_sample", "standard_public"], description: "Report scope. Only standard_public can produce public-comparable claims." },
+          systems: { type: "array", items: { type: "string" }, description: "Systems included in the report." },
+          metrics: { type: "object", description: "Metric values." },
+          generatedAt: { type: "string", description: "Optional ISO timestamp." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsBenchmarkReport(args),
+    );
+
+    register(
+      "oms_recall_feedback",
+      "Record explicit recall usage feedback, including negative_feedback, for a recalled target. This adjusts bounded usage stats only and never bypasses source verification.",
+      {
+        type: "object",
+        properties: {
+          targetId: { type: "string", description: "Target id, usually a memory-item:* id from oms_why_recalled or memory_retrieve." },
+          id: { type: "string", description: "Alias for targetId." },
+          targetKind: { type: "string", description: "Target kind. Defaults to memory_item." },
+          kind: { type: "string", description: "Alias for targetKind." },
+          eventType: { type: "string", enum: ["candidate_seen", "context_selected", "answer_used", "verified_answer_used", "rejected", "negative_feedback"], description: "Feedback event type. Defaults to negative_feedback." },
+          action: { type: "string", description: "Alias for eventType." },
+          query: { type: "string", description: "Optional query that produced the feedback." },
+          route: { type: "string", description: "Optional route label." },
+          note: { type: "string", description: "Optional human-readable feedback note." },
+          sourceVerified: { type: "boolean", description: "Whether the feedback refers to source-verified use." },
+        },
+        additionalProperties: false,
+      },
+      async (_toolCallId: string, args: unknown) =>
+        await this.retrieval.executeOmsRecallFeedback(args),
     );
 
     register(

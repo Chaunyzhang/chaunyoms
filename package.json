@@ -5,6 +5,9 @@
   "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=24"
+  },
   "openclaw": {
     "extensions": [
       "./dist/index.js"
@@ -22,6 +25,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
     "test:compiled": "node scripts/run-compiled-tests.cjs",
     "test": "npm run build && npm run test:compiled",
+    "doctor": "node --experimental-sqlite scripts/check-environment.cjs",
     "eval:memory": "npm run build && node dist/src/evals/run-eval-suite.js",
     "benchmark": "npm run build && node dist/src/benchmarks/benchmark-runtime.js",
     "qa:runtime-report": "node --experimental-sqlite scripts/openclaw-runtime-report.cjs",

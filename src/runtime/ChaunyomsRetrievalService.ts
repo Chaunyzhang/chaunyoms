@@ -2,10 +2,17 @@ import { ContextPlanner, ContextPlannerResult } from "../engines/ContextPlanner"
 import { LLMPlanner } from "../planner/LLMPlanner";
 import { PlanValidator } from "../planner/PlanValidator";
 import { RetrievalRuntime } from "../retrieval/RetrievalRuntime";
+import { DeterministicReranker, RerankAudit, RetrievalEnhancementRegistry } from "../retrieval/RetrievalEnhancementProviders";
+import { BrainPackExporter, BrainPackSnapshotReason } from "../brainpack/BrainPackExporter";
+import { BrainPackScheduler } from "../brainpack/BrainPackScheduler";
+import { BenchmarkComparisonGuard } from "../evals/benchmark-comparison";
+import { MemoryOperationCreator } from "../memory/MemoryOperation";
+import { OpenClawNativeAbsorber } from "../native/OpenClawNativeAbsorber";
 import { RetrievalVerifier, RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
 import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
+import { EnvironmentDoctor } from "../system/EnvironmentDoctor";
 import {
   AnswerCandidate,
   ContextItem,
@@ -26,8 +33,15 @@ import {
   LifecycleContext,
   OpenClawPayloadAdapter,
 } from "../host/OpenClawPayloadAdapter";
+import { DEFAULT_BRIDGE_CONFIG } from "../host/OpenClawHostServices";
 import { ChaunyomsSessionRuntime } from "./ChaunyomsSessionRuntime";
-import { OmsExpandResult, OmsGrepHit } from "../data/SQLiteRuntimeStore";
+import {
+  OmsExpandResult,
+  OmsGrepHit,
+  RetrievalUsageEventDraft,
+  RuntimeEnhancementSearchResult,
+  SQLiteRuntimeStore,
+} from "../data/SQLiteRuntimeStore";
 import { estimateTokens } from "../utils/tokenizer";
 
 interface ToolResponse {
@@ -40,6 +54,8 @@ interface SemanticExpansionResult {
   memoryItemHits: MemoryItemEntry[];
   summaryHits: SummaryEntry[];
   projectHit: ProjectRecord | null;
+  ragSearch?: RuntimeEnhancementSearchResult;
+  graphSearch?: RuntimeEnhancementSearchResult;
 }
 
 interface RecallPresentationOptions {
@@ -96,6 +112,7 @@ interface PlannerAuditContext {
   recallResult?: RecallResult;
   retrievalVerification?: RetrievalVerificationResult;
   evidenceGate?: EvidenceGateResult;
+  rerankAudit?: RerankAudit;
   timings?: Record<string, number>;
 }
 
@@ -111,6 +128,7 @@ export class ChaunyomsRetrievalService {
   private readonly planValidator = new PlanValidator();
   private readonly retrievalRuntime = new RetrievalRuntime();
   private readonly retrievalVerifier = new RetrievalVerifier();
+  private readonly deterministicReranker = new DeterministicReranker();
   private readonly fixedPrefixProvider: FixedPrefixProvider;
 
   constructor(
@@ -133,6 +151,8 @@ export class ChaunyomsRetrievalService {
       query,
       context,
       decision,
+      runtimeStore,
+      allowIndexing: false,
       memoryItems: runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
       summaryHits: stores.summaryStore.search(query, { sessionId: scopedSessionId }),
       projects: stores.projectStore.getAll().filter((project) => project.status !== "archived"),
@@ -225,19 +245,35 @@ export class ChaunyomsRetrievalService {
     }
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
-    const emptyExpansion = this.emptySemanticExpansion(matchedProject);
     const runtimeStore = await this.runtime.getRuntimeStore(context);
     const shouldProbeMemoryItems = decision.route === "memory_item" ||
       ((decision.requiresSourceRecall || decision.route === "summary_tree") &&
         (!context.config.autoRecallEnabled || context.config.emergencyBrake));
     const memoryItemHits = shouldProbeMemoryItems
       ? this.searchMemoryItemHits(
-        runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
+        runtimeStore.listMemoryItems({
+          agentId: context.config.agentId,
+          includeRetrievalUsage: context.config.usageFeedbackEnabled,
+        }),
         query,
         matchedProject?.id,
         3,
       )
       : [];
+    const semanticExpansion = await this.collectSemanticExpansion({
+      query,
+      context,
+      decision,
+      runtimeStore,
+      allowIndexing: true,
+      memoryItems: runtimeStore.listMemoryItems({
+        agentId: context.config.agentId,
+        includeRetrievalUsage: context.config.usageFeedbackEnabled,
+      }),
+      summaryHits: summaryStore.search(query, { sessionId: scopedSessionId }),
+      projects: activeProjects,
+      matchedProject,
+    });
     if ((decision.requiresSourceRecall || decision.route === "summary_tree") && (!context.config.autoRecallEnabled || context.config.emergencyBrake)) {
       await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_source_recall_disabled", {
         sourceRecallDisabled: true,
@@ -247,7 +283,7 @@ export class ChaunyomsRetrievalService {
         query,
         context,
         decision,
-        emptyExpansion,
+        semanticExpansion,
       );
     }
 
@@ -261,7 +297,7 @@ export class ChaunyomsRetrievalService {
         query,
         context,
         decision,
-        emptyExpansion,
+        semanticExpansion,
       );
     }
 
@@ -270,6 +306,7 @@ export class ChaunyomsRetrievalService {
       memoryItemHits.length > 0 &&
       !this.isHardSourceTraceRequired(context)
     ) {
+      this.recordDirectMemoryItemUsage(runtimeStore, memoryItemHits, query, context, decision);
       await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_memory_item", {
         memoryItemHitCount: memoryItemHits.length,
       });
@@ -292,7 +329,7 @@ export class ChaunyomsRetrievalService {
           matchedProjectId: decision.matchedProjectId ?? null,
           matchedProjectTitle: decision.matchedProjectTitle ?? null,
         },
-      }, query, context, decision, emptyExpansion);
+      }, query, context, decision, semanticExpansion);
     }
 
     if (this.shouldAutoRecall(decision, context)) {
@@ -305,7 +342,7 @@ export class ChaunyomsRetrievalService {
           query,
           context,
           decision,
-          emptyExpansion,
+          semanticExpansion,
         );
       }
 
@@ -346,15 +383,20 @@ export class ChaunyomsRetrievalService {
       );
       timings.atomMs = Date.now() - atomStartedAt;
       const planStartedAt = Date.now();
-      const planned = this.planRecallItems(query, atomResult, retrievalBudget);
+      const enhancedResult = this.mergeEnhancementCandidatesIntoRecallResult(
+        atomResult,
+        semanticExpansion,
+        recallBudget,
+      );
+      const planned = this.planRecallItems(query, enhancedResult, retrievalBudget, context.config, decision);
       timings.planMs = Date.now() - planStartedAt;
-      const evidenceGate = this.evaluateEvidenceGate(query, planned.items, atomResult);
+      const evidenceGate = this.evaluateEvidenceGate(query, planned.items, enhancedResult);
       const retrievalVerification = this.retrievalVerifier.verify({
         retrievalStrength,
         items: planned.items,
-        sourceTrace: atomResult.sourceTrace,
-        answerCandidates: atomResult.answerCandidates,
-        recallResult: atomResult,
+        sourceTrace: enhancedResult.sourceTrace,
+        answerCandidates: enhancedResult.answerCandidates,
+        recallResult: enhancedResult,
       });
       const persistentEvidenceAtomHitCount = atomResult.items.filter((item) =>
         item.metadata?.persistentEvidenceAtom === true,
@@ -367,12 +409,19 @@ export class ChaunyomsRetrievalService {
         query,
         decision,
         planned,
-        recallResult: atomResult,
+        recallResult: enhancedResult,
         retrievalVerification,
         evidenceGate,
+        rerankAudit: planned.rerankAudit,
         timings,
       });
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget, {
+        query,
+        route: decision.route,
+        retrievalStrength,
+        usageFeedbackEnabled: context.config.usageFeedbackEnabled,
+        answerUsed: retrievalVerification.status === "sufficient" && retrievalVerification.recommendedAction === "answer",
+        verifiedAnswerUsed: retrievalVerification.verifiedTraceCount > 0 || retrievalVerification.verifiedAnswerCount > 0,
         planner: decision.planner ?? null,
         plannerRunId: decision.planner?.runId ?? null,
         plannerIntent: decision.planner?.intent.primary ?? null,
@@ -381,6 +430,7 @@ export class ChaunyomsRetrievalService {
         retrievalVerification,
         evidenceGate,
         progressiveRetrievalSteps,
+        rerankAudit: planned.rerankAudit,
       });
       const presentation = this.resolveRecallPresentationOptions(args, context.config.retrievalStrength);
       timings.totalMs = Date.now() - startedAt;
@@ -389,7 +439,7 @@ export class ChaunyomsRetrievalService {
           this.buildRetrievalVerifierBlockedResponse(
             query,
             decision,
-            atomResult,
+            enhancedResult,
             retrievalVerification,
             evidenceGate,
             {
@@ -402,11 +452,11 @@ export class ChaunyomsRetrievalService {
           query,
           context,
           decision,
-          emptyExpansion,
+          semanticExpansion,
         );
       }
       return this.attachDiagnostics({
-        content: [{ type: "text", text: this.formatRecallText(query, planned.items, atomResult.sourceTrace, atomResult.answerCandidates, presentation, evidenceGate, {
+        content: [{ type: "text", text: this.formatRecallText(query, planned.items, enhancedResult.sourceTrace, enhancedResult.answerCandidates, presentation, evidenceGate, {
           retrievalBudget,
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
@@ -419,14 +469,15 @@ export class ChaunyomsRetrievalService {
           query,
           consumedTokens: planned.consumedTokens,
           hitCount: planned.items.length,
-          retrievalHitType: atomResult.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
-          recallStrategy: atomResult.strategy ?? "summary_navigation",
-          rawCandidateCount: atomResult.rawCandidateCount ?? 0,
+          retrievalHitType: enhancedResult.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
+          recallStrategy: enhancedResult.strategy ?? "summary_navigation",
+          rawCandidateCount: enhancedResult.rawCandidateCount ?? 0,
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
           evidenceGate,
           retrievalVerification,
           progressiveRetrievalSteps,
+          rerankAudit: planned.rerankAudit,
           rawFtsHintCount: rawFtsHints.length,
           autoRecall: true,
           autoRecallReason: this.explainAutoRecall(decision, context),
@@ -439,13 +490,15 @@ export class ChaunyomsRetrievalService {
           rawFtsHintLimit: this.resolveRawFtsHintLimit(args),
           scope,
           sessionId: scopedSessionId ?? null,
-          dagTrace: presentation.includeFullTrace ? atomResult.dagTrace : this.compactDagTrace(atomResult.dagTrace),
-          sourceTrace: presentation.includeFullTrace ? atomResult.sourceTrace : this.compactSourceTrace(atomResult.sourceTrace),
-          answerCandidates: this.compactAnswerCandidates(atomResult.answerCandidates ?? [], presentation),
+          dagTrace: presentation.includeFullTrace ? enhancedResult.dagTrace : this.compactDagTrace(enhancedResult.dagTrace),
+          sourceTrace: presentation.includeFullTrace ? enhancedResult.sourceTrace : this.compactSourceTrace(enhancedResult.sourceTrace),
+          answerCandidates: this.compactAnswerCandidates(enhancedResult.answerCandidates ?? [], presentation),
+          ragSearch: semanticExpansion.ragSearch ?? null,
+          graphSearch: semanticExpansion.graphSearch ?? null,
           plannerRunId: planned.plan.runId,
           plannerRejectedCount: planned.plan.rejected.length,
         },
-      }, query, context, decision, emptyExpansion);
+      }, query, context, decision, semanticExpansion);
     }
 
     if (decision.route === "knowledge") {
@@ -477,7 +530,7 @@ export class ChaunyomsRetrievalService {
             reason: "markdown_assets_not_hot_path",
           }],
         },
-      }, query, context, decision, emptyExpansion);
+      }, query, context, decision, semanticExpansion);
     }
 
     const recentTail = rawStore.getRecentTail(3, { sessionId: context.sessionId });
@@ -502,7 +555,7 @@ export class ChaunyomsRetrievalService {
           reason: "standard_path_no_authoritative_hit",
         }],
       },
-    }, query, context, decision, emptyExpansion);
+    }, query, context, decision, semanticExpansion);
   }
 
   async executeOpenClawMemorySearch(args: unknown): Promise<ToolResponse> {
@@ -725,6 +778,162 @@ export class ChaunyomsRetrievalService {
     );
   }
 
+  async executeOmsBrainPackExport(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const reason = this.resolveBrainPackReason(this.getStringArg(args, "reason"));
+    const outputDir = this.getStringArg(args, "outputDir") || undefined;
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const result = await new BrainPackExporter(runtimeStore, context.config).export({ reason, outputDir });
+    return this.jsonToolResponse(
+      "oms_brainpack_export",
+      result,
+      result.ok && result.redactionReport.okForGit,
+    );
+  }
+
+  async executeOmsBrainPackStatus(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const scheduler = new BrainPackScheduler();
+    const currentTurn = this.getNumberArg(args, "currentTurn", 0);
+    const lastSnapshotTurn = this.getNumberArg(args, "lastSnapshotTurn", 0);
+    const lastSnapshotAt = this.getStringArg(args, "lastSnapshotAt") || undefined;
+    const decision = scheduler.shouldExport(context.config, {
+      manual: this.getBooleanArg(args, "manual", false),
+      currentTurn,
+      lastSnapshotTurn,
+      lastSnapshotAt,
+    });
+    return this.jsonToolResponse("oms_brainpack_status", {
+      ok: true,
+      enabled: context.config.brainPackEnabled,
+      mode: context.config.brainPackMode,
+      outputDir: context.config.brainPackOutputDir,
+      gitEnabled: context.config.brainPackGitEnabled,
+      redactionMode: context.config.brainPackRedactionMode,
+      includeRawTranscript: context.config.brainPackIncludeRawTranscript,
+      includeToolOutputs: context.config.brainPackIncludeToolOutputs,
+      schedule: decision,
+    }, true);
+  }
+
+  async executeOmsNativePolicyStatus(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const compatibility = this.payloadAdapter.inspectOpenClawCompatibility();
+    return this.jsonToolResponse("oms_native_policy_status", {
+      ok: compatibility.ok,
+      mode: context.config.openClawNativeMode,
+      featurePolicy: {
+        defaultMode: context.config.openClawNativeMode,
+        memoryCore: context.config.openClawNativeMemoryCoreMode ?? context.config.openClawNativeMode,
+        activeMemory: context.config.openClawNativeActiveMemoryMode ?? context.config.openClawNativeMode,
+        memoryWiki: context.config.openClawNativeMemoryWikiMode ?? context.config.openClawNativeMode,
+        dreaming: context.config.openClawNativeDreamingMode ?? context.config.openClawNativeMode,
+      },
+      compatibility,
+    }, compatibility.ok);
+  }
+
+  async executeOmsNativeAbsorb(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const content = this.getStringArg(args, "content") ||
+      this.getStringArg(args, "text") ||
+      this.getStringArg(args, "output");
+    const metadata = this.isRecord(args) && this.isRecord(args.metadata)
+      ? args.metadata
+      : {};
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const result = await new OpenClawNativeAbsorber(runtimeStore, context.config).absorb({
+      feature: this.getStringArg(args, "feature") || undefined,
+      pluginId: this.getStringArg(args, "pluginId") || undefined,
+      sourceId: this.getStringArg(args, "sourceId") ||
+        this.getStringArg(args, "nativeEventId") ||
+        this.getStringArg(args, "eventId") ||
+        undefined,
+      content,
+      createdBy: this.resolveOperationCreator(this.getStringArg(args, "createdBy")),
+      confidence: this.getOptionalNumberArg(args, "confidence"),
+      apply: this.getBooleanArg(args, "apply", false),
+      metadata,
+    });
+    return this.jsonToolResponse("oms_native_absorb", result, result.ok);
+  }
+
+  async executeOmsBenchmarkReport(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    const guard = new BenchmarkComparisonGuard();
+    const scope = this.getStringArg(args, "scope") === "standard_public"
+      ? "standard_public"
+      : "development_sample";
+    const systems = this.readStringArrayArg(args, "systems");
+    const metrics = this.isRecord(args) && this.isRecord(args.metrics)
+      ? args.metrics
+      : {};
+    const report = guard.buildReport({
+      suite: this.getStringArg(args, "suite") || "unspecified",
+      scope,
+      systems: systems.length > 0 ? systems : ["chaunyoms"],
+      metrics,
+      generatedAt: this.getStringArg(args, "generatedAt") || undefined,
+    });
+    return this.jsonToolResponse("oms_benchmark_report", {
+      ...report,
+      publicComparableAllowed: guard.canClaimPublicComparison(report),
+      enforcement: report.claimLevel === "public_comparable"
+        ? "public_comparison_allowed"
+        : "regression_only_do_not_publish_as_public_ranking",
+      contextAgentId: context.config.agentId,
+    }, true);
+  }
+
+  async executeOmsRecallFeedback(args: unknown): Promise<ToolResponse> {
+    const context = this.resolveContext(args);
+    if (!context.config.usageFeedbackEnabled) {
+      return this.jsonToolResponse("oms_recall_feedback", {
+        ok: true,
+        recorded: false,
+        reason: "usage_feedback_disabled",
+      }, true);
+    }
+    const targetId = this.getStringArg(args, "targetId") || this.getStringArg(args, "id");
+    if (!targetId) {
+      return this.buildMissingIdResponse("oms_recall_feedback");
+    }
+    const requestedEventType = this.getStringArg(args, "eventType") || this.getStringArg(args, "action") || "negative_feedback";
+    const eventType = this.resolveUsageEventType(requestedEventType);
+    if (!eventType) {
+      return {
+        content: [{ type: "text", text: "oms_recall_feedback eventType must be candidate_seen, context_selected, answer_used, verified_answer_used, rejected, or negative_feedback." }],
+        details: { ok: false, tool: "oms_recall_feedback", reason: "invalid_event_type" },
+      };
+    }
+    const targetKind = this.getStringArg(args, "targetKind") || this.getStringArg(args, "kind") || "memory_item";
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    runtimeStore.recordRetrievalUsageEvents([{
+      eventType,
+      targetKind,
+      targetId,
+      sessionId: context.sessionId,
+      agentId: context.config.agentId,
+      projectId: this.getStringArg(args, "projectId") || undefined,
+      query: this.getStringArg(args, "query") || undefined,
+      route: this.getStringArg(args, "route") || "manual_feedback",
+      retrievalStrength: context.config.retrievalStrength,
+      sourceVerified: this.getBooleanArg(args, "sourceVerified", false),
+      answerUsed: eventType === "answer_used" || eventType === "verified_answer_used",
+      metadata: {
+        note: this.getStringArg(args, "note") || undefined,
+        feedbackSource: "oms_recall_feedback",
+      },
+    }]);
+    return this.jsonToolResponse("oms_recall_feedback", {
+      ok: true,
+      recorded: true,
+      eventType,
+      targetKind,
+      targetId,
+    }, true);
+  }
+
   async executeOmsSetupGuide(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
     const status = await this.runtime.getStatus(context);
@@ -758,6 +967,14 @@ export class ChaunyomsRetrievalService {
               kbExportEnabled: true,
               knowledgeIntakeMode: context.config.knowledgeIntakeMode,
               sqliteJournalMode: context.config.sqliteJournalMode,
+              ragEnabled: false,
+              ragProvider: "sqlite_vec",
+              ragFallbackToBruteForce: true,
+              graphEnabled: false,
+              graphProvider: "sqlite_graph",
+              rerankEnabled: false,
+              rerankProvider: "deterministic",
+              featureIsolationMode: "isolate_optional",
             },
           },
           "memory-core": { enabled: false },
@@ -820,7 +1037,11 @@ export class ChaunyomsRetrievalService {
     const verify = await this.runtime.verify(context);
     const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
     const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
+    const environment = EnvironmentDoctor.run({
+      vectorExtensionPath: context.config.vectorExtensionPath,
+    });
     const warnings = [
+      ...environment.warnings,
       ...configGuidance.warnings,
       ...openClawCompatibility.warnings,
       ...verify.warnings,
@@ -832,13 +1053,20 @@ export class ChaunyomsRetrievalService {
       ...(status.runtimeStore.experimentalAdapter ? ["SQLite runtime is using Node's experimental node:sqlite adapter; pin a compatible Node version for production deployments."] : []),
       ...(context.config.knowledgePromotionEnabled ? [] : ["knowledgePromotionEnabled is false; Markdown asset promotion is opt-in/disabled."]),
     ];
-    const errors = [...verify.errors, ...openClawCompatibility.errors];
+    const errors = [
+      ...verify.errors,
+      ...openClawCompatibility.errors,
+      ...environment.checks
+        .filter((check) => check.required && !check.ok)
+        .map((check) => check.message),
+    ];
     const doctor = {
       ok: errors.length === 0,
       engineId: "oms",
       activeRuntime: "sqlite-first runtime, markdown export-only assets",
       status,
       verify,
+      environment,
       configGuidance,
       openClawCompatibility,
       warnings,
@@ -1180,6 +1408,9 @@ export class ChaunyomsRetrievalService {
       apiPrompt: null,
       autoRecallEnabled: context.config.autoRecallEnabled,
       retrievalStrength: context.config.retrievalStrength,
+      usageFeedbackEnabled: context.config.usageFeedbackEnabled,
+      retrievalEnhancements: this.buildRetrievalEnhancementDiagnostics(context.config),
+      openClawNativeMode: context.config.openClawNativeMode,
       sourceTraceRequired: this.isSourceTraceRequired(decision, context),
       evidencePresentation: context.config.retrievalStrength === "forensic"
         ? "show_source_trace"
@@ -1198,11 +1429,15 @@ export class ChaunyomsRetrievalService {
       plannerActivationMode: decision.planner?.activationMode ?? null,
       plannerSelectedPlan: decision.planner?.selectedPlan ?? "deterministic",
       plannerValidation: decision.planner?.validation ?? null,
-      embeddingsReady: false,
       candidateExpansionMode:
         context.config.semanticCandidateExpansionEnabled
-          ? "heuristic_only"
+          ? semanticExpansion.ragSearch || semanticExpansion.graphSearch
+            ? "planner_guided_rag_graph_plus_heuristic"
+            : "heuristic_only"
           : "disabled",
+      embeddingsReady: Boolean(semanticExpansion.ragSearch?.providerAvailable || semanticExpansion.ragSearch?.candidates.length),
+      ragSearch: semanticExpansion.ragSearch ?? null,
+      graphSearch: semanticExpansion.graphSearch ?? null,
       semanticCandidates: semanticExpansion.candidates.map((candidate) => ({
         kind: candidate.kind,
         id: candidate.id,
@@ -1226,13 +1461,21 @@ export class ChaunyomsRetrievalService {
     query: string;
     context: LifecycleContext;
     decision: RetrievalDecision;
+    runtimeStore: SQLiteRuntimeStore;
+    allowIndexing?: boolean;
     memoryItems: MemoryItemEntry[];
     summaryHits: SummaryEntry[];
     projects: ProjectRecord[];
     matchedProject: ProjectRecord | null;
   }): Promise<SemanticExpansionResult> {
     const expansionEnabled = args.context.config.semanticCandidateExpansionEnabled;
-    if (!expansionEnabled) {
+    const shouldUseRag = args.context.config.ragEnabled &&
+      args.context.config.ragProvider !== "none" &&
+      args.decision.planner?.routeSteps.some((step) => step.layer === "rag_candidates") === true;
+    const shouldUseGraph = args.context.config.graphEnabled &&
+      args.context.config.graphProvider !== "none" &&
+      args.decision.planner?.routeSteps.some((step) => step.layer === "graph_neighbors") === true;
+    if (!expansionEnabled && !shouldUseRag && !shouldUseGraph) {
       return {
         candidates: [],
         memoryItemHits: [],
@@ -1242,6 +1485,55 @@ export class ChaunyomsRetrievalService {
     }
     const terms = this.semanticTerms(args.query);
     const candidates: SemanticCandidate[] = [];
+    const indexReport = (shouldUseRag || shouldUseGraph) && args.allowIndexing !== false
+      ? args.runtimeStore.indexRetrievalEnhancements(args.context.config, {
+          sessionId: args.context.sessionId,
+          agentId: args.context.config.agentId,
+        })
+      : null;
+    const ragSearch = shouldUseRag
+      ? args.runtimeStore.searchVectorCandidates(args.query, args.context.config, {
+          sessionId: args.context.sessionId,
+          agentId: args.context.config.agentId,
+          limit: args.context.config.vectorSearchMaxCandidates,
+        })
+      : undefined;
+    const graphSearch = shouldUseGraph
+      ? args.runtimeStore.searchGraphCandidates(args.query, args.context.config, {
+          sessionId: args.context.sessionId,
+          agentId: args.context.config.agentId,
+          seedIds: ragSearch?.candidates
+            .map((candidate) => typeof candidate.metadata?.sourceId === "string" ? `node:${candidate.metadata.sourceKind}:${candidate.metadata.sourceId}` : "")
+            .filter(Boolean),
+          limit: args.context.config.graphCandidateLimit,
+        })
+      : undefined;
+    for (const search of [ragSearch, graphSearch].filter(Boolean) as RuntimeEnhancementSearchResult[]) {
+      for (const candidate of search.candidates) {
+        const sourceKind = typeof candidate.metadata?.sourceKind === "string"
+          ? candidate.metadata.sourceKind
+          : candidate.kind;
+        candidates.push({
+          kind: (candidate.kind === "raw_message"
+            ? "summary"
+            : candidate.kind === "evidence_atom"
+              ? "memory_item"
+              : candidate.kind) as SemanticCandidate["kind"],
+          id: typeof candidate.metadata?.sourceId === "string" ? candidate.metadata.sourceId : candidate.id,
+          title: candidate.title ?? candidate.content?.slice(0, 80) ?? candidate.id,
+          score: candidate.score,
+          reasons: [
+            `${search.mode}:${candidate.reason}`,
+            ...(indexReport?.warnings ?? []),
+            ...(search.warnings ?? []),
+          ],
+          authority: candidate.sourceVerified ? "authoritative" : "hint",
+          sourceRoute: "semantic_candidate_expansion",
+          requiresSourceRecall: sourceKind === "summary",
+          matchedProjectId: typeof candidate.metadata?.projectId === "string" ? candidate.metadata.projectId : undefined,
+        });
+      }
+    }
 
     const memoryItemHits = [...args.memoryItems]
       .filter((entry) => entry.status === "active" && entry.contextPolicy !== "never")
@@ -1345,6 +1637,8 @@ export class ChaunyomsRetrievalService {
       memoryItemHits: memoryItemHits.map((item) => item.entry),
       summaryHits: summaryHits.map((item) => item.entry),
       projectHit,
+      ragSearch,
+      graphSearch,
     };
   }
 
@@ -1354,7 +1648,90 @@ export class ChaunyomsRetrievalService {
       memoryItemHits: [],
       summaryHits: [],
       projectHit,
+      ragSearch: undefined,
+      graphSearch: undefined,
     };
+  }
+
+  private mergeEnhancementCandidatesIntoRecallResult(
+    result: RecallResult,
+    semanticExpansion: SemanticExpansionResult,
+    tokenBudget: number,
+  ): RecallResult {
+    const existing = new Set(
+      result.items.map((item) =>
+        [
+          item.kind,
+          item.summaryId ?? item.metadata?.messageId ?? "",
+          item.content.slice(0, 120),
+        ].join("|"),
+      ),
+    );
+    const enhancementCandidates = [
+      ...(semanticExpansion.ragSearch?.candidates ?? []),
+      ...(semanticExpansion.graphSearch?.candidates ?? []),
+    ].sort((left, right) => right.score - left.score);
+    const enhancementItems: ContextItem[] = [];
+    let consumed = result.consumedTokens;
+    for (const candidate of enhancementCandidates) {
+      const content = candidate.content?.trim();
+      if (!content) {
+        continue;
+      }
+      const tokenCount = Math.max(candidate.tokenCount ?? estimateTokens(content), 1);
+      if (consumed + tokenCount > tokenBudget) {
+        break;
+      }
+      const sourceKind = typeof candidate.metadata?.sourceKind === "string"
+        ? candidate.metadata.sourceKind
+        : candidate.kind;
+      const sourceId = typeof candidate.metadata?.sourceId === "string"
+        ? candidate.metadata.sourceId
+        : candidate.id;
+      const key = ["enhancement", sourceKind, sourceId, content.slice(0, 120)].join("|");
+      if (existing.has(key)) {
+        continue;
+      }
+      existing.add(key);
+      consumed += tokenCount;
+      enhancementItems.push({
+        kind: "summary",
+        summaryId: candidate.kind === "summary" ? sourceId : undefined,
+        tokenCount,
+        content,
+        metadata: {
+          retrievalEnhancement: true,
+          enhancementReason: candidate.reason,
+          enhancementScore: candidate.score,
+          sourceKind,
+          sourceId,
+          sourceVerified: candidate.sourceVerified === true,
+          ...(candidate.metadata ?? {}),
+        },
+      });
+    }
+    if (enhancementItems.length === 0) {
+      return result;
+    }
+    return {
+      ...result,
+      items: [...enhancementItems, ...result.items],
+      consumedTokens: consumed,
+    };
+  }
+
+  private resolveUsageEventType(value: string): RetrievalUsageEventDraft["eventType"] | null {
+    const normalized = value.trim().toLowerCase();
+    return ["candidate_seen", "context_selected", "answer_used", "verified_answer_used", "rejected", "negative_feedback"].includes(normalized)
+      ? normalized as RetrievalUsageEventDraft["eventType"]
+      : null;
+  }
+
+  private resolveBrainPackReason(value: string): BrainPackSnapshotReason {
+    const normalized = value.trim().toLowerCase();
+    return ["manual", "turn_count", "interval", "major_change", "before_upgrade", "before_wipe", "release_gate"].includes(normalized)
+      ? normalized as BrainPackSnapshotReason
+      : "manual";
   }
 
   private resolveContext(args: unknown): LifecycleContext {
@@ -1405,6 +1782,27 @@ export class ChaunyomsRetrievalService {
       }
     }
     return fallback;
+  }
+
+  private readStringArrayArg(args: unknown, key: string): string[] {
+    if (!this.isRecord(args)) {
+      return [];
+    }
+    const value = args[key];
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  private resolveOperationCreator(value: string): MemoryOperationCreator | undefined {
+    const normalized = value.trim().toLowerCase();
+    return ["llm", "rule", "user", "system"].includes(normalized)
+      ? normalized as MemoryOperationCreator
+      : undefined;
   }
 
   private getOptionalNumberArg(args: unknown, key: string): number | undefined {
@@ -1755,10 +2153,17 @@ export class ChaunyomsRetrievalService {
     }));
   }
 
-  private planRecallItems(query: string, result: RecallResult, retrievalBudget: RetrievalBudgetPlan): {
+  private planRecallItems(
+    query: string,
+    result: RecallResult,
+    retrievalBudget: RetrievalBudgetPlan,
+    config: LifecycleContext["config"] = DEFAULT_BRIDGE_CONFIG,
+    decision?: RetrievalDecision,
+  ): {
     items: ContextItem[];
     consumedTokens: number;
     plan: ReturnType<ContextPlanner["plan"]>;
+    rerankAudit: RerankAudit;
   } {
     const answerEvidenceIds = new Set((result.answerCandidates ?? []).flatMap((candidate) => candidate.evidenceMessageIds));
     const recallItems = result.items.map((item) =>
@@ -1782,13 +2187,49 @@ export class ChaunyomsRetrievalService {
       }
       return candidate;
     });
-    const layerLimitedCandidates = this.applyRecallLayerBudgets(candidates, retrievalBudget);
+    const forceRerank = Boolean(decision?.planner?.routeSteps.some((step) => step.layer === "rerank" && step.action === "order"));
+    const reranker = this.deterministicReranker ?? new DeterministicReranker();
+    const reranked = reranker.rerank(
+      candidates.map((candidate) => ({
+        id: candidate.id,
+        lane: this.classifyRecallLayer(candidate.item),
+        score: candidate.score,
+        sourceVerified: candidate.authority === "raw_evidence" || candidate.authority === "source_backed_summary",
+        authority: candidate.authority,
+        tokenCount: candidate.item.tokenCount,
+        payload: candidate,
+      })),
+      config,
+      {
+        force: forceRerank,
+        strictConflict: this.hasStrictCandidateConflict(config.retrievalStrength, result),
+      },
+    );
+    const orderedCandidates = reranked.candidates.map((candidate) => ({
+      ...candidate.payload,
+      reasons: reranked.audit.used
+        ? [...candidate.payload.reasons, `rerank:${reranked.audit.provider}`]
+        : candidate.payload.reasons,
+    }));
+    const layerLimitedCandidates = this.applyRecallLayerBudgets(orderedCandidates, retrievalBudget);
     const plan = this.contextPlanner.plan(layerLimitedCandidates, { budget: retrievalBudget.total });
     return {
       items: plan.selected.map((candidate) => candidate.item),
       consumedTokens: plan.selectedTokens,
       plan,
+      rerankAudit: reranked.audit,
     };
+  }
+
+  private hasStrictCandidateConflict(retrievalStrength: RetrievalStrength, result: RecallResult): boolean {
+    if (retrievalStrength !== "strict" && retrievalStrength !== "forensic") {
+      return false;
+    }
+    const sourceBackedAnswers = (result.answerCandidates ?? [])
+      .filter((candidate) => candidate.sourceVerified)
+      .map((candidate) => candidate.text.trim().toLowerCase())
+      .filter(Boolean);
+    return new Set(sourceBackedAnswers).size > 1;
   }
 
   private contextSourceForRecallItem(
@@ -2169,8 +2610,11 @@ export class ChaunyomsRetrievalService {
       const layerSelected = selected.filter((candidate) => this.candidateMatchesPlannerLayer(candidate.source, step.layer));
       const layerRejected = rejected.filter((candidate) => this.candidateMatchesPlannerLayer(candidate.source, step.layer));
       const isRawStep = step.layer === "raw_sources";
+      const isRerankStep = step.layer === "rerank";
       const candidatesFound = isRawStep
         ? Math.max(sourceTrace.length, args.recallResult?.rawCandidateCount ?? 0)
+        : isRerankStep
+          ? args.rerankAudit?.candidateCount ?? 0
         : layerSelected.length + layerRejected.length;
       const stopTriggered = index === terminalIndex;
       return {
@@ -2180,9 +2624,15 @@ export class ChaunyomsRetrievalService {
         action: step.action,
         query: args.query,
         candidatesFound,
-        selectedCount: isRawStep ? sourceTrace.length : layerSelected.length,
-        rejectedCount: layerRejected.length,
-        rejectedReasons: [...new Set(layerRejected.map((candidate) => candidate.rejectedReason))],
+        selectedCount: isRawStep
+          ? sourceTrace.length
+          : isRerankStep
+            ? args.rerankAudit?.orderedCandidateIds.length ?? 0
+            : layerSelected.length,
+        rejectedCount: isRerankStep ? 0 : layerRejected.length,
+        rejectedReasons: isRerankStep
+          ? args.rerankAudit?.reasons ?? []
+          : [...new Set(layerRejected.map((candidate) => candidate.rejectedReason))],
         sourceVerifiedCount: isRawStep
           ? verifiedTraceCount
           : layerSelected.filter((candidate) => candidate.authority === "raw_evidence" || candidate.authority === "source_backed_summary").length,
@@ -2193,6 +2643,7 @@ export class ChaunyomsRetrievalService {
           : step.stopIf,
         reason: step.reason,
         stopIf: step.stopIf,
+        order: step.order,
         budgetTokens: step.budgetTokens,
       };
     });
@@ -2251,6 +2702,11 @@ export class ChaunyomsRetrievalService {
         return source === "active_memory";
       case "base_summaries":
         return source === "summary_context";
+      case "rag_candidates":
+      case "graph_neighbors":
+        return source === "summary_context" || source === "active_memory";
+      case "rerank":
+        return true;
       case "raw_sources":
         return source === "raw_exact_search";
       case "knowledge_export_index":
@@ -2287,6 +2743,10 @@ export class ChaunyomsRetrievalService {
       decision,
     });
     await this.runtime.recordRetrievalPlan(context, intent, plan, 0, {
+      query,
+      route: decision.route,
+      retrievalStrength: context.config.retrievalStrength,
+      usageFeedbackEnabled: context.config.usageFeedbackEnabled,
       planner: decision.planner,
       plannerRunId: decision.planner.runId,
       plannerIntent: decision.planner.intent.primary,
@@ -2349,6 +2809,22 @@ export class ChaunyomsRetrievalService {
         memoryItemEnabled: context.config.memoryItemEnabled,
         totalBudget: context.totalBudget,
         llmPlannerModel: context.config.llmPlannerModel,
+        heavyRetrievalPolicy: context.config.heavyRetrievalPolicy,
+        ragPlannerPolicy: context.config.ragPlannerPolicy,
+        graphPlannerPolicy: context.config.graphPlannerPolicy,
+        rerankPlannerPolicy: context.config.rerankPlannerPolicy,
+        graphEnabled: context.config.graphEnabled,
+        ragEnabled: context.config.ragEnabled,
+        rerankEnabled: context.config.rerankEnabled,
+        graphProvider: context.config.graphProvider,
+        ragProvider: context.config.ragProvider,
+        rerankProvider: context.config.rerankProvider,
+        candidateRerankThreshold: context.config.candidateRerankThreshold,
+        laneCandidateRerankThreshold: context.config.laneCandidateRerankThreshold,
+        candidateAmbiguityMargin: context.config.candidateAmbiguityMargin,
+        strictModeRequiresRerankOnConflict: context.config.strictModeRequiresRerankOnConflict,
+        estimatedCandidateCount: scopedMemoryItemHits.length + (routeContext.hasCompactedHistory ? 1 : 0),
+        candidateOverload: scopedMemoryItemHits.length >= context.config.laneCandidateRerankThreshold,
       },
     });
     const validation = this.planValidator.validate(plannerResult.plan);
@@ -2678,6 +3154,69 @@ export class ChaunyomsRetrievalService {
     return source.slice(0, Math.max(limit, 1)).map((item) => item.entry);
   }
 
+  private recordDirectMemoryItemUsage(
+    runtimeStore: { recordRetrievalUsageEvents(events: RetrievalUsageEventDraft[]): void },
+    hits: MemoryItemEntry[],
+    query: string,
+    context: LifecycleContext,
+    decision: RetrievalDecision,
+  ): void {
+    if (!context.config.usageFeedbackEnabled || hits.length === 0) {
+      return;
+    }
+    const events: RetrievalUsageEventDraft[] = [];
+    hits.forEach((hit, index) => {
+      const sourceVerified = hit.evidenceLevel === "source_verified" && !hit.inferred;
+      const common = {
+        targetKind: "memory_item",
+        targetId: hit.id,
+        sessionId: context.sessionId,
+        agentId: context.config.agentId,
+        projectId: hit.projectId,
+        query,
+        route: decision.route,
+        retrievalStrength: context.config.retrievalStrength,
+        selectedRank: index + 1,
+        sourceVerified,
+        metadata: { sourceTable: hit.sourceTable, sourceId: hit.sourceId },
+      } satisfies Omit<RetrievalUsageEventDraft, "eventType">;
+      events.push({ ...common, eventType: "candidate_seen" });
+      events.push({ ...common, eventType: "context_selected" });
+      events.push({
+        ...common,
+        eventType: sourceVerified ? "verified_answer_used" : "answer_used",
+        answerUsed: true,
+      });
+    });
+    try {
+      runtimeStore.recordRetrievalUsageEvents(events);
+    } catch {
+      // Usage feedback must never make retrieval fail.
+    }
+  }
+
+  private buildRetrievalEnhancementDiagnostics(config: LifecycleContext["config"]): Record<string, unknown> {
+    return RetrievalEnhancementRegistry.status(config) as unknown as Record<string, unknown>;
+  }
+
+  private scoreBoundedRetrievalUsage(value: unknown): number {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return 0;
+    }
+    const record = value as Record<string, unknown>;
+    const decayed = this.numberFromRecord(record, "decayedUsageScore");
+    const authority = this.numberFromRecord(record, "authorityUsageScore");
+    const negative = this.numberFromRecord(record, "negativeFeedbackCount") * 2.5;
+    const rejected = this.numberFromRecord(record, "rejectedCount") * 0.35;
+    const raw = (decayed * 0.6) + (authority * 0.4) - negative - rejected;
+    return Math.max(-4, Math.min(6, raw));
+  }
+
+  private numberFromRecord(record: Record<string, unknown>, key: string): number {
+    const value = record[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
+
   private scoreMemoryItemEntry(
     entry: MemoryItemEntry,
     terms: string[],
@@ -2712,6 +3251,7 @@ export class ChaunyomsRetrievalService {
     if (/(current|latest|now|currently)/i.test(query) && typeof metadata.factKey === "string") {
       score += 4;
     }
+    score += this.scoreBoundedRetrievalUsage(metadata.retrievalUsage);
     return score;
   }
 

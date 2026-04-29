@@ -76,6 +76,7 @@ export class SessionDataLayer {
     | "knowledgeBaseDir"
     | "memoryVaultDir"
     | "sqliteJournalMode"
+    | "vectorExtensionPath"
     | "agentVaultMirrorEnabled"
     | "summaryMarkdownMirrorEnabled"
     | "memoryItemMarkdownMirrorEnabled"
@@ -110,6 +111,7 @@ export class SessionDataLayer {
       this.boundConfig?.knowledgeBaseDir === config.knowledgeBaseDir &&
       this.boundConfig?.memoryVaultDir === config.memoryVaultDir &&
       this.boundConfig?.sqliteJournalMode === config.sqliteJournalMode &&
+      this.boundConfig?.vectorExtensionPath === config.vectorExtensionPath &&
       this.boundConfig?.agentVaultMirrorEnabled === config.agentVaultMirrorEnabled &&
       this.boundConfig?.summaryMarkdownMirrorEnabled === config.summaryMarkdownMirrorEnabled &&
       this.boundConfig?.memoryItemMarkdownMirrorEnabled === config.memoryItemMarkdownMirrorEnabled &&
@@ -131,6 +133,7 @@ export class SessionDataLayer {
       knowledgeBaseDir: knowledgeDir,
       logger: this.logger,
       journalMode: config.sqliteJournalMode,
+      vectorExtensionPath: config.vectorExtensionPath,
     });
     await this.runtimeStore.init();
     const runtimeStatus = this.runtimeStore.getStatus();
@@ -165,6 +168,7 @@ export class SessionDataLayer {
       knowledgeBaseDir: config.knowledgeBaseDir,
       memoryVaultDir: config.memoryVaultDir,
       sqliteJournalMode: config.sqliteJournalMode,
+      vectorExtensionPath: config.vectorExtensionPath,
       agentVaultMirrorEnabled: config.agentVaultMirrorEnabled,
       summaryMarkdownMirrorEnabled: config.summaryMarkdownMirrorEnabled,
       memoryItemMarkdownMirrorEnabled: config.memoryItemMarkdownMirrorEnabled,

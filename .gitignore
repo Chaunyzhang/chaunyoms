@@ -18,4 +18,5 @@ scripts/*
 !scripts/openclaw-real-test-worker.cjs
 !scripts/openclaw-runtime-report.cjs
 !scripts/openclaw-session-smoke.cjs
+!scripts/check-environment.cjs
 SKILL.md

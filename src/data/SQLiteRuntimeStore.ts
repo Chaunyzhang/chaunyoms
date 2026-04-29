@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 
 import {
+  BridgeConfig,
   MemoryItemDraftEntry,
   EvidenceAtomEntry,
   KnowledgeDocumentIndexEntry,
@@ -16,8 +17,18 @@ import {
   RawMessage,
   SourceSpanRef,
   SummaryEntry,
+  SummarySourceTraceReport,
 } from "../types";
 import { ContextPlannerResult } from "../engines/ContextPlanner";
+import { MemoryOperationTargetKind, MemoryOperationValidator } from "../memory/MemoryOperation";
+import { RetrievalEnhancementCandidate } from "../retrieval/RetrievalEnhancementProviders";
+import {
+  cosineSimilarity,
+  LocalHashEmbeddingProvider,
+  parseVector,
+  serializeVector,
+  tokenizeForEmbedding,
+} from "../retrieval/VectorEmbedding";
 
 const nodeRequire = createRequire(__filename);
 
@@ -33,6 +44,8 @@ const SQLITE_RUNTIME_STOP_WORDS = new Set([
   "whose", "why", "with", "would", "you", "your",
 ]);
 
+const RETRIEVAL_USAGE_DECAY_HALF_LIFE_DAYS = 30;
+
 type SQLiteValue = string | number | bigint | null;
 
 interface SQLiteStatementLike {
@@ -45,6 +58,8 @@ interface SQLiteDatabaseLike {
   exec(sql: string): void;
   prepare(sql: string): SQLiteStatementLike;
   close(): void;
+  enableLoadExtension?(allow: boolean): void;
+  loadExtension?(path: string, entryPoint?: string): void;
 }
 
 type SQLiteDatabaseCtor = new (location: string) => SQLiteDatabaseLike;
@@ -55,6 +70,7 @@ interface RuntimeStoreOptions {
   knowledgeBaseDir: string;
   logger: LoggerLike;
   journalMode?: "delete" | "wal";
+  vectorExtensionPath?: string;
 }
 
 export interface RuntimeContextRunRecord {
@@ -83,6 +99,15 @@ export interface RuntimeTableCounts {
   runtimeAnnotations: number;
   contextRuns: number;
   retrievalCandidates: number;
+  retrievalUsageEvents: number;
+  retrievalUsageStats: number;
+  vectorChunks: number;
+  vectorEmbeddings: number;
+  embeddingJobs: number;
+  graphNodes: number;
+  graphEdges: number;
+  graphEdgeEvidence: number;
+  graphEdgeUsage: number;
 }
 
 export interface RuntimeStoreStatus {
@@ -93,6 +118,14 @@ export interface RuntimeStoreStatus {
   adapter: "node:sqlite" | "unavailable";
   experimentalAdapter: boolean;
   journalMode: "delete" | "wal";
+  capabilities: {
+    loadExtensionAvailable: boolean;
+    vectorExtensionConfigured: boolean;
+    vectorExtensionLoaded: boolean;
+    vectorExtensionStatus: "not_configured" | "loaded" | "load_failed" | "load_unavailable";
+    vectorExtensionError?: string;
+    ragFallbackAvailable: boolean;
+  };
   counts: RuntimeTableCounts;
 }
 
@@ -128,6 +161,55 @@ export interface RuntimeCandidateRecord {
   reasons: string[];
   rejectedReason: string | null;
   payload: Record<string, unknown>;
+}
+
+export type RetrievalUsageEventType =
+  | "candidate_seen"
+  | "context_selected"
+  | "answer_used"
+  | "verified_answer_used"
+  | "rejected"
+  | "negative_feedback";
+
+export interface RetrievalUsageEventDraft {
+  eventType: RetrievalUsageEventType;
+  targetKind: string;
+  targetId: string;
+  sessionId?: string;
+  agentId?: string;
+  projectId?: string;
+  query?: string;
+  queryTerms?: string[];
+  route?: string;
+  retrievalStrength?: string;
+  plannerRunId?: string;
+  contextRunId?: string;
+  candidateScore?: number;
+  selectedRank?: number;
+  sourceVerified?: boolean;
+  answerUsed?: boolean;
+  createdAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RetrievalUsageStatsRecord {
+  targetKind: string;
+  targetId: string;
+  agentId: string;
+  projectId: string;
+  candidateSeenCount: number;
+  contextSelectedCount: number;
+  answerUsedCount: number;
+  verifiedAnswerUsedCount: number;
+  rejectedCount: number;
+  negativeFeedbackCount: number;
+  lastRecalledAt?: string;
+  lastSelectedAt?: string;
+  lastAnswerUsedAt?: string;
+  lastVerifiedAnswerUsedAt?: string;
+  decayedUsageScore: number;
+  authorityUsageScore: number;
+  updatedAt: string;
 }
 
 export interface RuntimeContextRunInspection {
@@ -195,6 +277,26 @@ export interface OmsExpandResult {
   edges: OmsTraceEdge[];
 }
 
+export interface RuntimeEnhancementIndexReport {
+  ok: boolean;
+  vectorIndexed: number;
+  embeddingJobsQueued: number;
+  graphNodesIndexed: number;
+  graphEdgesIndexed: number;
+  warnings: string[];
+}
+
+export interface RuntimeEnhancementSearchResult {
+  ok: boolean;
+  provider: string;
+  mode: "disabled" | "sqlite_vec" | "brute_force" | "sqlite_graph";
+  degraded: boolean;
+  providerAvailable: boolean;
+  providerUnavailableReason?: string;
+  candidates: RetrievalEnhancementCandidate[];
+  warnings: string[];
+}
+
 export interface RuntimeAssemblyReader {
   getSummaryCount(sessionId?: string): number;
   getActiveMemoryItems(limit?: number): MemoryItemEntry[];
@@ -206,13 +308,40 @@ interface RuntimeDatabaseModule {
   DatabaseSync?: SQLiteDatabaseCtor;
 }
 
+interface EnhancementSourceRow {
+  sourceKind: "memory_item" | "summary";
+  sourceId: string;
+  sessionId?: string;
+  agentId?: string;
+  projectId?: string;
+  label: string;
+  text: string;
+  tokenCount: number;
+  tags: string[];
+  sourceIds: string[];
+  metadata: Record<string, unknown>;
+}
+
+interface GraphNodeSeed extends EnhancementSourceRow {
+  nodeId: string;
+  concepts: string[];
+}
+
+function estimateSimpleTokens(text: string): number {
+  return Math.max(Math.ceil(text.length / 4), 1);
+}
+
 export class SQLiteRuntimeStore {
   private db: SQLiteDatabaseLike | null = null;
   private initPromise: Promise<void> | null = null;
   private enabled = false;
   private schemaReady = false;
   private ftsReady = false;
+  private vectorExtensionLoaded = false;
+  private vectorExtensionError: string | null = null;
   private readonly statementCache = new Map<string, SQLiteStatementLike>();
+  private readonly memoryOperationValidator = new MemoryOperationValidator();
+  private readonly localEmbeddingProvider = new LocalHashEmbeddingProvider();
 
   constructor(private readonly options: RuntimeStoreOptions) {}
 
@@ -554,6 +683,16 @@ export class SQLiteRuntimeStore {
       );
 
       this.db?.prepare("DELETE FROM retrieval_candidates WHERE context_run_id = ?").run(args.plan.runId);
+      const usageEvents: RetrievalUsageEventDraft[] = [];
+      const metadata = args.metadata ?? {};
+      const usageFeedbackEnabled = metadata.usageFeedbackEnabled !== false;
+      const query = typeof metadata.query === "string" ? metadata.query : undefined;
+      const route = typeof metadata.route === "string" ? metadata.route : args.intent;
+      const retrievalStrength = typeof metadata.retrievalStrength === "string" ? metadata.retrievalStrength : undefined;
+      const plannerRunId = typeof metadata.plannerRunId === "string" ? metadata.plannerRunId : undefined;
+      const projectId = typeof metadata.projectId === "string" ? metadata.projectId : undefined;
+      const answerUsed = metadata.answerUsed === true;
+      const verifiedAnswerUsed = metadata.verifiedAnswerUsed === true;
       const insert = this.db?.prepare(`
       INSERT INTO retrieval_candidates (
         id, context_run_id, source, authority, target_kind, target_id,
@@ -577,6 +716,73 @@ export class SQLiteRuntimeStore {
         null,
         this.stringify({ contentPreview: selected.item.content.slice(0, 240), metadata: selected.item.metadata ?? {} }),
         );
+        if (usageFeedbackEnabled) {
+          const targetKind = this.itemTargetKind(selected.item);
+          const targetId = this.itemTargetId(selected.item, selected.id);
+          if (targetId) {
+            const sourceVerified = selected.authority === "raw_evidence" ||
+              selected.authority === "source_backed_summary" ||
+              selected.item.metadata?.sourceVerified === true ||
+              selected.item.metadata?.persistentEvidenceAtom === true;
+            usageEvents.push({
+              eventType: "candidate_seen",
+              targetKind,
+              targetId,
+              sessionId: args.sessionId,
+              agentId: args.agentId,
+              projectId: typeof selected.item.metadata?.projectId === "string" ? selected.item.metadata.projectId : projectId,
+              query,
+              route,
+              retrievalStrength,
+              plannerRunId,
+              contextRunId: args.plan.runId,
+              createdAt: args.plan.createdAt,
+              candidateScore: selected.score,
+              selectedRank: index,
+              sourceVerified,
+              metadata: { source: selected.source, authority: selected.authority, reasons: selected.reasons },
+            });
+            usageEvents.push({
+              eventType: "context_selected",
+              targetKind,
+              targetId,
+              sessionId: args.sessionId,
+              agentId: args.agentId,
+              projectId: typeof selected.item.metadata?.projectId === "string" ? selected.item.metadata.projectId : projectId,
+              query,
+              route,
+              retrievalStrength,
+              plannerRunId,
+              contextRunId: args.plan.runId,
+              createdAt: args.plan.createdAt,
+              candidateScore: selected.score,
+              selectedRank: index,
+              sourceVerified,
+              metadata: { source: selected.source, authority: selected.authority },
+            });
+            if (answerUsed) {
+              usageEvents.push({
+                eventType: sourceVerified || verifiedAnswerUsed ? "verified_answer_used" : "answer_used",
+                targetKind,
+                targetId,
+                sessionId: args.sessionId,
+                agentId: args.agentId,
+                projectId: typeof selected.item.metadata?.projectId === "string" ? selected.item.metadata.projectId : projectId,
+                query,
+                route,
+                retrievalStrength,
+                plannerRunId,
+                contextRunId: args.plan.runId,
+                createdAt: args.plan.createdAt,
+                candidateScore: selected.score,
+                selectedRank: index,
+                sourceVerified,
+                answerUsed: true,
+                metadata: { source: selected.source, authority: selected.authority },
+              });
+            }
+          }
+        }
       }
       for (const rejected of args.plan.rejected) {
         index += 1;
@@ -594,6 +800,40 @@ export class SQLiteRuntimeStore {
         rejected.rejectedReason,
         this.stringify({}),
         );
+        if (usageFeedbackEnabled) {
+          usageEvents.push({
+            eventType: "candidate_seen",
+            targetKind: "context_item",
+            targetId: rejected.id,
+            sessionId: args.sessionId,
+            agentId: args.agentId,
+            projectId,
+            query,
+            route,
+            retrievalStrength,
+            plannerRunId,
+            contextRunId: args.plan.runId,
+            createdAt: args.plan.createdAt,
+            candidateScore: rejected.score,
+            metadata: { source: rejected.source, authority: rejected.authority, reasons: rejected.reasons },
+          });
+          usageEvents.push({
+            eventType: "rejected",
+            targetKind: "context_item",
+            targetId: rejected.id,
+            sessionId: args.sessionId,
+            agentId: args.agentId,
+            projectId,
+            query,
+            route,
+            retrievalStrength,
+            plannerRunId,
+            contextRunId: args.plan.runId,
+            createdAt: args.plan.createdAt,
+            candidateScore: rejected.score,
+            metadata: { rejectedReason: rejected.rejectedReason, source: rejected.source, authority: rejected.authority },
+          });
+        }
       }
       for (const step of this.readProgressivePlannerSteps(args.metadata)) {
         index += 1;
@@ -620,6 +860,9 @@ export class SQLiteRuntimeStore {
           step.stopTriggered === true ? null : String(step.stopReason ?? "progressive_step_not_terminal"),
           this.stringify(step),
         );
+      }
+      if (usageEvents.length > 0) {
+        this.recordRetrievalUsageEventsInOpenDb(usageEvents);
       }
     } finally {
       this.closeDatabase();
@@ -893,6 +1136,7 @@ export class SQLiteRuntimeStore {
         adapter: "unavailable",
         experimentalAdapter: false,
         journalMode: this.resolveJournalMode(),
+        capabilities: this.runtimeCapabilities(),
         counts: this.emptyCounts(),
       };
     }
@@ -905,6 +1149,7 @@ export class SQLiteRuntimeStore {
         adapter: "node:sqlite",
         experimentalAdapter: true,
         journalMode: this.resolveJournalMode(),
+        capabilities: this.runtimeCapabilities(),
         counts: this.collectCounts(),
       };
     } finally {
@@ -922,6 +1167,7 @@ export class SQLiteRuntimeStore {
         adapter: "unavailable",
         experimentalAdapter: false,
         journalMode: this.resolveJournalMode(),
+        capabilities: this.runtimeCapabilities(),
         counts: this.emptyCounts(),
         ok: false,
         errors: ["SQLite runtime is unavailable in this Node runtime."],
@@ -986,6 +1232,7 @@ export class SQLiteRuntimeStore {
         adapter: "node:sqlite",
         experimentalAdapter: true,
         journalMode: this.resolveJournalMode(),
+        capabilities: this.runtimeCapabilities(),
         counts,
         ok: errors.length === 0,
         errors,
@@ -1244,6 +1491,336 @@ export class SQLiteRuntimeStore {
     }
   }
 
+  indexRetrievalEnhancements(
+    config: BridgeConfig,
+    options: { sessionId?: string; agentId?: string } = {},
+  ): RuntimeEnhancementIndexReport {
+    if (!this.openDatabase()) {
+      return {
+        ok: false,
+        vectorIndexed: 0,
+        embeddingJobsQueued: 0,
+        graphNodesIndexed: 0,
+        graphEdgesIndexed: 0,
+        warnings: ["sqlite_runtime_unavailable"],
+      };
+    }
+    const warnings: string[] = [];
+    let transactionStarted = false;
+    let vectorIndexed = 0;
+    let embeddingJobsQueued = 0;
+    let graphNodesIndexed = 0;
+    let graphEdgesIndexed = 0;
+    try {
+      this.db?.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      if (config.embeddingEnabled && config.embeddingProvider !== "none") {
+        const sources = this.readEnhancementSourceRows(options);
+        for (const source of sources) {
+          const result = this.upsertVectorChunkAndEmbedding(source, config);
+          if (result.indexed) {
+            vectorIndexed += 1;
+          }
+          if (result.jobQueued) {
+            embeddingJobsQueued += 1;
+          }
+        }
+      } else if (config.ragEnabled) {
+        warnings.push("embedding_disabled_existing_vectors_only");
+      }
+
+      if (config.graphBuilderEnabled && config.graphBuilderProvider !== "none") {
+        const sources = this.readEnhancementSourceRows(options);
+        const nodes = sources.map((source) => this.upsertGraphNodeFromSource(source, config));
+        graphNodesIndexed = nodes.filter(Boolean).length;
+        graphEdgesIndexed = this.rebuildDeterministicGraphEdges(
+          nodes.filter((node): node is GraphNodeSeed => Boolean(node)),
+          config,
+        );
+      } else if (config.graphEnabled) {
+        warnings.push("graph_builder_disabled_existing_edges_only");
+      }
+      this.db?.exec("COMMIT");
+      transactionStarted = false;
+      return {
+        ok: true,
+        vectorIndexed,
+        embeddingJobsQueued,
+        graphNodesIndexed,
+        graphEdgesIndexed,
+        warnings,
+      };
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve original indexing failure.
+        }
+      }
+      if (config.featureIsolationMode === "isolate_optional") {
+        return {
+          ok: false,
+          vectorIndexed,
+          embeddingJobsQueued,
+          graphNodesIndexed,
+          graphEdgesIndexed,
+          warnings: [
+            ...warnings,
+            `optional_enhancement_index_failed:${error instanceof Error ? error.message : String(error)}`,
+          ],
+        };
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  searchVectorCandidates(
+    query: string,
+    config: BridgeConfig,
+    options: { sessionId?: string; agentId?: string; limit?: number } = {},
+  ): RuntimeEnhancementSearchResult {
+    if (!config.ragEnabled || config.ragProvider === "none" || !query.trim()) {
+      return this.disabledEnhancementSearch("rag", "disabled");
+    }
+    const limit = Math.max(Math.min(options.limit ?? config.vectorSearchMaxCandidates, 100), 1);
+    const providerAvailable = config.ragProvider === "brute_force" ||
+      config.ragProvider === "embedding" ||
+      (config.ragProvider === "sqlite_vec" && this.vectorExtensionLoaded);
+    const shouldFallback = !providerAvailable && config.ragFallbackToBruteForce;
+    if (!providerAvailable && !shouldFallback) {
+      return {
+        ok: false,
+        provider: config.ragProvider,
+        mode: "sqlite_vec",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: this.vectorExtensionError ?? "sqlite_vector_extension_unavailable",
+        candidates: [],
+        warnings: ["rag_provider_unavailable_without_fallback"],
+      };
+    }
+    if (!this.openDatabase()) {
+      return {
+        ok: false,
+        provider: config.ragProvider,
+        mode: shouldFallback ? "brute_force" : "sqlite_vec",
+        degraded: shouldFallback,
+        providerAvailable: false,
+        providerUnavailableReason: "sqlite_runtime_unavailable",
+        candidates: [],
+        warnings: ["sqlite_runtime_unavailable"],
+      };
+    }
+    try {
+      const mode = providerAvailable && config.ragProvider === "sqlite_vec" ? "sqlite_vec" : "brute_force";
+      const queryVector = this.localEmbeddingProvider.embed(query, config.embeddingDimensions);
+      const rows = this.db?.prepare(`
+        SELECT chunk.chunk_id, chunk.source_kind, chunk.source_id, chunk.session_id, chunk.agent_id,
+               chunk.project_id, chunk.text, chunk.token_count, embedding.vector_json, embedding.provider,
+               embedding.model, embedding.dimensions
+        FROM vector_chunks chunk
+        JOIN vector_embeddings embedding ON embedding.chunk_id = chunk.chunk_id
+        WHERE (? IS NULL OR chunk.session_id = ?)
+          AND (? IS NULL OR chunk.agent_id = ?)
+        ORDER BY chunk.updated_at DESC
+        LIMIT ?
+      `).all(
+        options.sessionId ?? null,
+        options.sessionId ?? null,
+        options.agentId ?? null,
+        options.agentId ?? null,
+        Math.max(config.bruteForceVectorMaxRows, limit),
+      ) ?? [];
+      const candidates = rows
+        .map((row) => {
+          const vector = parseVector(row.vector_json);
+          const score = cosineSimilarity(queryVector, vector);
+          return {
+            row,
+            score,
+          };
+        })
+        .filter((item) => item.score > 0)
+        .sort((left, right) => right.score - left.score)
+        .slice(0, limit)
+        .map((item): RetrievalEnhancementCandidate => {
+          const sourceKind = String(item.row.source_kind ?? "memory_item");
+          const sourceId = String(item.row.source_id ?? "");
+          const text = String(item.row.text ?? "");
+          return {
+            id: `rag:${sourceKind}:${sourceId}`,
+            kind: this.enhancementCandidateKind(sourceKind),
+            score: Number(item.score.toFixed(6)),
+            reason: mode === "sqlite_vec"
+              ? "sqlite_vec_vector_similarity"
+              : "brute_force_vector_similarity",
+            sourceVerified: sourceKind === "summary" || sourceKind === "memory_item",
+            title: text.slice(0, 96),
+            content: text,
+            tokenCount: Number(item.row.token_count ?? estimateSimpleTokens(text)),
+            metadata: {
+              chunkId: String(item.row.chunk_id ?? ""),
+              provider: String(item.row.provider ?? ""),
+              model: String(item.row.model ?? ""),
+              dimensions: Number(item.row.dimensions ?? 0),
+              sourceKind,
+              sourceId,
+              degraded: mode === "brute_force" && config.ragProvider === "sqlite_vec",
+            },
+          };
+        });
+      return {
+        ok: true,
+        provider: config.ragProvider,
+        mode,
+        degraded: mode === "brute_force" && config.ragProvider === "sqlite_vec",
+        providerAvailable,
+        providerUnavailableReason: providerAvailable
+          ? undefined
+          : this.vectorExtensionError ?? "sqlite_vector_extension_unavailable",
+        candidates,
+        warnings: providerAvailable
+          ? []
+          : ["sqlite_vec_unavailable_brute_force_fallback_used"],
+      };
+    } catch (error) {
+      if (config.featureIsolationMode === "isolate_optional") {
+        return {
+          ok: false,
+          provider: config.ragProvider,
+          mode: "brute_force",
+          degraded: true,
+          providerAvailable: false,
+          providerUnavailableReason: error instanceof Error ? error.message : String(error),
+          candidates: [],
+          warnings: ["optional_rag_search_failed"],
+        };
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  searchGraphCandidates(
+    query: string,
+    config: BridgeConfig,
+    options: { sessionId?: string; agentId?: string; seedIds?: string[]; limit?: number } = {},
+  ): RuntimeEnhancementSearchResult {
+    if (!config.graphEnabled || config.graphProvider === "none" || !query.trim()) {
+      return this.disabledEnhancementSearch("graph", "disabled");
+    }
+    if (!this.openDatabase()) {
+      return {
+        ok: false,
+        provider: config.graphProvider,
+        mode: "sqlite_graph",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: "sqlite_runtime_unavailable",
+        candidates: [],
+        warnings: ["sqlite_runtime_unavailable"],
+      };
+    }
+    try {
+      const limit = Math.max(Math.min(options.limit ?? config.graphCandidateLimit, 100), 1);
+      const terms = this.queryTerms(query);
+      const seedRows = this.findGraphSeedRows(terms, options, Math.max(config.graphMaxFanout, limit));
+      const seedNodeIds = new Set([
+        ...seedRows.map((row) => String(row.node_id ?? "")),
+        ...(options.seedIds ?? []).filter(Boolean),
+      ]);
+      const seenNodeIds = new Set(seedNodeIds);
+      const scored = new Map<string, { row: Record<string, unknown>; score: number; reasons: string[] }>();
+      let frontier = [...seedNodeIds];
+      for (let depth = 0; depth < Math.max(config.graphMaxDepth, 1) && frontier.length > 0; depth += 1) {
+        const next: string[] = [];
+        for (const sourceNodeId of frontier.slice(0, Math.max(config.graphMaxFanout, 1))) {
+          const edges = this.graphNeighborRows(sourceNodeId, config, Math.max(config.graphMaxFanout, 1));
+          for (const edge of edges) {
+            const targetNodeId = String(edge.target_node_id ?? "");
+            if (!targetNodeId || seenNodeIds.has(targetNodeId)) {
+              continue;
+            }
+            const node = this.graphNodeById(targetNodeId);
+            if (!node) {
+              continue;
+            }
+            seenNodeIds.add(targetNodeId);
+            next.push(targetNodeId);
+            const relation = String(edge.relation ?? "related_to");
+            const confidence = Number(edge.confidence ?? 0.5);
+            const weight = Number(edge.weight ?? 1);
+            const baseScore = this.scoreText(String(node.text ?? ""), terms);
+            const graphScore = confidence * weight * (config.graphMaxDepth - depth + 1);
+            const id = targetNodeId;
+            const existing = scored.get(id);
+            const score = graphScore + baseScore;
+            const reasons = [`graph:${relation}`, `depth:${depth + 1}`, `status:${String(edge.status ?? "candidate")}`];
+            if (!existing || existing.score < score) {
+              scored.set(id, { row: node, score, reasons });
+            }
+          }
+        }
+        frontier = next;
+      }
+      const candidates = [...scored.entries()]
+        .sort((left, right) => right[1].score - left[1].score || left[0].localeCompare(right[0]))
+        .slice(0, limit)
+        .map(([, item]): RetrievalEnhancementCandidate => {
+          const targetKind = String(item.row.target_kind ?? "memory_item");
+          const targetId = String(item.row.target_id ?? "");
+          const text = String(item.row.text ?? "");
+          return {
+            id: `graph:${targetKind}:${targetId}`,
+            kind: this.enhancementCandidateKind(targetKind),
+            score: Number(item.score.toFixed(6)),
+            reason: item.reasons.join(","),
+            sourceVerified: targetKind === "summary" || targetKind === "memory_item",
+            title: String(item.row.label ?? text.slice(0, 96)),
+            content: text,
+            tokenCount: estimateSimpleTokens(text),
+            metadata: {
+              nodeId: String(item.row.node_id ?? ""),
+              sourceKind: targetKind,
+              sourceId: targetId,
+              reasons: item.reasons,
+            },
+          };
+        });
+      return {
+        ok: true,
+        provider: config.graphProvider,
+        mode: "sqlite_graph",
+        degraded: config.graphProvider === "sqlite_edges",
+        providerAvailable: true,
+        candidates,
+        warnings: config.graphProvider === "sqlite_edges"
+          ? ["sqlite_edges_alias_routes_to_sqlite_graph"]
+          : [],
+      };
+    } catch (error) {
+      if (config.featureIsolationMode === "isolate_optional") {
+        return {
+          ok: false,
+          provider: config.graphProvider,
+          mode: "sqlite_graph",
+          degraded: true,
+          providerAvailable: false,
+          providerUnavailableReason: error instanceof Error ? error.message : String(error),
+          candidates: [],
+          warnings: ["optional_graph_search_failed"],
+        };
+      }
+      throw error;
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
   purgeSession(sessionId: string): RuntimePurgeReport {
     if (!sessionId.trim()) {
       return { ok: false, scope: "session", target: sessionId, deleted: {} };
@@ -1334,6 +1911,7 @@ export class SQLiteRuntimeStore {
       this.db.close();
     } finally {
       this.db = null;
+      this.vectorExtensionLoaded = false;
       this.statementCache.clear();
     }
   }
@@ -1348,6 +1926,58 @@ export class SQLiteRuntimeStore {
     try {
       this.db?.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
+      deleted.retrieval_usage_events = this.deleteBySql(
+        `DELETE FROM retrieval_usage_events WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.graph_edge_usage = this.deleteBySql(
+        `
+          DELETE FROM graph_edge_usage
+          WHERE edge_id IN (
+            SELECT edge_id FROM graph_edges WHERE ${args.whereColumn} = ?
+          )
+        `,
+        args.target,
+      );
+      deleted.graph_edge_evidence = this.deleteBySql(
+        `
+          DELETE FROM graph_edge_evidence
+          WHERE edge_id IN (
+            SELECT edge_id FROM graph_edges WHERE ${args.whereColumn} = ?
+          )
+        `,
+        args.target,
+      );
+      deleted.graph_edges = this.deleteBySql(
+        `DELETE FROM graph_edges WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.graph_nodes = this.deleteBySql(
+        `DELETE FROM graph_nodes WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
+      deleted.embedding_jobs = this.deleteBySql(
+        `
+          DELETE FROM embedding_jobs
+          WHERE chunk_id IN (
+            SELECT chunk_id FROM vector_chunks WHERE ${args.whereColumn} = ?
+          )
+        `,
+        args.target,
+      );
+      deleted.vector_embeddings = this.deleteBySql(
+        `
+          DELETE FROM vector_embeddings
+          WHERE chunk_id IN (
+            SELECT chunk_id FROM vector_chunks WHERE ${args.whereColumn} = ?
+          )
+        `,
+        args.target,
+      );
+      deleted.vector_chunks = this.deleteBySql(
+        `DELETE FROM vector_chunks WHERE ${args.whereColumn} = ?`,
+        args.target,
+      );
       deleted.retrieval_candidates = this.deleteBySql(
         `
           DELETE FROM retrieval_candidates
@@ -1406,6 +2036,12 @@ export class SQLiteRuntimeStore {
         `DELETE FROM runtime_records WHERE ${args.whereColumn} = ?`,
         args.target,
       );
+      if (args.scope === "agent") {
+        deleted.retrieval_usage_stats = this.deleteBySql(
+          `DELETE FROM retrieval_usage_stats WHERE agent_id = ?`,
+          args.target,
+        );
+      }
       this.db?.exec("COMMIT");
       transactionStarted = false;
       return deleted;
@@ -1466,6 +2102,41 @@ export class SQLiteRuntimeStore {
       this.options.logger.warn("sqlite_runtime_pragma_failed", {
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+    this.tryLoadVectorExtension();
+  }
+
+  private tryLoadVectorExtension(): void {
+    if (!this.db || this.vectorExtensionLoaded) {
+      return;
+    }
+    const extensionPath = this.options.vectorExtensionPath?.trim();
+    if (!extensionPath) {
+      this.vectorExtensionError = null;
+      return;
+    }
+    if (typeof this.db.enableLoadExtension !== "function" || typeof this.db.loadExtension !== "function") {
+      this.vectorExtensionError = "sqlite_load_extension_unavailable";
+      return;
+    }
+    try {
+      this.db.enableLoadExtension(true);
+      this.db.loadExtension(extensionPath);
+      this.vectorExtensionLoaded = true;
+      this.vectorExtensionError = null;
+    } catch (error) {
+      this.vectorExtensionLoaded = false;
+      this.vectorExtensionError = error instanceof Error ? error.message : String(error);
+      this.options.logger.warn("sqlite_vector_extension_load_failed", {
+        path: extensionPath,
+        error: this.vectorExtensionError,
+      });
+    } finally {
+      try {
+        this.db.enableLoadExtension(false);
+      } catch {
+        // best effort; loading is optional and isolated
+      }
     }
   }
 
@@ -1654,6 +2325,156 @@ export class SQLiteRuntimeStore {
         payload_json TEXT NOT NULL DEFAULT '{}'
       );
       CREATE INDEX IF NOT EXISTS idx_candidates_run ON retrieval_candidates(context_run_id, status);
+
+      CREATE TABLE IF NOT EXISTS retrieval_usage_events (
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        project_id TEXT,
+        query_hash TEXT,
+        query_terms_json TEXT NOT NULL DEFAULT '[]',
+        route TEXT,
+        retrieval_strength TEXT,
+        planner_run_id TEXT,
+        context_run_id TEXT,
+        candidate_score REAL,
+        selected_rank INTEGER,
+        source_verified INTEGER NOT NULL DEFAULT 0,
+        answer_used INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_events_target ON retrieval_usage_events(target_kind, target_id, event_type);
+      CREATE INDEX IF NOT EXISTS idx_usage_events_run ON retrieval_usage_events(context_run_id, event_type);
+      CREATE INDEX IF NOT EXISTS idx_usage_events_session ON retrieval_usage_events(session_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS retrieval_usage_stats (
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
+        project_id TEXT NOT NULL DEFAULT '',
+        candidate_seen_count INTEGER NOT NULL DEFAULT 0,
+        context_selected_count INTEGER NOT NULL DEFAULT 0,
+        answer_used_count INTEGER NOT NULL DEFAULT 0,
+        verified_answer_used_count INTEGER NOT NULL DEFAULT 0,
+        rejected_count INTEGER NOT NULL DEFAULT 0,
+        negative_feedback_count INTEGER NOT NULL DEFAULT 0,
+        last_recalled_at TEXT,
+        last_selected_at TEXT,
+        last_answer_used_at TEXT,
+        last_verified_answer_used_at TEXT,
+        decayed_usage_score REAL NOT NULL DEFAULT 0,
+        authority_usage_score REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(target_kind, target_id, agent_id, project_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS vector_chunks (
+        chunk_id TEXT PRIMARY KEY,
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        project_id TEXT,
+        text TEXT NOT NULL,
+        token_count INTEGER NOT NULL DEFAULT 0,
+        text_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_vector_chunks_source ON vector_chunks(source_kind, source_id);
+      CREATE INDEX IF NOT EXISTS idx_vector_chunks_agent ON vector_chunks(agent_id, session_id);
+
+      CREATE TABLE IF NOT EXISTS vector_embeddings (
+        chunk_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        vector_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_vector_embeddings_provider ON vector_embeddings(provider, model, dimensions);
+
+      CREATE TABLE IF NOT EXISTS embedding_jobs (
+        job_id TEXT PRIMARY KEY,
+        chunk_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_embedding_jobs_status ON embedding_jobs(status, updated_at);
+
+      CREATE TABLE IF NOT EXISTS graph_nodes (
+        node_id TEXT PRIMARY KEY,
+        node_kind TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        project_id TEXT,
+        label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        confidence REAL NOT NULL DEFAULT 0.5,
+        weight REAL NOT NULL DEFAULT 1,
+        created_by TEXT NOT NULL DEFAULT 'system',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_nodes_target ON graph_nodes(target_kind, target_id);
+      CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent ON graph_nodes(agent_id, session_id);
+
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        edge_id TEXT PRIMARY KEY,
+        source_node_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        target_node_id TEXT NOT NULL,
+        session_id TEXT,
+        agent_id TEXT,
+        project_id TEXT,
+        status TEXT NOT NULL DEFAULT 'candidate',
+        confidence REAL NOT NULL DEFAULT 0.5,
+        weight REAL NOT NULL DEFAULT 1,
+        created_by TEXT NOT NULL DEFAULT 'system',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, relation, status);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, relation, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique ON graph_edges(source_node_id, relation, target_node_id);
+
+      CREATE TABLE IF NOT EXISTS graph_edge_evidence (
+        id TEXT PRIMARY KEY,
+        edge_id TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        evidence_text TEXT,
+        created_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_edge_evidence_edge ON graph_edge_evidence(edge_id);
+
+      CREATE TABLE IF NOT EXISTS graph_edge_usage (
+        edge_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        query_hash TEXT,
+        created_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_edge_usage_edge ON graph_edge_usage(edge_id, created_at);
 
       CREATE TABLE IF NOT EXISTS runtime_records (
         kind TEXT NOT NULL,
@@ -1908,6 +2729,7 @@ export class SQLiteRuntimeStore {
   }
 
   private upsertMemoryItem(item: MemoryItemEntry): void {
+    this.assertMemoryOperationValid(item);
     const metadata = item.metadata ?? {};
     const content = item.content ?? item.text;
     this.prepare(`
@@ -1999,6 +2821,34 @@ export class SQLiteRuntimeStore {
     );
   }
 
+  private assertMemoryOperationValid(item: MemoryItemEntry): void {
+    const validation = this.memoryOperationValidator.validate({
+      operationId: `memory-item-upsert:${item.id}:${item.updatedAt}`,
+      type: "update",
+      targetKind: this.memoryOperationTargetKind(item),
+      targetId: item.id,
+      sourceIds: item.sourceIds ?? [],
+      proposedContent: item.text,
+      reason: `runtime_store_upsert_from_${item.sourceTable}`,
+      confidence: item.confidence,
+      createdBy: item.inferred ? "llm" : "system",
+    });
+    if (!validation.ok) {
+      throw new Error(`invalid_memory_operation_before_write:${validation.errors.join("; ")}`);
+    }
+  }
+
+  private memoryOperationTargetKind(item: MemoryItemEntry): MemoryOperationTargetKind {
+    switch (item.sourceTable) {
+      case "summary_evidence_drafts":
+        return "evidence_atom";
+      case "knowledge_raw":
+        return "knowledge_raw";
+      default:
+        return "memory_item";
+    }
+  }
+
   private memoryItemFromDraft(memory: MemoryItemDraftEntry): MemoryItemEntry {
     const kindByDraft: Record<MemoryItemDraftEntry["kind"], MemoryItemKind> = {
       user_fact: "preference",
@@ -2029,7 +2879,7 @@ export class SQLiteRuntimeStore {
       contextPolicy: memory.projectId ? "project_active" : "default",
       text: memory.text,
       content: memory.text,
-      confidence: this.numberFromUnknown(metadata.confidence, memory.sourceType === "raw_message" ? 0.8 : 0.5),
+      confidence: this.confidenceFromUnknown(metadata.confidence, memory.sourceType === "raw_message" ? 0.8 : 0.5),
       stability: this.stabilityFromUnknown(metadata.stability),
       priority: this.numberFromUnknown(metadata.priority, memory.projectId ? 20 : 30),
       tags: memory.tags ?? [],
@@ -2095,7 +2945,7 @@ export class SQLiteRuntimeStore {
       contextPolicy: "strict_only",
       text: atom.text,
       content: atom.text,
-      confidence: atom.confidence,
+      confidence: this.confidenceFromUnknown(atom.confidence, 0.5),
       stability: this.memoryItemStabilityFromScore(atom.stability),
       priority: this.priorityFromEvidenceAtom(atom),
       tags: atom.tags ?? [],
@@ -2170,6 +3020,12 @@ export class SQLiteRuntimeStore {
   private numberFromUnknown(value: unknown, fallback: number): number {
     const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
     return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  private confidenceFromUnknown(value: unknown, fallback: number): number {
+    const parsed = this.numberFromUnknown(value, fallback);
+    const normalized = parsed > 1 ? parsed / 100 : parsed;
+    return Math.max(0, Math.min(1, normalized));
   }
 
   private stabilityFromUnknown(value: unknown): MemoryItemStability {
@@ -2262,7 +3118,7 @@ export class SQLiteRuntimeStore {
       contextPolicy: "never",
       text: entry.oneLineSummary?.trim() || summary.summary,
       content: entry.oneLineSummary?.trim() || summary.summary,
-      confidence: this.numberFromUnknown(entry.score?.total, summary.quality?.confidence ?? 0.5),
+      confidence: this.confidenceFromUnknown(entry.score?.total, summary.quality?.confidence ?? 0.5),
       stability: "medium",
       priority: 80,
       tags: [
@@ -2692,6 +3548,15 @@ export class SQLiteRuntimeStore {
       runtimeAnnotations: this.countTable("runtime_annotations"),
       contextRuns: this.countTable("context_runs"),
       retrievalCandidates: this.countTable("retrieval_candidates"),
+      retrievalUsageEvents: this.countTable("retrieval_usage_events"),
+      retrievalUsageStats: this.countTable("retrieval_usage_stats"),
+      vectorChunks: this.countTable("vector_chunks"),
+      vectorEmbeddings: this.countTable("vector_embeddings"),
+      embeddingJobs: this.countTable("embedding_jobs"),
+      graphNodes: this.countTable("graph_nodes"),
+      graphEdges: this.countTable("graph_edges"),
+      graphEdgeEvidence: this.countTable("graph_edge_evidence"),
+      graphEdgeUsage: this.countTable("graph_edge_usage"),
     };
   }
 
@@ -2709,6 +3574,15 @@ export class SQLiteRuntimeStore {
       runtimeAnnotations: 0,
       contextRuns: 0,
       retrievalCandidates: 0,
+      retrievalUsageEvents: 0,
+      retrievalUsageStats: 0,
+      vectorChunks: 0,
+      vectorEmbeddings: 0,
+      embeddingJobs: 0,
+      graphNodes: 0,
+      graphEdges: 0,
+      graphEdgeEvidence: 0,
+      graphEdgeUsage: 0,
     };
   }
 
@@ -2761,6 +3635,9 @@ export class SQLiteRuntimeStore {
   }
 
   private parseStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value.filter((item): item is string => typeof item === "string");
+    }
     if (typeof value !== "string" || !value.trim()) {
       return [];
     }
@@ -2969,6 +3846,117 @@ export class SQLiteRuntimeStore {
     }
   }
 
+  inspectSummarySourceTrace(options: { sessionId?: string } = {}): SummarySourceTraceReport {
+    const summaries = this.listSummaries(options);
+    const byId = new Map(summaries.map((summary) => [summary.id, summary]));
+    const edgeTargets = this.readSummarySourceEdgeTargets(options);
+    const baseSummaries = summaries.filter((summary) =>
+      (summary.summaryLevel ?? 1) === 1 && (summary.nodeKind ?? "leaf") === "leaf",
+    );
+    const branchSummaries = summaries.filter((summary) =>
+      (summary.summaryLevel ?? 1) > 1 || (summary.nodeKind ?? "leaf") === "branch",
+    );
+    const missingBase = baseSummaries
+      .filter((summary) => !this.summaryHasRawTrace(summary, byId, edgeTargets))
+      .map((summary) => summary.id);
+    const missingBranch = branchSummaries
+      .filter((summary) => !this.summaryHasRawTrace(summary, byId, edgeTargets))
+      .map((summary) => summary.id);
+    const navigationOnlySummaryIds = [...missingBase, ...missingBranch];
+    const warnings = [
+      ...(missingBase.length > 0 ? [`${missingBase.length} BaseSummary records are navigation-only because raw source trace is missing.`] : []),
+      ...(missingBranch.length > 0 ? [`${missingBranch.length} BranchSummary records cannot trace through children/source summaries to raw Source.`] : []),
+    ];
+    return {
+      ok: navigationOnlySummaryIds.length === 0,
+      baseSummaries: {
+        total: baseSummaries.length,
+        traceable: baseSummaries.length - missingBase.length,
+        missing: missingBase,
+      },
+      branchSummaries: {
+        total: branchSummaries.length,
+        traceable: branchSummaries.length - missingBranch.length,
+        missing: missingBranch,
+      },
+      navigationOnlySummaryIds,
+      warnings,
+    };
+  }
+
+  private readSummarySourceEdgeTargets(options: { sessionId?: string } = {}): Map<string, { messages: Set<string>; summaries: Set<string> }> {
+    const targets = new Map<string, { messages: Set<string>; summaries: Set<string> }>();
+    if (!this.openDatabase()) {
+      return targets;
+    }
+    try {
+      const rows = this.db?.prepare(`
+        SELECT source_id, target_kind, target_id
+        FROM source_edges
+        WHERE source_kind = 'summary'
+          AND relation IN ('derived_from', 'has_child')
+          AND (? IS NULL OR session_id = ?)
+      `).all(options.sessionId ?? null, options.sessionId ?? null) ?? [];
+      for (const row of rows) {
+        const summaryId = String(row.source_id ?? "");
+        if (!summaryId) {
+          continue;
+        }
+        const current = targets.get(summaryId) ?? { messages: new Set<string>(), summaries: new Set<string>() };
+        const targetKind = String(row.target_kind ?? "");
+        const targetId = String(row.target_id ?? "");
+        if (targetKind === "message" && targetId) {
+          current.messages.add(targetId);
+        } else if (targetKind === "summary" && targetId) {
+          current.summaries.add(targetId);
+        }
+        targets.set(summaryId, current);
+      }
+    } finally {
+      this.closeDatabase();
+    }
+    return targets;
+  }
+
+  private summaryHasRawTrace(
+    summary: SummaryEntry,
+    summariesById: Map<string, SummaryEntry>,
+    edgeTargets: Map<string, { messages: Set<string>; summaries: Set<string> }>,
+    seen: Set<string> = new Set(),
+  ): boolean {
+    if (seen.has(summary.id)) {
+      return false;
+    }
+    seen.add(summary.id);
+    if (this.summaryDirectMessageIds(summary, edgeTargets).length > 0) {
+      return true;
+    }
+    const nextSummaryIds = [
+      ...(summary.childSummaryIds ?? []),
+      ...(summary.sourceSummaryIds ?? []),
+      ...Array.from(edgeTargets.get(summary.id)?.summaries ?? []),
+    ].filter((value, index, list) => value.trim().length > 0 && list.indexOf(value) === index);
+    for (const nextId of nextSummaryIds) {
+      const next = summariesById.get(nextId);
+      if (next && this.summaryHasRawTrace(next, summariesById, edgeTargets, seen)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private summaryDirectMessageIds(
+    summary: SummaryEntry,
+    edgeTargets: Map<string, { messages: Set<string>; summaries: Set<string> }>,
+  ): string[] {
+    return [...new Set([
+      ...(summary.sourceMessageIds ?? []),
+      ...(summary.sourceBinding?.messageIds ?? []),
+      ...(summary.sourceRefs ?? []).map((ref) => ref.messageId),
+      ...Array.from(edgeTargets.get(summary.id)?.messages ?? []),
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0))];
+  }
+
   listMemories(options: { sessionId?: string } = {}): MemoryItemDraftEntry[] {
     if (!this.openDatabase()) {
       return [];
@@ -3055,7 +4043,7 @@ export class SQLiteRuntimeStore {
       contextPolicy,
       text: entry.text ?? content,
       content,
-      confidence: this.numberFromUnknown(entry.confidence, 0.5),
+      confidence: this.confidenceFromUnknown(entry.confidence, 0.5),
       stability: this.stabilityFromUnknown(entry.stability),
       priority: this.numberFromUnknown(entry.priority, 50),
       promotionState,
@@ -3270,12 +4258,12 @@ export class SQLiteRuntimeStore {
     }
   }
 
-  listMemoryItems(options: { sessionId?: string; agentId?: string } = {}): MemoryItemEntry[] {
+  listMemoryItems(options: { sessionId?: string; agentId?: string; includeRetrievalUsage?: boolean } = {}): MemoryItemEntry[] {
     if (!this.openDatabase()) {
       return [];
     }
     try {
-      return this.db?.prepare(`
+      const items = this.db?.prepare(`
         SELECT payload_json FROM memory_items
         WHERE (? IS NULL OR session_id = ?)
           AND (? IS NULL OR agent_id = ?)
@@ -3287,6 +4275,63 @@ export class SQLiteRuntimeStore {
         options.agentId ?? null,
       )
         .map((row) => this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry)) ?? [];
+      if (options.includeRetrievalUsage !== true) {
+        return items;
+      }
+      const statsById = this.usageStatsByTargetIds(items.map((item) => item.id), options.agentId);
+      return items.map((item) => {
+        const usage = statsById.get(item.id);
+        return usage
+          ? { ...item, metadata: { ...(item.metadata ?? {}), retrievalUsage: usage } }
+          : item;
+      });
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  recordRetrievalUsageEvents(events: RetrievalUsageEventDraft[]): void {
+    if (events.length === 0 || !this.openDatabase()) {
+      return;
+    }
+    try {
+      this.recordRetrievalUsageEventsInOpenDb(events);
+    } finally {
+      this.closeDatabase();
+    }
+  }
+
+  listRetrievalUsageStats(options: {
+    targetKind?: string;
+    targetId?: string;
+    agentId?: string;
+    projectId?: string;
+    limit?: number;
+  } = {}): RetrievalUsageStatsRecord[] {
+    if (!this.openDatabase()) {
+      return [];
+    }
+    try {
+      const limit = Math.max(Math.min(options.limit ?? 200, 1000), 1);
+      return this.db?.prepare(`
+        SELECT * FROM retrieval_usage_stats
+        WHERE (? IS NULL OR target_kind = ?)
+          AND (? IS NULL OR target_id = ?)
+          AND (? IS NULL OR agent_id = ?)
+          AND (? IS NULL OR project_id = ?)
+        ORDER BY authority_usage_score DESC, decayed_usage_score DESC, updated_at DESC
+        LIMIT ?
+      `).all(
+        options.targetKind ?? null,
+        options.targetKind ?? null,
+        options.targetId ?? null,
+        options.targetId ?? null,
+        options.agentId ?? null,
+        options.agentId ?? null,
+        options.projectId ?? null,
+        options.projectId ?? null,
+        limit,
+      ).map((row) => this.rowToRetrievalUsageStats(row)) ?? [];
     } finally {
       this.closeDatabase();
     }
@@ -3399,11 +4444,435 @@ export class SQLiteRuntimeStore {
     }
   }
 
+  private disabledEnhancementSearch(provider: string, mode: RuntimeEnhancementSearchResult["mode"]): RuntimeEnhancementSearchResult {
+    return {
+      ok: true,
+      provider,
+      mode,
+      degraded: false,
+      providerAvailable: false,
+      candidates: [],
+      warnings: [],
+    };
+  }
+
+  private readEnhancementSourceRows(options: { sessionId?: string; agentId?: string } = {}): EnhancementSourceRow[] {
+    if (!this.db) {
+      return [];
+    }
+    const memoryRows = this.db.prepare(`
+      SELECT id, session_id, agent_id, project_id, kind, text, content, tags_json,
+             source_ids_json, metadata_json, payload_json
+      FROM memory_items
+      WHERE status = 'active'
+        AND context_policy != 'never'
+        AND (? IS NULL OR session_id = ?)
+        AND (? IS NULL OR agent_id = ?)
+      ORDER BY updated_at DESC, created_at DESC
+    `).all(options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null)
+      .map((row): EnhancementSourceRow => {
+        const text = String(row.content ?? row.text ?? "");
+        return {
+          sourceKind: "memory_item",
+          sourceId: String(row.id ?? ""),
+          sessionId: typeof row.session_id === "string" ? row.session_id : undefined,
+          agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
+          projectId: typeof row.project_id === "string" ? row.project_id : undefined,
+          label: `[${String(row.kind ?? "memory")}] ${text.slice(0, 80)}`,
+          text,
+          tokenCount: estimateSimpleTokens(text),
+          tags: this.parseStringArray(row.tags_json),
+          sourceIds: this.parseStringArray(row.source_ids_json),
+          metadata: this.parseObject(row.metadata_json),
+        };
+      });
+    const summaryRows = this.db.prepare(`
+      SELECT id, session_id, agent_id, project_id, summary, token_count, keywords_json, source_summary_ids_json,
+             source_binding_json, payload_json
+      FROM summaries
+      WHERE COALESCE(record_status, 'active') = 'active'
+        AND (? IS NULL OR session_id = ?)
+        AND (? IS NULL OR agent_id = ?)
+      ORDER BY end_turn DESC, start_turn DESC
+    `).all(options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null)
+      .map((row): EnhancementSourceRow => {
+        const text = String(row.summary ?? "");
+        return {
+          sourceKind: "summary",
+          sourceId: String(row.id ?? ""),
+          sessionId: typeof row.session_id === "string" ? row.session_id : undefined,
+          agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
+          projectId: typeof row.project_id === "string" ? row.project_id : undefined,
+          label: text.slice(0, 80),
+          text,
+          tokenCount: Number(row.token_count ?? estimateSimpleTokens(text)),
+          tags: this.parseStringArray(row.keywords_json),
+          sourceIds: this.parseStringArray(row.source_summary_ids_json),
+          metadata: this.parseObject(row.source_binding_json),
+        };
+      });
+    return [...memoryRows, ...summaryRows].filter((row) => row.sourceId && row.text.trim());
+  }
+
+  private upsertVectorChunkAndEmbedding(source: EnhancementSourceRow, config: BridgeConfig): { indexed: boolean; jobQueued: boolean } {
+    if (!this.db) {
+      return { indexed: false, jobQueued: false };
+    }
+    const now = new Date().toISOString();
+    const chunkId = `chunk:${source.sourceKind}:${source.sourceId}`;
+    const textHash = this.hash(source.text);
+    this.prepare(`
+      INSERT INTO vector_chunks (
+        chunk_id, source_kind, source_id, session_id, agent_id, project_id,
+        text, token_count, text_hash, created_at, updated_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chunk_id) DO UPDATE SET
+        session_id=excluded.session_id,
+        agent_id=excluded.agent_id,
+        project_id=excluded.project_id,
+        text=excluded.text,
+        token_count=excluded.token_count,
+        text_hash=excluded.text_hash,
+        updated_at=excluded.updated_at,
+        metadata_json=excluded.metadata_json
+    `)?.run(
+      chunkId,
+      source.sourceKind,
+      source.sourceId,
+      source.sessionId ?? null,
+      source.agentId ?? null,
+      source.projectId ?? null,
+      source.text,
+      source.tokenCount,
+      textHash,
+      now,
+      now,
+      this.stringify({
+        tags: source.tags,
+        sourceIds: source.sourceIds,
+        sourceMetadata: source.metadata,
+      }),
+    );
+    if (config.embeddingProvider !== "local_hash") {
+      this.queueEmbeddingJob(chunkId, config, now, "external_embedding_provider_pending");
+      return { indexed: false, jobQueued: true };
+    }
+    const vector = this.localEmbeddingProvider.embed(source.text, config.embeddingDimensions);
+    this.prepare(`
+      INSERT INTO vector_embeddings (
+        chunk_id, provider, model, dimensions, vector_json, created_at, updated_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chunk_id) DO UPDATE SET
+        provider=excluded.provider,
+        model=excluded.model,
+        dimensions=excluded.dimensions,
+        vector_json=excluded.vector_json,
+        updated_at=excluded.updated_at,
+        metadata_json=excluded.metadata_json
+    `)?.run(
+      chunkId,
+      config.embeddingProvider,
+      config.embeddingModel,
+      config.embeddingDimensions,
+      serializeVector(vector),
+      now,
+      now,
+      this.stringify({ textHash, sourceKind: source.sourceKind, sourceId: source.sourceId }),
+    );
+    this.queueEmbeddingJob(chunkId, config, now, "completed");
+    return { indexed: true, jobQueued: false };
+  }
+
+  private queueEmbeddingJob(chunkId: string, config: BridgeConfig, now: string, status: string): void {
+    this.prepare(`
+      INSERT INTO embedding_jobs (
+        job_id, chunk_id, status, provider, model, attempts, last_error, created_at, updated_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id) DO UPDATE SET
+        status=excluded.status,
+        provider=excluded.provider,
+        model=excluded.model,
+        updated_at=excluded.updated_at,
+        metadata_json=excluded.metadata_json
+    `)?.run(
+      `embedding-job:${chunkId}`,
+      chunkId,
+      status,
+      config.embeddingProvider,
+      config.embeddingModel,
+      status === "completed" ? 1 : 0,
+      null,
+      now,
+      now,
+      this.stringify({ async: config.embeddingAsync, maxRetries: config.embeddingJobMaxRetries }),
+    );
+  }
+
+  private upsertGraphNodeFromSource(source: EnhancementSourceRow, config: BridgeConfig): GraphNodeSeed | null {
+    if (!this.db) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nodeId = `node:${source.sourceKind}:${source.sourceId}`;
+    const concepts = this.extractGraphConcepts(source);
+    this.prepare(`
+      INSERT INTO graph_nodes (
+        node_id, node_kind, target_kind, target_id, session_id, agent_id, project_id,
+        label, text, status, confidence, weight, created_by, created_at, updated_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET
+        session_id=excluded.session_id,
+        agent_id=excluded.agent_id,
+        project_id=excluded.project_id,
+        label=excluded.label,
+        text=excluded.text,
+        status=excluded.status,
+        confidence=excluded.confidence,
+        weight=excluded.weight,
+        updated_at=excluded.updated_at,
+        metadata_json=excluded.metadata_json
+    `)?.run(
+      nodeId,
+      source.sourceKind,
+      source.sourceKind,
+      source.sourceId,
+      source.sessionId ?? null,
+      source.agentId ?? null,
+      source.projectId ?? null,
+      source.label,
+      source.text,
+      "active",
+      0.75,
+      source.sourceKind === "memory_item" ? 1.2 : 1,
+      config.graphBuilderProvider === "llm" ? "llm" : "system",
+      now,
+      now,
+      this.stringify({
+        tags: source.tags,
+        sourceIds: source.sourceIds,
+        concepts,
+      }),
+    );
+    return {
+      ...source,
+      nodeId,
+      concepts,
+    };
+  }
+
+  private rebuildDeterministicGraphEdges(nodes: GraphNodeSeed[], config: BridgeConfig): number {
+    if (!this.db || nodes.length < 2) {
+      return 0;
+    }
+    let count = 0;
+    const allowed = new Set(config.graphAllowedRelations);
+    const addEdge = (
+      source: GraphNodeSeed,
+      target: GraphNodeSeed,
+      relation: string,
+      confidence: number,
+      weight: number,
+      evidenceText: string,
+    ): void => {
+      if (!allowed.has(relation) || source.nodeId === target.nodeId || confidence < config.graphMinConfidence) {
+        return;
+      }
+      const now = new Date().toISOString();
+      const edgeId = `edge:${this.hash([source.nodeId, relation, target.nodeId].join("|")).slice(0, 40)}`;
+      this.prepare(`
+        INSERT INTO graph_edges (
+          edge_id, source_node_id, relation, target_node_id, session_id, agent_id, project_id,
+          status, confidence, weight, created_by, created_at, updated_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_node_id, relation, target_node_id) DO UPDATE SET
+          status=excluded.status,
+          confidence=excluded.confidence,
+          weight=excluded.weight,
+          updated_at=excluded.updated_at,
+          metadata_json=excluded.metadata_json
+      `)?.run(
+        edgeId,
+        source.nodeId,
+        relation,
+        target.nodeId,
+        source.sessionId ?? target.sessionId ?? null,
+        source.agentId ?? target.agentId ?? null,
+        source.projectId ?? target.projectId ?? null,
+        confidence >= 0.7 ? "promoted" : "candidate",
+        confidence,
+        weight,
+        config.graphBuilderProvider === "llm" ? "llm" : "system",
+        now,
+        now,
+        this.stringify({
+          sourceKind: source.sourceKind,
+          sourceId: source.sourceId,
+          targetKind: target.sourceKind,
+          targetId: target.sourceId,
+          evidenceText,
+        }),
+      );
+      const edgeChanged = this.getSingleNumber("SELECT changes() AS count");
+      this.prepare(`
+        INSERT INTO graph_edge_evidence (
+          id, edge_id, source_kind, source_id, evidence_text, created_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `)?.run(
+        `edge-evidence:${edgeId}`,
+        edgeId,
+        source.sourceKind,
+        source.sourceId,
+        evidenceText,
+        now,
+        this.stringify({ targetSourceKind: target.sourceKind, targetSourceId: target.sourceId }),
+      );
+      if (edgeChanged > 0) {
+        count += 1;
+      }
+    };
+
+    for (let leftIndex = 0; leftIndex < nodes.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < nodes.length; rightIndex += 1) {
+        const left = nodes[leftIndex];
+        const right = nodes[rightIndex];
+        const sharedConcepts = left.concepts.filter((concept) => right.concepts.includes(concept));
+        const sharedTags = left.tags.filter((tag) => right.tags.includes(tag));
+        const sameProject = Boolean(left.projectId && left.projectId === right.projectId);
+        const sourceLinked = left.sourceIds.includes(right.sourceId) || right.sourceIds.includes(left.sourceId);
+        if (sourceLinked) {
+          addEdge(left, right, "derived_from", 0.85, 1.4, "shared source linkage");
+          addEdge(right, left, "source_of", 0.85, 1.4, "shared source linkage");
+        }
+        if (sharedConcepts.length >= 2) {
+          addEdge(left, right, "similar_to", Math.min(0.95, 0.45 + sharedConcepts.length * 0.08), 1.1, `shared concepts: ${sharedConcepts.slice(0, 6).join(", ")}`);
+          addEdge(right, left, "similar_to", Math.min(0.95, 0.45 + sharedConcepts.length * 0.08), 1.1, `shared concepts: ${sharedConcepts.slice(0, 6).join(", ")}`);
+        } else if (sharedTags.length > 0 || sameProject) {
+          addEdge(left, right, "related_to", sameProject ? 0.62 : 0.5, 1, `shared ${sameProject ? "project" : "tags"}`);
+          addEdge(right, left, "related_to", sameProject ? 0.62 : 0.5, 1, `shared ${sameProject ? "project" : "tags"}`);
+        }
+        if (sharedTags.length > 0) {
+          addEdge(left, right, "co_occurs_with", Math.min(0.9, 0.4 + sharedTags.length * 0.1), 0.8, `shared tags: ${sharedTags.join(", ")}`);
+          addEdge(right, left, "co_occurs_with", Math.min(0.9, 0.4 + sharedTags.length * 0.1), 0.8, `shared tags: ${sharedTags.join(", ")}`);
+        }
+      }
+    }
+    return count;
+  }
+
+  private extractGraphConcepts(source: EnhancementSourceRow): string[] {
+    const concepts = new Set<string>();
+    for (const tag of source.tags) {
+      if (tag.trim()) {
+        concepts.add(tag.trim().toLowerCase());
+      }
+    }
+    for (const term of tokenizeForEmbedding(source.text)) {
+      if (term.length >= 3 && !SQLITE_RUNTIME_STOP_WORDS.has(term)) {
+        concepts.add(term);
+      }
+    }
+    return [...concepts].slice(0, 32);
+  }
+
+  private findGraphSeedRows(
+    terms: string[],
+    options: { sessionId?: string; agentId?: string },
+    limit: number,
+  ): Array<Record<string, unknown>> {
+    if (!this.db) {
+      return [];
+    }
+    return this.db.prepare(`
+      SELECT node_id, target_kind, target_id, label, text, metadata_json
+      FROM graph_nodes
+      WHERE status = 'active'
+        AND (? IS NULL OR session_id = ?)
+        AND (? IS NULL OR agent_id = ?)
+      ORDER BY updated_at DESC
+      LIMIT 500
+    `).all(options.sessionId ?? null, options.sessionId ?? null, options.agentId ?? null, options.agentId ?? null)
+      .map((row) => ({
+        row,
+        score: this.scoreText([
+          String(row.label ?? ""),
+          String(row.text ?? ""),
+          this.parseStringArray(this.parseObject(row.metadata_json).concepts).join(" "),
+        ].join(" "), terms),
+      }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit)
+      .map((item) => item.row);
+  }
+
+  private graphNeighborRows(sourceNodeId: string, config: BridgeConfig, limit: number): Array<Record<string, unknown>> {
+    if (!this.db) {
+      return [];
+    }
+    return this.db.prepare(`
+      SELECT edge_id, source_node_id, relation, target_node_id, status, confidence, weight, metadata_json
+      FROM graph_edges
+      WHERE source_node_id = ?
+        AND status IN ('candidate', 'promoted')
+        AND confidence >= ?
+      ORDER BY confidence DESC, weight DESC, updated_at DESC
+      LIMIT ?
+    `).all(sourceNodeId, config.graphMinConfidence, Math.max(limit, 1))
+      .filter((row) => config.graphAllowedRelations.includes(String(row.relation ?? "")));
+  }
+
+  private graphNodeById(nodeId: string): Record<string, unknown> | null {
+    if (!this.db) {
+      return null;
+    }
+    return this.db.prepare(`
+      SELECT node_id, target_kind, target_id, label, text, metadata_json
+      FROM graph_nodes
+      WHERE node_id = ?
+    `).get(nodeId) ?? null;
+  }
+
+  private enhancementCandidateKind(sourceKind: string): RetrievalEnhancementCandidate["kind"] {
+    switch (sourceKind) {
+      case "summary":
+        return "summary";
+      case "raw_message":
+      case "message":
+        return "raw_message";
+      case "evidence_atom":
+        return "evidence_atom";
+      default:
+        return "memory_item";
+    }
+  }
+
   private ftsRuntimeStatus(): RuntimeStoreStatus["ftsStatus"] {
     if (!this.enabled) {
       return "unavailable";
     }
     return this.ftsReady ? "ready" : "lazy_not_initialized";
+  }
+
+  private runtimeCapabilities(): RuntimeStoreStatus["capabilities"] {
+    const configured = typeof this.options.vectorExtensionPath === "string" &&
+      this.options.vectorExtensionPath.trim().length > 0;
+    const loadExtensionAvailable = typeof this.db?.loadExtension === "function" &&
+      typeof this.db?.enableLoadExtension === "function";
+    return {
+      loadExtensionAvailable,
+      vectorExtensionConfigured: configured,
+      vectorExtensionLoaded: this.vectorExtensionLoaded,
+      vectorExtensionStatus: !configured
+        ? "not_configured"
+        : this.vectorExtensionLoaded
+          ? "loaded"
+          : loadExtensionAvailable
+            ? "load_failed"
+            : "load_unavailable",
+      ...(this.vectorExtensionError ? { vectorExtensionError: this.vectorExtensionError } : {}),
+      ragFallbackAvailable: true,
+    };
   }
 
   private queryTerms(query: string): string[] {
@@ -3457,6 +4926,213 @@ export class SQLiteRuntimeStore {
       return lower;
     }
     return lower.replace(/(?:ingly|edly|ing|ed|es|s)$/i, "");
+  }
+
+  private recordRetrievalUsageEventsInOpenDb(events: RetrievalUsageEventDraft[]): void {
+    if (!this.db || events.length === 0) {
+      return;
+    }
+    const insert = this.prepare(`
+      INSERT INTO retrieval_usage_events (
+        event_id, event_type, target_kind, target_id, session_id, agent_id, project_id,
+        query_hash, query_terms_json, route, retrieval_strength, planner_run_id, context_run_id,
+        candidate_score, selected_rank, source_verified, answer_used, created_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id) DO NOTHING
+    `);
+    for (const event of events) {
+      if (!event.targetKind.trim() || !event.targetId.trim()) {
+        continue;
+      }
+      const createdAt = event.createdAt ?? new Date().toISOString();
+      const terms = event.queryTerms ?? (event.query ? this.queryTerms(event.query) : []);
+      const queryHash = event.query ? this.hash(event.query.trim().toLowerCase()) : null;
+      const agentId = event.agentId ?? this.options.agentId;
+      const projectId = event.projectId ?? "";
+      const eventId = this.hash([
+        event.eventType,
+        event.targetKind,
+        event.targetId,
+        event.contextRunId ?? "",
+        event.selectedRank ?? "",
+        event.candidateScore ?? "",
+        createdAt,
+        agentId,
+        projectId,
+      ].join("|"));
+      insert?.run(
+        `usage-${eventId.slice(0, 32)}`,
+        event.eventType,
+        event.targetKind,
+        event.targetId,
+        event.sessionId ?? null,
+        agentId,
+        projectId || null,
+        queryHash,
+        this.stringify(terms),
+        event.route ?? null,
+        event.retrievalStrength ?? null,
+        event.plannerRunId ?? null,
+        event.contextRunId ?? null,
+        event.candidateScore ?? null,
+        event.selectedRank ?? null,
+        event.sourceVerified === true ? 1 : 0,
+        event.answerUsed === true || event.eventType === "answer_used" || event.eventType === "verified_answer_used" ? 1 : 0,
+        createdAt,
+        this.stringify(event.metadata ?? {}),
+      );
+      if (this.getSingleNumber("SELECT changes() AS count") > 0) {
+        this.applyRetrievalUsageStats({ ...event, createdAt, agentId, projectId });
+      }
+    }
+  }
+
+  private applyRetrievalUsageStats(event: RetrievalUsageEventDraft & { createdAt: string; agentId: string; projectId: string }): void {
+    const weight = this.usageEventWeight(event.eventType);
+    const positiveAuthority = event.sourceVerified === true && weight > 0 ? weight * 1.5 : weight;
+    const existing = this.db?.prepare(`
+      SELECT decayed_usage_score, updated_at FROM retrieval_usage_stats
+      WHERE target_kind = ?
+        AND target_id = ?
+        AND agent_id = ?
+        AND project_id = ?
+    `).get(event.targetKind, event.targetId, event.agentId, event.projectId);
+    const decayedPrior = existing
+      ? this.decayUsageScore(
+        Number(existing.decayed_usage_score ?? 0),
+        String(existing.updated_at ?? event.createdAt),
+        event.createdAt,
+      )
+      : 0;
+    const nextDecayedUsageScore = decayedPrior + weight;
+    const counts = {
+      candidateSeen: event.eventType === "candidate_seen" ? 1 : 0,
+      contextSelected: event.eventType === "context_selected" ? 1 : 0,
+      answerUsed: event.eventType === "answer_used" ? 1 : 0,
+      verifiedAnswerUsed: event.eventType === "verified_answer_used" ? 1 : 0,
+      rejected: event.eventType === "rejected" ? 1 : 0,
+      negativeFeedback: event.eventType === "negative_feedback" ? 1 : 0,
+    };
+    this.prepare(`
+      INSERT INTO retrieval_usage_stats (
+        target_kind, target_id, agent_id, project_id,
+        candidate_seen_count, context_selected_count, answer_used_count,
+        verified_answer_used_count, rejected_count, negative_feedback_count,
+        last_recalled_at, last_selected_at, last_answer_used_at, last_verified_answer_used_at,
+        decayed_usage_score, authority_usage_score, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(target_kind, target_id, agent_id, project_id) DO UPDATE SET
+        candidate_seen_count = candidate_seen_count + excluded.candidate_seen_count,
+        context_selected_count = context_selected_count + excluded.context_selected_count,
+        answer_used_count = answer_used_count + excluded.answer_used_count,
+        verified_answer_used_count = verified_answer_used_count + excluded.verified_answer_used_count,
+        rejected_count = rejected_count + excluded.rejected_count,
+        negative_feedback_count = negative_feedback_count + excluded.negative_feedback_count,
+        last_recalled_at = COALESCE(excluded.last_recalled_at, last_recalled_at),
+        last_selected_at = COALESCE(excluded.last_selected_at, last_selected_at),
+        last_answer_used_at = COALESCE(excluded.last_answer_used_at, last_answer_used_at),
+        last_verified_answer_used_at = COALESCE(excluded.last_verified_answer_used_at, last_verified_answer_used_at),
+        decayed_usage_score = excluded.decayed_usage_score,
+        authority_usage_score = authority_usage_score + excluded.authority_usage_score,
+        updated_at = excluded.updated_at
+    `)?.run(
+      event.targetKind,
+      event.targetId,
+      event.agentId,
+      event.projectId,
+      counts.candidateSeen,
+      counts.contextSelected,
+      counts.answerUsed,
+      counts.verifiedAnswerUsed,
+      counts.rejected,
+      counts.negativeFeedback,
+      event.eventType === "candidate_seen" ? event.createdAt : null,
+      event.eventType === "context_selected" ? event.createdAt : null,
+      event.eventType === "answer_used" ? event.createdAt : null,
+      event.eventType === "verified_answer_used" ? event.createdAt : null,
+      nextDecayedUsageScore,
+      positiveAuthority,
+      event.createdAt,
+    );
+  }
+
+  private usageEventWeight(eventType: RetrievalUsageEventType): number {
+    switch (eventType) {
+      case "candidate_seen":
+        return 0.1;
+      case "context_selected":
+        return 0.6;
+      case "answer_used":
+        return 1.25;
+      case "verified_answer_used":
+        return 2;
+      case "rejected":
+        return -0.35;
+      case "negative_feedback":
+        return -2.5;
+      default:
+        return 0;
+    }
+  }
+
+  private usageStatsByTargetIds(targetIds: string[], agentId?: string): Map<string, RetrievalUsageStatsRecord> {
+    const normalized = [...new Set(targetIds.filter(Boolean))];
+    const result = new Map<string, RetrievalUsageStatsRecord>();
+    if (!this.db || normalized.length === 0) {
+      return result;
+    }
+    for (let index = 0; index < normalized.length; index += 250) {
+      const chunk = normalized.slice(index, index + 250);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db.prepare(`
+        SELECT * FROM retrieval_usage_stats
+        WHERE target_kind = 'memory_item'
+          AND target_id IN (${placeholders})
+          AND (? IS NULL OR agent_id = ?)
+      `).all(...chunk, agentId ?? null, agentId ?? null);
+      for (const row of rows) {
+        const record = this.rowToRetrievalUsageStats(row);
+        result.set(record.targetId, record);
+      }
+    }
+    return result;
+  }
+
+  private rowToRetrievalUsageStats(row: Record<string, unknown>): RetrievalUsageStatsRecord {
+    const updatedAt = String(row.updated_at ?? "");
+    return {
+      targetKind: String(row.target_kind ?? ""),
+      targetId: String(row.target_id ?? ""),
+      agentId: String(row.agent_id ?? ""),
+      projectId: String(row.project_id ?? ""),
+      candidateSeenCount: Number(row.candidate_seen_count ?? 0),
+      contextSelectedCount: Number(row.context_selected_count ?? 0),
+      answerUsedCount: Number(row.answer_used_count ?? 0),
+      verifiedAnswerUsedCount: Number(row.verified_answer_used_count ?? 0),
+      rejectedCount: Number(row.rejected_count ?? 0),
+      negativeFeedbackCount: Number(row.negative_feedback_count ?? 0),
+      lastRecalledAt: typeof row.last_recalled_at === "string" ? row.last_recalled_at : undefined,
+      lastSelectedAt: typeof row.last_selected_at === "string" ? row.last_selected_at : undefined,
+      lastAnswerUsedAt: typeof row.last_answer_used_at === "string" ? row.last_answer_used_at : undefined,
+      lastVerifiedAnswerUsedAt: typeof row.last_verified_answer_used_at === "string" ? row.last_verified_answer_used_at : undefined,
+      decayedUsageScore: Number(row.decayed_usage_score ?? 0),
+      authorityUsageScore: Number(row.authority_usage_score ?? 0),
+      updatedAt,
+    };
+  }
+
+  private decayUsageScore(score: number, fromIso: string, toIso: string): number {
+    if (!Number.isFinite(score) || score === 0) {
+      return 0;
+    }
+    const from = Date.parse(fromIso);
+    const to = Date.parse(toIso);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+      return score;
+    }
+    const elapsedDays = (to - from) / (24 * 60 * 60 * 1000);
+    const factor = Math.pow(0.5, elapsedDays / RETRIEVAL_USAGE_DECAY_HALF_LIFE_DAYS);
+    return score * factor;
   }
 
   private stringify(value: unknown): string {

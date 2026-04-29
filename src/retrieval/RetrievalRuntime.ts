@@ -28,6 +28,7 @@ export interface PlannerDecisionMetadata {
   routeSteps: Array<{
     layer: string;
     action: string;
+    order?: number;
     reason: string;
     stopIf?: string;
     budgetTokens?: number;
@@ -128,7 +129,11 @@ export class RetrievalRuntime {
           break;
         case "base_summaries":
         case "raw_sources":
+        case "rag_candidates":
+        case "graph_neighbors":
           add("summary_tree");
+          break;
+        case "rerank":
           break;
         case "knowledge_export_index":
           add("knowledge");

@@ -1,6 +1,12 @@
 import {
+  HeavyRetrievalLanePolicy,
+  HeavyRetrievalPolicy,
   MemoryItemKind,
+  RerankPlannerPolicy,
   RetrievalRoute,
+  RetrievalGraphProvider,
+  RetrievalRagProvider,
+  RetrievalRerankProvider,
   RetrievalStrength,
 } from "../types";
 
@@ -36,13 +42,17 @@ export type PlannerCandidateLayer =
   | "project_registry"
   | "base_summaries"
   | "raw_sources"
-  | "knowledge_export_index";
+  | "knowledge_export_index"
+  | "rag_candidates"
+  | "graph_neighbors"
+  | "rerank";
 
 export type PlannerRouteAction =
   | "probe"
   | "retrieve"
   | "expand"
   | "verify"
+  | "order"
   | "stop";
 
 export type PlannerFallbackRoute =
@@ -84,6 +94,22 @@ export interface PlannerRuntimeSignals {
   memoryItemEnabled: boolean;
   totalBudget: number;
   llmPlannerModel?: string;
+  heavyRetrievalPolicy?: HeavyRetrievalPolicy;
+  ragPlannerPolicy?: HeavyRetrievalLanePolicy;
+  graphPlannerPolicy?: HeavyRetrievalLanePolicy;
+  rerankPlannerPolicy?: RerankPlannerPolicy;
+  graphEnabled?: boolean;
+  ragEnabled?: boolean;
+  rerankEnabled?: boolean;
+  graphProvider?: RetrievalGraphProvider;
+  ragProvider?: RetrievalRagProvider;
+  rerankProvider?: RetrievalRerankProvider;
+  candidateRerankThreshold?: number;
+  laneCandidateRerankThreshold?: number;
+  candidateAmbiguityMargin?: number;
+  strictModeRequiresRerankOnConflict?: boolean;
+  estimatedCandidateCount?: number;
+  candidateOverload?: boolean;
 }
 
 export interface ContextBudgetIntent {
@@ -112,6 +138,7 @@ export interface MemoryWriteDecision {
 export interface PlannerRouteStep {
   layer: PlannerCandidateLayer;
   action: PlannerRouteAction;
+  order?: number;
   budgetTokens?: number;
   reason: string;
   stopIf?: string;

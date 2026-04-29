@@ -28,6 +28,8 @@ const CREATIVE_RE = /(想想|发散|灵感|创意|方案 brainstorm|creative|ins
 const KNOWLEDGE_RE = /(knowledge|文档|知识库|Obsidian|Markdown|资料)/i;
 const DESTRUCTIVE_RE = /(wipe|restore|import|delete|reset|清空|恢复|导入|删除|重置)/i;
 const HIGH_CONSTRAINT_RE = /(严格按文档|按文档严格|绝对干净|不要妥协|不妥协|打磨到最终形态|最终形态|strictly follow|no compromise|final shape|production-ready)/i;
+const SEMANTIC_FUZZY_RE = /(\u7c7b\u4f3c|\u76f8\u4f3c|\u90a3\u4e2a\u60f3\u6cd5|\u90a3\u4e2a\u539f\u5219|\u610f\u601d\u63a5\u8fd1|\u8bed\u4e49|\u6a21\u7cca|similar|like that|that idea|that principle|semantic|fuzzy|concept)/i;
+const GRAPH_RELATION_RE = /(\u4f9d\u8d56|\u5f71\u54cd|\u5173\u7cfb|\u6765\u6e90|\u6eaf\u6e90|\u94fe\u8def|\u591a\u8df3|\u4e3a\u4ec0\u4e48|\u56e0\u679c|\u51b2\u7a81|\u652f\u6301|\u66ff\u4ee3|depends|dependency|impact|relation|provenance|trace|multi-hop|why|conflict|support|supersede)/i;
 
 export interface LLMPlannerInput {
   query: string;
@@ -111,7 +113,7 @@ export class LLMPlanner {
       intent.primary === "precision_fact" ||
       intent.primary === "history_trace" ||
       (intent.primary === "architecture_reasoning" && HIGH_CONSTRAINT_RE.test(input.query));
-    const candidateLayers = this.resolveCandidateLayers(input.deterministicDecision, intent.primary, input.signals, sourceTraceRequired);
+    const candidateLayers = this.resolveCandidateLayers(input.query, input.deterministicDecision, intent.primary, input.signals, sourceTraceRequired);
     const routePlan = this.buildRouteSteps(candidateLayers, input.signals, sourceTraceRequired, intent.primary);
     const activation = this.activationPolicy.decide(input.query, input.signals);
     const context = this.buildContextBudget(input.signals, sourceTraceRequired);
@@ -234,6 +236,7 @@ export class LLMPlanner {
   }
 
   private resolveCandidateLayers(
+    query: string,
     decision: RetrievalDecision,
     intent: PlannerIntent,
     signals: PlannerRuntimeSignals,
@@ -278,8 +281,68 @@ export class LLMPlanner {
     if (sourceTraceRequired) {
       add("raw_sources");
     }
+    if (this.shouldAddRagLayer(query, signals, intent)) {
+      add("rag_candidates");
+    }
+    if (this.shouldAddGraphLayer(query, signals, intent)) {
+      add("graph_neighbors");
+    }
+    if (this.shouldAddRerankLayer(signals, intent, sourceTraceRequired)) {
+      add("rerank");
+    }
     if (layers.length === 0) add("recent_tail");
     return layers;
+  }
+
+  private shouldAddRagLayer(queryHint: string, signals: PlannerRuntimeSignals, intent: PlannerIntent): boolean {
+    if (signals.heavyRetrievalPolicy === "disabled" || signals.ragPlannerPolicy === "disabled") {
+      return false;
+    }
+    const ragAvailable = signals.ragEnabled === true && signals.ragProvider !== "none";
+    if (!ragAvailable) {
+      return false;
+    }
+    return SEMANTIC_FUZZY_RE.test(queryHint) ||
+      signals.queryComplexity === "high" ||
+      intent === "history_trace" ||
+      intent === "architecture_reasoning" ||
+      Boolean(signals.candidateOverload);
+  }
+
+  private shouldAddGraphLayer(queryHint: string, signals: PlannerRuntimeSignals, intent: PlannerIntent): boolean {
+    if (signals.heavyRetrievalPolicy === "disabled" || signals.graphPlannerPolicy === "disabled") {
+      return false;
+    }
+    const graphAvailable = signals.graphEnabled === true && signals.graphProvider !== "none";
+    if (!graphAvailable) {
+      return false;
+    }
+    return GRAPH_RELATION_RE.test(queryHint) ||
+      intent === "history_trace" ||
+      intent === "architecture_reasoning" ||
+      intent === "decision" ||
+      intent === "constraint" ||
+      Boolean(signals.candidateOverload);
+  }
+
+  private shouldAddRerankLayer(
+    signals: PlannerRuntimeSignals,
+    intent: PlannerIntent,
+    sourceTraceRequired: boolean,
+  ): boolean {
+    if (signals.rerankPlannerPolicy === "disabled") {
+      return false;
+    }
+    const threshold = signals.candidateRerankThreshold ?? 20;
+    const overloaded = Boolean(signals.candidateOverload) ||
+      (signals.estimatedCandidateCount ?? 0) >= threshold;
+    return overloaded ||
+      signals.rerankPlannerPolicy === "candidate_overload_required" && (
+        signals.queryComplexity === "high" ||
+        Boolean(signals.candidateOverload) ||
+        intent === "architecture_reasoning" ||
+        intent === "history_trace"
+      );
   }
 
   private buildRouteSteps(
@@ -291,7 +354,8 @@ export class LLMPlanner {
     const budget = Math.max(256, Math.floor(signals.totalBudget * (sourceTraceRequired ? 0.035 : 0.015)));
     const steps: PlannerRouteStep[] = layers.map((layer, index) => ({
       layer,
-      action: layer === "raw_sources" ? "expand" : "retrieve",
+      action: this.routeActionForLayer(layer),
+      order: index + 1,
       budgetTokens: Math.max(128, Math.floor(budget / Math.max(layers.length, 1))),
       reason: this.layerReason(layer, intent, sourceTraceRequired),
       stopIf: index === layers.length - 1
@@ -304,11 +368,24 @@ export class LLMPlanner {
       steps.push({
         layer: "raw_sources",
         action: "verify",
+        order: steps.length + 1,
         reason: "Verifier must confirm source-backed evidence before final fact presentation.",
         stopIf: "source_verification_passed",
       });
     }
     return steps;
+  }
+
+  private routeActionForLayer(layer: PlannerCandidateLayer): PlannerRouteStep["action"] {
+    switch (layer) {
+      case "raw_sources":
+      case "graph_neighbors":
+        return "expand";
+      case "rerank":
+        return "order";
+      default:
+        return "retrieve";
+    }
   }
 
   private buildContextBudget(signals: PlannerRuntimeSignals, sourceTraceRequired: boolean): ContextBudgetIntent {
@@ -504,6 +581,12 @@ export class LLMPlanner {
           : "Raw source can expand a summary or memory hint if needed.";
       case "knowledge_export_index":
         return "Knowledge/Markdown index is export-only and advisory, never runtime fact authority.";
+      case "rag_candidates":
+        return "RAG lane may discover semantic candidates for fuzzy intent; candidates remain non-authoritative until source verified.";
+      case "graph_neighbors":
+        return "Graph lane may expand provenance, dependency, and multi-hop relation candidates; candidates remain non-authoritative.";
+      case "rerank":
+        return "Candidate pool is large, ambiguous, or strict enough that ordering must happen before final context selection.";
       default:
         return `Layer selected for ${intent}.`;
     }
@@ -588,6 +671,9 @@ const PLANNER_LAYERS: PlannerCandidateLayer[] = [
   "base_summaries",
   "raw_sources",
   "knowledge_export_index",
+  "rag_candidates",
+  "graph_neighbors",
+  "rerank",
 ];
 
 function basePlanToSignals(plan: LlmPlannerPlan): PlannerRuntimeSignals {
@@ -608,5 +694,19 @@ function basePlanToSignals(plan: LlmPlannerPlan): PlannerRuntimeSignals {
     memoryItemEnabled: plan.memoryWrite.allowed,
     totalBudget: Math.max(plan.context.totalRequestedTokens, 4096),
     llmPlannerModel: undefined,
+    heavyRetrievalPolicy: "planner_only",
+    ragPlannerPolicy: "planner_only",
+    graphPlannerPolicy: "planner_only",
+    rerankPlannerPolicy: "candidate_overload_required",
+    graphEnabled: plan.retrieval.candidateLayers.includes("graph_neighbors"),
+    ragEnabled: plan.retrieval.candidateLayers.includes("rag_candidates"),
+    rerankEnabled: plan.retrieval.candidateLayers.includes("rerank"),
+    graphProvider: plan.retrieval.candidateLayers.includes("graph_neighbors") ? "sqlite_graph" : "none",
+    ragProvider: plan.retrieval.candidateLayers.includes("rag_candidates") ? "sqlite_vec" : "none",
+    rerankProvider: plan.retrieval.candidateLayers.includes("rerank") ? "deterministic" : "none",
+    candidateRerankThreshold: 20,
+    laneCandidateRerankThreshold: 10,
+    candidateAmbiguityMargin: 0.08,
+    strictModeRequiresRerankOnConflict: true,
   };
 }
