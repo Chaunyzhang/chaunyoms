@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readdirSync, statSync } = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 function serializeVectorFloat32(vector) {
   const bytes = new Uint8Array(vector.length * 4);
@@ -108,8 +110,74 @@ function checkVectorExtensionLoad(vectorExtensionPath, vectorExtensionEntryPoint
   }
 }
 
+function candidateExtensionFileNames() {
+  if (process.platform === "win32") {
+    return new Set(["vec0.dll", "sqlite_vec.dll", "sqlite-vec.dll", "libsqlite_vec.dll"]);
+  }
+  if (process.platform === "darwin") {
+    return new Set(["vec0.dylib", "sqlite_vec.dylib", "sqlite-vec.dylib", "libsqlite_vec.dylib"]);
+  }
+  return new Set(["vec0.so", "sqlite_vec.so", "sqlite-vec.so", "libsqlite_vec.so"]);
+}
+
+function scanVectorExtensionCandidates() {
+  const names = candidateExtensionFileNames();
+  const roots = [
+    path.join(process.cwd(), "native"),
+    path.join(process.cwd(), "vendor"),
+    path.join(process.cwd(), "extensions"),
+    path.join(process.cwd(), "node_modules"),
+    path.join(os.homedir(), ".openclaw", "plugin-cache"),
+    path.join(os.homedir(), ".openclaw", "extensions"),
+    path.join(os.homedir(), ".openclaw", "chaunyoms", "plugin-cache"),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "OpenClaw", "plugin-cache") : "",
+  ].filter(Boolean);
+  const found = [];
+  const visited = new Set();
+  const walk = (root, depth) => {
+    if (!root || depth < 0 || visited.has(root) || !existsSync(root)) {
+      return;
+    }
+    visited.add(root);
+    let entries = [];
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(root, entry.name);
+      if (entry.isFile() && names.has(entry.name.toLowerCase())) {
+        let size = 0;
+        try {
+          size = statSync(fullPath).size;
+        } catch {
+          size = 0;
+        }
+        found.push({ path: fullPath, size });
+      } else if (entry.isDirectory() && depth > 0) {
+        if ([".git", "dist", "artifacts"].includes(entry.name)) {
+          continue;
+        }
+        walk(fullPath, depth - 1);
+      }
+      if (found.length >= 20) {
+        return;
+      }
+    }
+  };
+  for (const root of roots) {
+    walk(root, 4);
+    if (found.length >= 20) {
+      break;
+    }
+  }
+  return found;
+}
+
 const args = new Set(process.argv.slice(2));
 const strict = args.has("--strict");
+const installMode = args.has("--install");
 const vectorExtensionPath = process.env.OMS_VECTOR_EXTENSION_PATH || "";
 const vectorExtensionEntryPoint = process.env.OMS_VECTOR_EXTENSION_ENTRY_POINT || "";
 const nodeVersion = process.versions.node;
@@ -164,12 +232,34 @@ const vectorExtensionLoad = checkVectorExtensionLoad(vectorExtensionPath, vector
 if (vectorExtensionLoad) {
   checks.push(vectorExtensionLoad);
 }
+const vectorExtensionCandidates = vectorExtensionPath ? [] : scanVectorExtensionCandidates();
+checks.push({
+  name: "vector_extension_scan",
+  ok: vectorExtensionPath.length > 0 || vectorExtensionCandidates.length > 0,
+  required: false,
+  message: vectorExtensionPath
+    ? "Vector extension scan skipped because OMS_VECTOR_EXTENSION_PATH is already configured."
+    : vectorExtensionCandidates.length > 0
+      ? `Found ${vectorExtensionCandidates.length} possible SQLite vector extension candidate(s). Set OMS_VECTOR_EXTENSION_PATH to one of them to enable sqlite_vec.`
+      : "No local sqlite_vec/vec0 extension candidate found in repo/OpenClaw/plugin-cache scan roots; brute-force fallback remains active.",
+});
 const warnings = checks.filter((check) => !check.required && !check.ok).map((check) => check.message);
 const blocking = checks.filter((check) => check.required && !check.ok);
 const report = {
   ok: blocking.length === 0 && (!strict || warnings.length === 0),
+  mode: installMode ? "install" : "doctor",
   nodeVersion,
   npmVersion,
+  vectorExtension: {
+    configuredPath: vectorExtensionPath || null,
+    configuredEntryPoint: vectorExtensionEntryPoint || null,
+    scannedCandidateCount: vectorExtensionCandidates.length,
+    candidates: vectorExtensionCandidates,
+    suggestedEnv: vectorExtensionCandidates[0]
+      ? `OMS_VECTOR_EXTENSION_PATH=${vectorExtensionCandidates[0].path}`
+      : null,
+    note: "Installer/doctor only reports candidates; it never writes global environment variables or OpenClaw config automatically.",
+  },
   checks,
   warnings,
 };
