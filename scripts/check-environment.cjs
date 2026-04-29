@@ -66,7 +66,7 @@ function checkVectorExtensionLoad(vectorExtensionPath, vectorExtensionEntryPoint
     if (!sqlite.DatabaseSync) {
       throw new Error("node_sqlite_database_unavailable");
     }
-    const db = new sqlite.DatabaseSync(":memory:");
+    const db = new sqlite.DatabaseSync(":memory:", { allowExtension: true });
     try {
       if (typeof db.enableLoadExtension !== "function" || typeof db.loadExtension !== "function") {
         throw new Error("sqlite_load_extension_unavailable");
@@ -175,11 +175,36 @@ function scanVectorExtensionCandidates() {
   return found;
 }
 
+function loadOpenClawVectorExtensionConfig() {
+  const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(configPath)) {
+    return { path: "", entryPoint: "", source: null };
+  }
+  try {
+    const raw = require("node:fs").readFileSync(configPath, "utf8").replace(/^\uFEFF/, "");
+    const config = JSON.parse(raw);
+    const omsConfig = config?.plugins?.entries?.oms?.config ?? {};
+    return {
+      path: typeof omsConfig.vectorExtensionPath === "string" ? omsConfig.vectorExtensionPath : "",
+      entryPoint: typeof omsConfig.vectorExtensionEntryPoint === "string" ? omsConfig.vectorExtensionEntryPoint : "",
+      source: "openclaw_config",
+    };
+  } catch {
+    return { path: "", entryPoint: "", source: null };
+  }
+}
+
 const args = new Set(process.argv.slice(2));
 const strict = args.has("--strict");
 const installMode = args.has("--install");
-const vectorExtensionPath = process.env.OMS_VECTOR_EXTENSION_PATH || "";
-const vectorExtensionEntryPoint = process.env.OMS_VECTOR_EXTENSION_ENTRY_POINT || "";
+const openClawVectorConfig = loadOpenClawVectorExtensionConfig();
+const vectorExtensionPath = process.env.OMS_VECTOR_EXTENSION_PATH || openClawVectorConfig.path || "";
+const vectorExtensionEntryPoint = process.env.OMS_VECTOR_EXTENSION_ENTRY_POINT || openClawVectorConfig.entryPoint || "";
+const vectorExtensionConfigSource = process.env.OMS_VECTOR_EXTENSION_PATH
+  ? "environment"
+  : openClawVectorConfig.path
+    ? openClawVectorConfig.source
+    : null;
 const nodeVersion = process.versions.node;
 const nodeMajor = Number(nodeVersion.split(".")[0] || 0);
 const npm = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["-v"], {
@@ -224,8 +249,8 @@ const checks = [
     ok: vectorExtensionPath.length > 0,
     required: false,
     message: vectorExtensionPath
-      ? `OMS_VECTOR_EXTENSION_PATH configured: ${vectorExtensionPath}`
-      : "OMS_VECTOR_EXTENSION_PATH is not set; sqlite_vec will degrade to brute-force when RAG is enabled.",
+      ? `SQLite vector extension path configured from ${vectorExtensionConfigSource}: ${vectorExtensionPath}`
+      : "No OMS vector extension path is configured in env or OpenClaw config; sqlite_vec will degrade to brute-force when RAG is enabled.",
   },
 ];
 const vectorExtensionLoad = checkVectorExtensionLoad(vectorExtensionPath, vectorExtensionEntryPoint);
@@ -238,7 +263,7 @@ checks.push({
   ok: vectorExtensionPath.length > 0 || vectorExtensionCandidates.length > 0,
   required: false,
   message: vectorExtensionPath
-    ? "Vector extension scan skipped because OMS_VECTOR_EXTENSION_PATH is already configured."
+    ? `Vector extension scan skipped because vector extension path is already configured from ${vectorExtensionConfigSource}.`
     : vectorExtensionCandidates.length > 0
       ? `Found ${vectorExtensionCandidates.length} possible SQLite vector extension candidate(s). Set OMS_VECTOR_EXTENSION_PATH to one of them to enable sqlite_vec.`
       : "No local sqlite_vec/vec0 extension candidate found in repo/OpenClaw/plugin-cache scan roots; brute-force fallback remains active.",
@@ -253,6 +278,7 @@ const report = {
   vectorExtension: {
     configuredPath: vectorExtensionPath || null,
     configuredEntryPoint: vectorExtensionEntryPoint || null,
+    configuredSource: vectorExtensionConfigSource,
     scannedCandidateCount: vectorExtensionCandidates.length,
     candidates: vectorExtensionCandidates,
     suggestedEnv: vectorExtensionCandidates[0]

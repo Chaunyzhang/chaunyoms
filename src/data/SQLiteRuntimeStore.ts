@@ -64,7 +64,7 @@ interface SQLiteDatabaseLike {
   loadExtension?(path: string, entryPoint?: string): void;
 }
 
-type SQLiteDatabaseCtor = new (location: string) => SQLiteDatabaseLike;
+type SQLiteDatabaseCtor = new (location: string, options?: { allowExtension?: boolean }) => SQLiteDatabaseLike;
 
 interface RuntimeStoreOptions {
   dbPath: string;
@@ -2000,7 +2000,10 @@ export class SQLiteRuntimeStore {
     }
 
     await mkdir(path.dirname(this.options.dbPath), { recursive: true });
-    this.db = new DatabaseSync(this.options.dbPath);
+    this.db = new DatabaseSync(this.options.dbPath, {
+      allowExtension: typeof this.options.vectorExtensionPath === "string" &&
+        this.options.vectorExtensionPath.trim().length > 0,
+    });
     this.enabled = true;
     this.configureDatabase();
     this.createSchema();
@@ -2016,7 +2019,10 @@ export class SQLiteRuntimeStore {
     if (!DatabaseSync) {
       return false;
     }
-    this.db = new DatabaseSync(this.options.dbPath);
+    this.db = new DatabaseSync(this.options.dbPath, {
+      allowExtension: typeof this.options.vectorExtensionPath === "string" &&
+        this.options.vectorExtensionPath.trim().length > 0,
+    });
     this.enabled = true;
     this.configureDatabase();
     if (!this.schemaReady) {

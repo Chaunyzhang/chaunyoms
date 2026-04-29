@@ -97,7 +97,7 @@ export class EnvironmentDoctor {
   } {
     try {
       const sqlite = nodeRequire("node:sqlite") as {
-        DatabaseSync?: new (location: string) => {
+        DatabaseSync?: new (location: string, options?: { allowExtension?: boolean }) => {
           close(): void;
           enableLoadExtension?: (enabled: boolean) => void;
           loadExtension?: (path: string) => void;
@@ -157,7 +157,7 @@ export class EnvironmentDoctor {
     }
     try {
       const sqlite = nodeRequire("node:sqlite") as {
-        DatabaseSync?: new (location: string) => {
+        DatabaseSync?: new (location: string, options?: { allowExtension?: boolean }) => {
           close(): void;
           enableLoadExtension?: (enabled: boolean) => void;
           loadExtension?: (path: string, entryPoint?: string) => void;
@@ -169,7 +169,7 @@ export class EnvironmentDoctor {
       if (!sqlite.DatabaseSync) {
         throw new Error("node_sqlite_database_unavailable");
       }
-      const db = new sqlite.DatabaseSync(":memory:");
+      const db = new sqlite.DatabaseSync(":memory:", { allowExtension: true });
       try {
         if (typeof db.enableLoadExtension !== "function" || typeof db.loadExtension !== "function") {
           throw new Error("sqlite_load_extension_unavailable");
