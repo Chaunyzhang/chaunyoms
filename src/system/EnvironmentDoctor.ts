@@ -1,4 +1,6 @@
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { serializeVectorFloat32 } from "../retrieval/VectorEmbedding";
 
 export interface EnvironmentDoctorCheck {
   name: string;
@@ -22,6 +24,7 @@ export class EnvironmentDoctor {
   static run(options: {
     npmVersion?: string;
     vectorExtensionPath?: string;
+    vectorExtensionEntryPoint?: string;
     strict?: boolean;
   } = {}): EnvironmentDoctorReport {
     const checks: EnvironmentDoctorCheck[] = [];
@@ -59,6 +62,12 @@ export class EnvironmentDoctor {
         : "No vector extension path configured; sqlite_vec will degrade to brute-force when RAG is enabled.",
       details: configuredVectorExtension ? { vectorExtensionPath: options.vectorExtensionPath } : undefined,
     });
+    if (configuredVectorExtension) {
+      checks.push(this.inspectVectorExtensionLoad({
+        path: options.vectorExtensionPath?.trim() ?? "",
+        entryPoint: options.vectorExtensionEntryPoint,
+      }));
+    }
 
     if (options.npmVersion) {
       checks.push({
@@ -129,6 +138,78 @@ export class EnvironmentDoctor {
           message: `node:sqlite unavailable: ${error instanceof Error ? error.message : String(error)}`,
         },
         loadExtensionAvailable: false,
+      };
+    }
+  }
+
+  private static inspectVectorExtensionLoad(options: {
+    path: string;
+    entryPoint?: string;
+  }): EnvironmentDoctorCheck {
+    if (!existsSync(options.path)) {
+      return {
+        name: "vector_extension_load",
+        ok: false,
+        required: false,
+        message: `Configured vector extension does not exist: ${options.path}`,
+        details: { vectorExtensionPath: options.path },
+      };
+    }
+    try {
+      const sqlite = nodeRequire("node:sqlite") as {
+        DatabaseSync?: new (location: string) => {
+          close(): void;
+          enableLoadExtension?: (enabled: boolean) => void;
+          loadExtension?: (path: string, entryPoint?: string) => void;
+          prepare(sql: string): {
+            get(...params: unknown[]): Record<string, unknown> | undefined;
+          };
+        };
+      };
+      if (!sqlite.DatabaseSync) {
+        throw new Error("node_sqlite_database_unavailable");
+      }
+      const db = new sqlite.DatabaseSync(":memory:");
+      try {
+        if (typeof db.enableLoadExtension !== "function" || typeof db.loadExtension !== "function") {
+          throw new Error("sqlite_load_extension_unavailable");
+        }
+        db.enableLoadExtension(true);
+        const entryPoint = options.entryPoint?.trim();
+        if (entryPoint) {
+          db.loadExtension(options.path, entryPoint);
+        } else {
+          db.loadExtension(options.path);
+        }
+        db.enableLoadExtension(false);
+        const row = db.prepare("SELECT vec_distance_cosine(?, ?) AS distance")
+          .get(serializeVectorFloat32([1, 0]), serializeVectorFloat32([1, 0]));
+        const distance = Number(row?.distance);
+        if (!Number.isFinite(distance) || Math.abs(distance) > 0.0001) {
+          throw new Error("sqlite_vec_probe_failed");
+        }
+        return {
+          name: "vector_extension_load",
+          ok: true,
+          required: false,
+          message: "Configured SQLite vector extension loaded and passed vec_distance_cosine probe.",
+          details: { vectorExtensionPath: options.path, entryPoint },
+        };
+      } finally {
+        try {
+          db.enableLoadExtension?.(false);
+        } catch {
+          // Best effort; the in-memory connection is about to close.
+        }
+        db.close();
+      }
+    } catch (error) {
+      return {
+        name: "vector_extension_load",
+        ok: false,
+        required: false,
+        message: `Configured vector extension failed to load/probe: ${error instanceof Error ? error.message : String(error)}`,
+        details: { vectorExtensionPath: options.path },
       };
     }
   }

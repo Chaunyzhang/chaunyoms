@@ -48,6 +48,15 @@ export function serializeVector(vector: number[]): string {
   return JSON.stringify(vector.map((value) => Number(value.toFixed(6))));
 }
 
+export function serializeVectorFloat32(vector: number[]): Uint8Array {
+  const bytes = new Uint8Array(vector.length * 4);
+  const view = new DataView(bytes.buffer);
+  vector.forEach((value, index) => {
+    view.setFloat32(index * 4, Number.isFinite(value) ? value : 0, true);
+  });
+  return bytes;
+}
+
 export function parseVector(value: unknown): number[] {
   if (typeof value !== "string" || !value.trim()) {
     return [];

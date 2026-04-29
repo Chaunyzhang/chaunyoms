@@ -111,6 +111,8 @@ export class OmsAdminService {
         embeddingProvider: context.config.embeddingProvider,
         embeddingModel: context.config.embeddingModel,
         embeddingDimensions: context.config.embeddingDimensions,
+        vectorExtensionPath: context.config.vectorExtensionPath,
+        vectorExtensionEntryPoint: context.config.vectorExtensionEntryPoint,
         vectorSearchMaxCandidates: context.config.vectorSearchMaxCandidates,
         bruteForceVectorMaxRows: context.config.bruteForceVectorMaxRows,
         ragFallbackToBruteForce: context.config.ragFallbackToBruteForce,

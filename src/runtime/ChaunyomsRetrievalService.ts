@@ -1039,6 +1039,7 @@ export class ChaunyomsRetrievalService {
     const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
     const environment = EnvironmentDoctor.run({
       vectorExtensionPath: context.config.vectorExtensionPath,
+      vectorExtensionEntryPoint: context.config.vectorExtensionEntryPoint,
     });
     const warnings = [
       ...environment.warnings,

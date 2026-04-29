@@ -11,6 +11,8 @@ import { getDefaultSharedDataDir, getDefaultWorkspaceDir } from "./HostPathResol
 
 const DEFAULT_SHARED_DATA_DIR = getDefaultSharedDataDir();
 const DEFAULT_WORKSPACE_DIR = getDefaultWorkspaceDir();
+const DEFAULT_VECTOR_EXTENSION_PATH = process.env.OMS_VECTOR_EXTENSION_PATH?.trim() || undefined;
+const DEFAULT_VECTOR_EXTENSION_ENTRY_POINT = process.env.OMS_VECTOR_EXTENSION_ENTRY_POINT?.trim() || undefined;
 
 export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   dataDir: path.join(DEFAULT_SHARED_DATA_DIR, "data", "chaunyoms"),
@@ -86,6 +88,8 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   embeddingAsync: true,
   embeddingJobMaxBatch: 64,
   embeddingJobMaxRetries: 3,
+  vectorExtensionPath: DEFAULT_VECTOR_EXTENSION_PATH,
+  vectorExtensionEntryPoint: DEFAULT_VECTOR_EXTENSION_ENTRY_POINT,
   vectorSearchMaxCandidates: 32,
   bruteForceVectorMaxRows: 5000,
   ragFallbackToBruteForce: true,

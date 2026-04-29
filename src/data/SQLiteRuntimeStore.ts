@@ -26,6 +26,7 @@ import {
   cosineSimilarity,
   LocalHashEmbeddingProvider,
   parseVector,
+  serializeVectorFloat32,
   serializeVector,
   tokenizeForEmbedding,
 } from "../retrieval/VectorEmbedding";
@@ -46,7 +47,7 @@ const SQLITE_RUNTIME_STOP_WORDS = new Set([
 
 const RETRIEVAL_USAGE_DECAY_HALF_LIFE_DAYS = 30;
 
-type SQLiteValue = string | number | bigint | null;
+type SQLiteValue = string | number | bigint | Uint8Array | null;
 
 interface SQLiteStatementLike {
   run(...params: SQLiteValue[]): unknown;
@@ -58,6 +59,7 @@ interface SQLiteDatabaseLike {
   exec(sql: string): void;
   prepare(sql: string): SQLiteStatementLike;
   close(): void;
+  function?(name: string, fn: (...args: SQLiteValue[]) => SQLiteValue): void;
   enableLoadExtension?(allow: boolean): void;
   loadExtension?(path: string, entryPoint?: string): void;
 }
@@ -71,6 +73,7 @@ interface RuntimeStoreOptions {
   logger: LoggerLike;
   journalMode?: "delete" | "wal";
   vectorExtensionPath?: string;
+  vectorExtensionEntryPoint?: string;
 }
 
 export interface RuntimeContextRunRecord {
@@ -1586,11 +1589,11 @@ export class SQLiteRuntimeStore {
       return this.disabledEnhancementSearch("rag", "disabled");
     }
     const limit = Math.max(Math.min(options.limit ?? config.vectorSearchMaxCandidates, 100), 1);
-    const providerAvailable = config.ragProvider === "brute_force" ||
-      config.ragProvider === "embedding" ||
-      (config.ragProvider === "sqlite_vec" && this.vectorExtensionLoaded);
-    const shouldFallback = !providerAvailable && config.ragFallbackToBruteForce;
-    if (!providerAvailable && !shouldFallback) {
+    const providerAvailableWithoutProbe = config.ragProvider === "brute_force" ||
+      config.ragProvider === "embedding";
+    const requiresSqliteVecProbe = config.ragProvider === "sqlite_vec";
+    const shouldFallback = requiresSqliteVecProbe && config.ragFallbackToBruteForce;
+    if (!providerAvailableWithoutProbe && !requiresSqliteVecProbe && !shouldFallback) {
       return {
         ok: false,
         provider: config.ragProvider,
@@ -1615,74 +1618,70 @@ export class SQLiteRuntimeStore {
       };
     }
     try {
+      const providerAvailable = config.ragProvider === "brute_force" ||
+        config.ragProvider === "embedding" ||
+        (config.ragProvider === "sqlite_vec" && this.vectorExtensionLoaded);
+      if (!providerAvailable && config.ragProvider === "sqlite_vec" && !config.ragFallbackToBruteForce) {
+        return {
+          ok: false,
+          provider: config.ragProvider,
+          mode: "sqlite_vec",
+          degraded: false,
+          providerAvailable: false,
+          providerUnavailableReason: this.vectorExtensionError ?? "sqlite_vector_extension_unavailable",
+          candidates: [],
+          warnings: ["rag_provider_unavailable_without_fallback"],
+        };
+      }
       const mode = providerAvailable && config.ragProvider === "sqlite_vec" ? "sqlite_vec" : "brute_force";
       const queryVector = this.localEmbeddingProvider.embed(query, config.embeddingDimensions);
-      const rows = this.db?.prepare(`
-        SELECT chunk.chunk_id, chunk.source_kind, chunk.source_id, chunk.session_id, chunk.agent_id,
-               chunk.project_id, chunk.text, chunk.token_count, embedding.vector_json, embedding.provider,
-               embedding.model, embedding.dimensions
-        FROM vector_chunks chunk
-        JOIN vector_embeddings embedding ON embedding.chunk_id = chunk.chunk_id
-        WHERE (? IS NULL OR chunk.session_id = ?)
-          AND (? IS NULL OR chunk.agent_id = ?)
-        ORDER BY chunk.updated_at DESC
-        LIMIT ?
-      `).all(
-        options.sessionId ?? null,
-        options.sessionId ?? null,
-        options.agentId ?? null,
-        options.agentId ?? null,
-        Math.max(config.bruteForceVectorMaxRows, limit),
-      ) ?? [];
-      const candidates = rows
-        .map((row) => {
-          const vector = parseVector(row.vector_json);
-          const score = cosineSimilarity(queryVector, vector);
+      if (mode === "sqlite_vec") {
+        try {
+          const candidates = this.searchSqliteVecCandidates(queryVector, config, options, limit);
           return {
-            row,
-            score,
+            ok: true,
+            provider: config.ragProvider,
+            mode: "sqlite_vec",
+            degraded: false,
+            providerAvailable: true,
+            candidates,
+            warnings: [],
           };
-        })
-        .filter((item) => item.score > 0)
-        .sort((left, right) => right.score - left.score)
-        .slice(0, limit)
-        .map((item): RetrievalEnhancementCandidate => {
-          const sourceKind = String(item.row.source_kind ?? "memory_item");
-          const sourceId = String(item.row.source_id ?? "");
-          const text = String(item.row.text ?? "");
-          return {
-            id: `rag:${sourceKind}:${sourceId}`,
-            kind: this.enhancementCandidateKind(sourceKind),
-            score: Number(item.score.toFixed(6)),
-            reason: mode === "sqlite_vec"
-              ? "sqlite_vec_vector_similarity"
-              : "brute_force_vector_similarity",
-            sourceVerified: sourceKind === "summary" || sourceKind === "memory_item",
-            title: text.slice(0, 96),
-            content: text,
-            tokenCount: Number(item.row.token_count ?? estimateSimpleTokens(text)),
-            metadata: {
-              chunkId: String(item.row.chunk_id ?? ""),
-              provider: String(item.row.provider ?? ""),
-              model: String(item.row.model ?? ""),
-              dimensions: Number(item.row.dimensions ?? 0),
-              sourceKind,
-              sourceId,
-              degraded: mode === "brute_force" && config.ragProvider === "sqlite_vec",
-            },
-          };
-        });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.vectorExtensionLoaded = false;
+          this.vectorExtensionError = message;
+          this.options.logger.warn("sqlite_vec_search_failed", {
+            error: message,
+          });
+          if (!config.ragFallbackToBruteForce) {
+            return {
+              ok: false,
+              provider: config.ragProvider,
+              mode: "sqlite_vec",
+              degraded: false,
+              providerAvailable: false,
+              providerUnavailableReason: message,
+              candidates: [],
+              warnings: ["sqlite_vec_search_failed_without_fallback"],
+            };
+          }
+        }
+      }
+      const candidates = this.searchBruteForceVectorCandidates(queryVector, config, options, limit, {
+        degraded: config.ragProvider === "sqlite_vec",
+      });
       return {
         ok: true,
         provider: config.ragProvider,
-        mode,
-        degraded: mode === "brute_force" && config.ragProvider === "sqlite_vec",
-        providerAvailable,
-        providerUnavailableReason: providerAvailable
+        mode: "brute_force",
+        degraded: config.ragProvider === "sqlite_vec",
+        providerAvailable: config.ragProvider !== "sqlite_vec",
+        providerUnavailableReason: config.ragProvider !== "sqlite_vec"
           ? undefined
           : this.vectorExtensionError ?? "sqlite_vector_extension_unavailable",
         candidates,
-        warnings: providerAvailable
+        warnings: config.ragProvider !== "sqlite_vec"
           ? []
           : ["sqlite_vec_unavailable_brute_force_fallback_used"],
       };
@@ -1703,6 +1702,130 @@ export class SQLiteRuntimeStore {
     } finally {
       this.closeDatabase();
     }
+  }
+
+  private searchSqliteVecCandidates(
+    queryVector: number[],
+    config: BridgeConfig,
+    options: { sessionId?: string; agentId?: string },
+    limit: number,
+  ): RetrievalEnhancementCandidate[] {
+    const queryJson = serializeVector(queryVector);
+    const queryBlob = serializeVectorFloat32(queryVector);
+    const rows = this.db?.prepare(`
+      SELECT chunk.chunk_id, chunk.source_kind, chunk.source_id, chunk.session_id, chunk.agent_id,
+             chunk.project_id, chunk.text, chunk.token_count, embedding.provider,
+             embedding.model, embedding.dimensions,
+             CASE
+               WHEN embedding.vector_f32_blob IS NOT NULL
+                 THEN vec_distance_cosine(?, embedding.vector_f32_blob)
+               ELSE vec_distance_cosine(?, embedding.vector_json)
+             END AS distance
+      FROM vector_chunks chunk
+      JOIN vector_embeddings embedding ON embedding.chunk_id = chunk.chunk_id
+      WHERE (? IS NULL OR chunk.session_id = ?)
+        AND (? IS NULL OR chunk.agent_id = ?)
+        AND embedding.dimensions = ?
+      ORDER BY distance ASC, chunk.updated_at DESC
+      LIMIT ?
+    `).all(
+      queryBlob,
+      queryJson,
+      options.sessionId ?? null,
+      options.sessionId ?? null,
+      options.agentId ?? null,
+      options.agentId ?? null,
+      config.embeddingDimensions,
+      limit,
+    ) ?? [];
+    return rows
+      .map((row) => ({
+        row,
+        score: this.sqliteVectorDistanceToScore(Number(row.distance ?? Number.POSITIVE_INFINITY)),
+      }))
+      .filter((item) => item.score > 0)
+      .map((item) => this.rowToVectorCandidate(item.row, item.score, "sqlite_vec_vector_similarity", false));
+  }
+
+  private searchBruteForceVectorCandidates(
+    queryVector: number[],
+    config: BridgeConfig,
+    options: { sessionId?: string; agentId?: string },
+    limit: number,
+    flags: { degraded: boolean },
+  ): RetrievalEnhancementCandidate[] {
+    const rows = this.db?.prepare(`
+      SELECT chunk.chunk_id, chunk.source_kind, chunk.source_id, chunk.session_id, chunk.agent_id,
+             chunk.project_id, chunk.text, chunk.token_count, embedding.vector_json, embedding.provider,
+             embedding.model, embedding.dimensions
+      FROM vector_chunks chunk
+      JOIN vector_embeddings embedding ON embedding.chunk_id = chunk.chunk_id
+      WHERE (? IS NULL OR chunk.session_id = ?)
+        AND (? IS NULL OR chunk.agent_id = ?)
+      ORDER BY chunk.updated_at DESC
+      LIMIT ?
+    `).all(
+      options.sessionId ?? null,
+      options.sessionId ?? null,
+      options.agentId ?? null,
+      options.agentId ?? null,
+      Math.max(config.bruteForceVectorMaxRows, limit),
+    ) ?? [];
+    return rows
+      .map((row) => {
+        const vector = parseVector(row.vector_json);
+        const score = cosineSimilarity(queryVector, vector);
+        return {
+          row,
+          score,
+        };
+      })
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit)
+      .map((item) => this.rowToVectorCandidate(
+        item.row,
+        item.score,
+        "brute_force_vector_similarity",
+        flags.degraded,
+      ));
+  }
+
+  private rowToVectorCandidate(
+    row: Record<string, unknown>,
+    score: number,
+    reason: string,
+    degraded: boolean,
+  ): RetrievalEnhancementCandidate {
+    const sourceKind = String(row.source_kind ?? "memory_item");
+    const sourceId = String(row.source_id ?? "");
+    const text = String(row.text ?? "");
+    return {
+      id: `rag:${sourceKind}:${sourceId}`,
+      kind: this.enhancementCandidateKind(sourceKind),
+      score: Number(score.toFixed(6)),
+      reason,
+      sourceVerified: sourceKind === "summary" || sourceKind === "memory_item",
+      title: text.slice(0, 96),
+      content: text,
+      tokenCount: Number(row.token_count ?? estimateSimpleTokens(text)),
+      metadata: {
+        chunkId: String(row.chunk_id ?? ""),
+        provider: String(row.provider ?? ""),
+        model: String(row.model ?? ""),
+        dimensions: Number(row.dimensions ?? 0),
+        sourceKind,
+        sourceId,
+        degraded,
+      },
+    };
+  }
+
+  private sqliteVectorDistanceToScore(distance: number): number {
+    if (!Number.isFinite(distance)) {
+      return 0;
+    }
+    return Math.max(0, Math.min(1, 1 - distance));
   }
 
   searchGraphCandidates(
@@ -2119,9 +2242,15 @@ export class SQLiteRuntimeStore {
       this.vectorExtensionError = "sqlite_load_extension_unavailable";
       return;
     }
+    const entryPoint = this.options.vectorExtensionEntryPoint?.trim();
     try {
       this.db.enableLoadExtension(true);
-      this.db.loadExtension(extensionPath);
+      if (entryPoint) {
+        this.db.loadExtension(extensionPath, entryPoint);
+      } else {
+        this.db.loadExtension(extensionPath);
+      }
+      this.probeVectorExtensionFunctions();
       this.vectorExtensionLoaded = true;
       this.vectorExtensionError = null;
     } catch (error) {
@@ -2137,6 +2266,19 @@ export class SQLiteRuntimeStore {
       } catch {
         // best effort; loading is optional and isolated
       }
+    }
+  }
+
+  private probeVectorExtensionFunctions(): void {
+    if (!this.db) {
+      throw new Error("sqlite_runtime_unavailable");
+    }
+    const one = serializeVectorFloat32([1, 0]);
+    const two = serializeVectorFloat32([1, 0]);
+    const row = this.db.prepare("SELECT vec_distance_cosine(?, ?) AS distance").get(one, two);
+    const distance = Number(row?.distance);
+    if (!Number.isFinite(distance) || Math.abs(distance) > 0.0001) {
+      throw new Error("sqlite_vec_probe_failed");
     }
   }
 
@@ -2395,6 +2537,7 @@ export class SQLiteRuntimeStore {
         model TEXT NOT NULL,
         dimensions INTEGER NOT NULL,
         vector_json TEXT NOT NULL,
+        vector_f32_blob BLOB,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -2494,7 +2637,19 @@ export class SQLiteRuntimeStore {
     // boot and normal mirroring should not pay virtual-table setup or refresh
     // costs until a future semantic/FTS path explicitly enables it.
     this.ensureMemoryItemSchema();
+    this.ensureVectorEmbeddingSchema();
     this.dropLegacyMemoryTables();
+  }
+
+  private ensureVectorEmbeddingSchema(): void {
+    if (!this.db) {
+      return;
+    }
+    const rows = this.db.prepare("PRAGMA table_info(vector_embeddings)").all();
+    const columns = new Set(rows.map((row) => String(row.name)));
+    if (!columns.has("vector_f32_blob")) {
+      this.db.exec("ALTER TABLE vector_embeddings ADD COLUMN vector_f32_blob BLOB;");
+    }
   }
 
   private dropLegacyMemoryTables(): void {
@@ -4560,13 +4715,14 @@ export class SQLiteRuntimeStore {
     const vector = this.localEmbeddingProvider.embed(source.text, config.embeddingDimensions);
     this.prepare(`
       INSERT INTO vector_embeddings (
-        chunk_id, provider, model, dimensions, vector_json, created_at, updated_at, metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        chunk_id, provider, model, dimensions, vector_json, vector_f32_blob, created_at, updated_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET
         provider=excluded.provider,
         model=excluded.model,
         dimensions=excluded.dimensions,
         vector_json=excluded.vector_json,
+        vector_f32_blob=excluded.vector_f32_blob,
         updated_at=excluded.updated_at,
         metadata_json=excluded.metadata_json
     `)?.run(
@@ -4575,6 +4731,7 @@ export class SQLiteRuntimeStore {
       config.embeddingModel,
       config.embeddingDimensions,
       serializeVector(vector),
+      serializeVectorFloat32(vector),
       now,
       now,
       this.stringify({ textHash, sourceKind: source.sourceKind, sourceId: source.sourceId }),

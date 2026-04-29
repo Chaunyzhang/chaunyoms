@@ -336,6 +336,10 @@ export const pluginConfigSchema = {
       type: "string",
       description: "Optional path to a SQLite vector extension. Missing or failing extension falls back when ragFallbackToBruteForce=true.",
     },
+    vectorExtensionEntryPoint: {
+      type: "string",
+      description: "Optional SQLite extension entry point, for hosts that need an explicit sqlite3_*_init symbol.",
+    },
     vectorSearchMaxCandidates: {
       type: "number",
       minimum: 1,

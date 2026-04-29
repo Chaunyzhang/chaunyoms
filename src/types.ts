@@ -855,6 +855,7 @@ export interface BridgeConfig {
   embeddingJobMaxBatch: number;
   embeddingJobMaxRetries: number;
   vectorExtensionPath?: string;
+  vectorExtensionEntryPoint?: string;
   vectorSearchMaxCandidates: number;
   bruteForceVectorMaxRows: number;
   ragFallbackToBruteForce: boolean;

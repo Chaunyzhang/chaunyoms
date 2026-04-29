@@ -160,6 +160,8 @@ export interface OmsRuntimeStatus {
     | "embeddingProvider"
     | "embeddingModel"
     | "embeddingDimensions"
+    | "vectorExtensionPath"
+    | "vectorExtensionEntryPoint"
     | "vectorSearchMaxCandidates"
     | "bruteForceVectorMaxRows"
     | "ragFallbackToBruteForce"

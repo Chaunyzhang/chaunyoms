@@ -19,10 +19,48 @@ const logger = {
   error(): void {},
 };
 
+function parseTestVector(value: unknown): number[] {
+  if (value instanceof Uint8Array) {
+    const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+    const vector: number[] = [];
+    for (let offset = 0; offset < value.byteLength; offset += 4) {
+      vector.push(view.getFloat32(offset, true));
+    }
+    return vector;
+  }
+  if (typeof value === "string") {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.map((entry) => Number(entry)) : [];
+  }
+  return [];
+}
+
+function cosineDistance(leftValue: unknown, rightValue: unknown): number {
+  const left = parseTestVector(leftValue);
+  const right = parseTestVector(rightValue);
+  const length = Math.min(left.length, right.length);
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < length; index += 1) {
+    dot += left[index] * right[index];
+    leftNorm += left[index] * left[index];
+    rightNorm += right[index] * right[index];
+  }
+  if (leftNorm <= 0 || rightNorm <= 0) {
+    return 1;
+  }
+  return 1 - (dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm)));
+}
+
 async function main(): Promise<void> {
   const doctor = EnvironmentDoctor.run();
   assert(doctor.checks.some((check) => check.name === "node_sqlite"), "environment doctor should inspect node:sqlite");
   assert(doctor.checks.some((check) => check.name === "sqlite_load_extension_api"), "environment doctor should inspect loadExtension support");
+  const missingExtensionDoctor = EnvironmentDoctor.run({
+    vectorExtensionPath: path.join(os.tmpdir(), "missing-sqlite-vec-extension"),
+  });
+  assert(missingExtensionDoctor.checks.some((check) => check.name === "vector_extension_load" && !check.ok), "environment doctor should probe configured vector extension paths");
 
   const dir = await mkdtemp(path.join(os.tmpdir(), "chaunyoms-rag-graph-"));
   try {
@@ -128,6 +166,25 @@ async function main(): Promise<void> {
     assert(rag.mode === "brute_force", "sqlite_vec should degrade to brute-force when no vector extension is loaded");
     assert(rag.degraded, "sqlite_vec fallback should be marked degraded");
     assert(rag.candidates.length > 0, "RAG search should return local vector candidates");
+
+    const unsafeStore = store as unknown as {
+      openDatabase(): boolean;
+      db: {
+        function(name: string, fn: (left: unknown, right: unknown) => number): void;
+      } | null;
+      vectorExtensionLoaded: boolean;
+    };
+    assert(unsafeStore.openDatabase(), "test should be able to open sqlite runtime");
+    unsafeStore.db?.function("vec_distance_cosine", cosineDistance);
+    unsafeStore.vectorExtensionLoaded = true;
+    const sqliteVec = store.searchVectorCandidates("socket binding port", config, {
+      sessionId: "session-rag",
+      agentId: "agent-rag",
+    });
+    assert(sqliteVec.ok, "sqlite_vec path should return ok when vec_distance_cosine is available");
+    assert(sqliteVec.mode === "sqlite_vec", "sqlite_vec path should use SQLite vector distance instead of brute-force");
+    assert(!sqliteVec.degraded, "loaded sqlite_vec path should not be marked degraded");
+    assert(sqliteVec.candidates.some((candidate) => candidate.reason === "sqlite_vec_vector_similarity"), "sqlite_vec path should mark extension-backed candidate reasons");
 
     const graph = store.searchGraphCandidates("socket binding", config, {
       sessionId: "session-rag",

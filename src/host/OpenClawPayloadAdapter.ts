@@ -857,6 +857,10 @@ export class OpenClawPayloadAdapter {
         pluginConfig.vectorExtensionPath,
         baseConfig.vectorExtensionPath,
       ),
+      vectorExtensionEntryPoint: this.resolveOptionalString(
+        pluginConfig.vectorExtensionEntryPoint,
+        baseConfig.vectorExtensionEntryPoint,
+      ),
       vectorSearchMaxCandidates: this.resolveNumberConfig(
         [pluginConfig.vectorSearchMaxCandidates, pluginConfig.ragVectorCandidateLimit],
         baseConfig.vectorSearchMaxCandidates,
