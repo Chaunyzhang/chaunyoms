@@ -27,32 +27,57 @@ export class PlanValidator {
     }
 
     if (
-      (plan.retrieval.strength === "strict" || plan.retrieval.strength === "forensic") &&
+      (plan.retrieval.strength === "high" || plan.retrieval.strength === "xhigh") &&
       !plan.retrieval.sourceTraceRequired
     ) {
       violations.push({
-        code: "strict_without_source_trace",
+        code: "high_without_source_trace",
         severity: "error",
         message: `${plan.retrieval.strength} retrieval requires sourceTraceRequired=true.`,
       });
     }
 
     if (
-      plan.retrieval.strength === "forensic" &&
+      (plan.retrieval.strength === "high" || plan.retrieval.strength === "xhigh") &&
       !plan.retrieval.candidateLayers.includes("raw_sources")
     ) {
+      const code = plan.retrieval.strength === "xhigh" ? "xhigh_without_raw_sources" : "high_without_raw_sources";
       violations.push({
-        code: "forensic_without_raw_sources",
+        code,
         severity: "error",
-        message: "forensic retrieval must include raw_sources in candidateLayers.",
+        message: `${plan.retrieval.strength} retrieval must include raw_sources in candidateLayers.`,
       });
     }
 
-    if (plan.retrieval.strength === "forensic" && plan.safety.summaryOnlyFinalFactAllowed) {
+    if (plan.retrieval.dagExpansion.mode === "delegated_agent" && plan.retrieval.dagExpansion.agentProvider === "none") {
+      if (executablePlan) {
+        executablePlan = {
+          ...executablePlan,
+          retrieval: {
+            ...executablePlan.retrieval,
+            dagExpansion: {
+              ...executablePlan.retrieval.dagExpansion,
+              mode: "deterministic",
+              fallbackMode: "deterministic",
+              reason: "Delegated DAG expansion was requested without a configured provider; repaired to deterministic expansion.",
+            },
+          },
+        };
+      }
+      repaired = true;
       violations.push({
-        code: "forensic_summary_only_final_fact",
+        code: "delegated_dag_expansion_without_provider_repair",
+        severity: "warning",
+        message: "Delegated DAG expansion requires a configured provider.",
+        repair: "Set retrieval.dagExpansion.mode=deterministic.",
+      });
+    }
+
+    if (plan.retrieval.strength === "xhigh" && plan.safety.summaryOnlyFinalFactAllowed) {
+      violations.push({
+        code: "xhigh_summary_only_final_fact",
         severity: "error",
-        message: "forensic retrieval cannot allow summary-only evidence as a final fact.",
+        message: "xhigh retrieval cannot allow summary-only evidence as a final fact.",
       });
     }
 
@@ -187,6 +212,7 @@ export class PlanValidator {
       retrieval: {
         ...plan.retrieval,
         candidateLayers: [...plan.retrieval.candidateLayers],
+        dagExpansion: { ...plan.retrieval.dagExpansion },
         routePlan: plan.retrieval.routePlan.map((step) => ({ ...step })),
       },
       context: {

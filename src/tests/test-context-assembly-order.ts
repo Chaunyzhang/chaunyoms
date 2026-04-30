@@ -267,7 +267,7 @@ async function main(): Promise<void> {
 
   assert(
     labels.join(" > ") ===
-      "shared_cognition > navigation > oms_recall_guidance > memory_item > summaries > knowledge_base_index > recent_tail",
+      "shared_cognition > navigation > recent_tail > oms_recall_guidance > memory_item > summaries > knowledge_base_index",
     `unexpected assembly order: ${labels.join(" > ")}`,
   );
 

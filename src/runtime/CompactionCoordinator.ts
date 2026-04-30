@@ -214,6 +214,7 @@ export class CompactionCoordinator {
     const memoryItemDraft = this.deps.assembler.assembleMemoryItems(
       memoryItemDraftStore,
       budget.recallBudget,
+      { rawStore, sessionId: context.sessionId },
     );
     const pluginFixedTokens = [
       ...stablePrefix,

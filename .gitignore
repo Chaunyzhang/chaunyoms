@@ -13,10 +13,17 @@ docs/*
 !docs/knowledge-intent-ingress-plan.md
 !docs/oms-foundation-substrate-plan.md
 !docs/productization-roadmap.md
+!docs/standard-benchmark-status.md
 scripts/*
 !scripts/run-compiled-tests.cjs
 !scripts/openclaw-real-test-worker.cjs
 !scripts/openclaw-runtime-report.cjs
 !scripts/openclaw-session-smoke.cjs
 !scripts/check-environment.cjs
+!scripts/run-locomo-standard.cjs
+!scripts/run-longmemeval-siliconflow.cjs
+!scripts/run-personamem-standard.cjs
+!scripts/run-prefeval10-standard.cjs
+!scripts/run-standard-benchmarks.ps1
+!scripts/run-default-baseline-mini.cjs
 SKILL.md

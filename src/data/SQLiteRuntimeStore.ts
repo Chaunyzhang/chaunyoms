@@ -303,6 +303,7 @@ export interface RuntimeEnhancementSearchResult {
 export interface RuntimeAssemblyReader {
   getSummaryCount(sessionId?: string): number;
   getActiveMemoryItems(limit?: number): MemoryItemEntry[];
+  getCompactedMessageIds(messageIds: string[], sessionId?: string): Set<string>;
   getSummaries(budget: number, sessionId?: string): SummaryEntry[];
   getRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[];
 }
@@ -530,6 +531,8 @@ export class SQLiteRuntimeStore {
       return reader({
         getSummaryCount: (sessionId) => this.readAssemblySummaryCount(sessionId),
         getActiveMemoryItems: (limit) => this.readAssemblyActiveMemoryItems(limit),
+        getCompactedMessageIds: (messageIds, sessionId) =>
+          this.readAssemblyCompactedMessageIds(messageIds, sessionId),
         getSummaries: (budget, sessionId) => this.readAssemblySummaries(budget, sessionId),
         getRecentTailByTokens: (tokenBudget, maxTurns, sessionId) =>
           this.readAssemblyRecentTailByTokens(tokenBudget, maxTurns, sessionId),
@@ -578,6 +581,24 @@ export class SQLiteRuntimeStore {
       LIMIT ?
     `).all(Math.max(Math.min(limit, 50), 1))
       .map((row) => this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry));
+  }
+
+  private readAssemblyCompactedMessageIds(messageIds: string[], sessionId?: string): Set<string> {
+    if (!this.db || messageIds.length === 0) {
+      return new Set();
+    }
+    const uniqueIds = [...new Set(messageIds.map((id) => id.trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return new Set();
+    }
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      SELECT id FROM messages
+      WHERE id IN (${placeholders})
+        AND compacted = 1
+        AND (? IS NULL OR session_id = ?)
+    `).all(...uniqueIds, sessionId ?? null, sessionId ?? null);
+    return new Set(rows.map((row) => String(row.id ?? "")).filter(Boolean));
   }
 
   private readAssemblySummaries(budget: number, sessionId?: string): SummaryEntry[] {
@@ -880,7 +901,7 @@ export class SQLiteRuntimeStore {
       : [];
   }
 
-  grepMessages(query: string, options: { sessionId?: string; limit?: number; contextTurns?: number } = {}): OmsGrepHit[] {
+  grepMessages(query: string, options: { sessionId?: string; limit?: number; contextTurns?: number; fastOnly?: boolean } = {}): OmsGrepHit[] {
     if (!query.trim() || !this.openDatabase()) {
       return [];
     }
@@ -893,18 +914,25 @@ export class SQLiteRuntimeStore {
       }
 
       const ftsScored = this.searchMessagesFts(query, terms, options.sessionId, limit * 2);
-      // FTS is only an anchor accelerator. It must never become a hard recall gate:
-      // long histories often contain many generic FTS hits that can crowd out the
-      // exact source turn. Always merge a deterministic term scan so raw recall
-      // keeps lossless behavior even when BM25 is noisy.
-      const rows = this.db?.prepare(`
+      // FTS is only an anchor accelerator by default. It must never become a hard
+      // recall gate for normal OMS recall: long histories can contain generic
+      // FTS hits that crowd out the exact source turn, so normal mode merges a
+      // deterministic full scan.
+      //
+      // losslessFastPath/directGrep benchmarks intentionally ask for the
+      // lossless-claw-style substrate: prebuilt FTS, no planner, no reranker, and
+      // no whole-ledger scan unless FTS finds nothing. This isolates the no-LLM
+      // fast path without weakening the authoritative recall path.
+      const shouldRunFullScan = options.fastOnly !== true || ftsScored.length === 0;
+      const scanScored = shouldRunFullScan
+        ? (this.db?.prepare(`
       SELECT * FROM messages
       WHERE (? IS NULL OR session_id = ?)
       ORDER BY sequence ASC, turn_number ASC, created_at ASC
-      `).all(options.sessionId ?? null, options.sessionId ?? null) ?? [];
-      const scanScored = rows
-        .map((row) => ({ message: this.rowToMessage(row), score: this.scoreText(String(row.content ?? ""), terms) }))
-        .filter((item) => item.score > 0);
+      `).all(options.sessionId ?? null, options.sessionId ?? null) ?? [])
+          .map((row) => ({ message: this.rowToMessage(row), score: this.scoreText(String(row.content ?? ""), terms) }))
+          .filter((item) => item.score > 0)
+        : [];
       const byId = new Map<string, { message: RawMessage; score: number }>();
       for (const item of [...ftsScored, ...scanScored]) {
         const existing = byId.get(item.message.id);
@@ -1532,7 +1560,7 @@ export class SQLiteRuntimeStore {
         warnings.push("embedding_disabled_existing_vectors_only");
       }
 
-      if (config.graphBuilderEnabled && config.graphBuilderProvider !== "none") {
+      if (config.graphBuilderEnabled && config.graphBuilderProvider === "deterministic") {
         const sources = this.readEnhancementSourceRows(options);
         const nodes = sources.map((source) => this.upsertGraphNodeFromSource(source, config));
         graphNodesIndexed = nodes.filter(Boolean).length;
@@ -1540,6 +1568,8 @@ export class SQLiteRuntimeStore {
           nodes.filter((node): node is GraphNodeSeed => Boolean(node)),
           config,
         );
+      } else if (config.graphBuilderEnabled && config.graphBuilderProvider !== "none") {
+        warnings.push(`graph_builder_provider_not_runtime_configured:${config.graphBuilderProvider}`);
       } else if (config.graphEnabled) {
         warnings.push("graph_builder_disabled_existing_edges_only");
       }
@@ -1587,6 +1617,42 @@ export class SQLiteRuntimeStore {
   ): RuntimeEnhancementSearchResult {
     if (!config.ragEnabled || config.ragProvider === "none" || !query.trim()) {
       return this.disabledEnhancementSearch("rag", "disabled");
+    }
+    if (config.ragProvider === "external") {
+      return {
+        ok: false,
+        provider: config.ragProvider,
+        mode: "disabled",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: "rag_external_provider_not_runtime_configured",
+        candidates: [],
+        warnings: ["rag_external_provider_not_runtime_configured"],
+      };
+    }
+    if (!config.embeddingEnabled || config.embeddingProvider === "none") {
+      return {
+        ok: true,
+        provider: config.ragProvider,
+        mode: "disabled",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: "embedding_disabled",
+        candidates: [],
+        warnings: ["embedding_disabled_vector_search_skipped"],
+      };
+    }
+    if (config.embeddingProvider !== "local_hash") {
+      return {
+        ok: false,
+        provider: config.ragProvider,
+        mode: "disabled",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: "embedding_provider_not_runtime_available",
+        candidates: [],
+        warnings: [`embedding_provider_${config.embeddingProvider}_requires_runtime_provider`],
+      };
     }
     const limit = Math.max(Math.min(options.limit ?? config.vectorSearchMaxCandidates, 100), 1);
     const providerAvailableWithoutProbe = config.ragProvider === "brute_force" ||
@@ -1835,6 +1901,18 @@ export class SQLiteRuntimeStore {
   ): RuntimeEnhancementSearchResult {
     if (!config.graphEnabled || config.graphProvider === "none" || !query.trim()) {
       return this.disabledEnhancementSearch("graph", "disabled");
+    }
+    if (config.graphProvider === "external") {
+      return {
+        ok: false,
+        provider: config.graphProvider,
+        mode: "disabled",
+        degraded: false,
+        providerAvailable: false,
+        providerUnavailableReason: "graph_external_provider_not_runtime_configured",
+        candidates: [],
+        warnings: ["graph_external_provider_not_runtime_configured"],
+      };
     }
     if (!this.openDatabase()) {
       return {
@@ -2639,9 +2717,12 @@ export class SQLiteRuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_runtime_records_kind_agent ON runtime_records(kind, agent_id);
     `);
 
-    // FTS is deliberately lazy. Exact/LIKE search remains canonical today, so
-    // boot and normal mirroring should not pay virtual-table setup or refresh
-    // costs until a future semantic/FTS path explicitly enables it.
+    // Keep the lossless/raw substrate write-through indexed. Lossless-claw's
+    // no-LLM speed comes from having FTS ready as messages are written instead
+    // of building a virtual table and backfilling the whole ledger on the
+    // first recall. The per-message refresh remains best-effort; LIKE/raw scan
+    // still stays authoritative if FTS is unavailable.
+    this.ensureFtsSchema();
     this.ensureMemoryItemSchema();
     this.ensureVectorEmbeddingSchema();
     this.dropLegacyMemoryTables();
@@ -4383,6 +4464,8 @@ export class SQLiteRuntimeStore {
         return "on_demand";
       case "auto":
         return "default";
+      case "high":
+      case "xhigh":
       case "strict":
       case "forensic":
         return "strict_only";
@@ -4807,7 +4890,7 @@ export class SQLiteRuntimeStore {
       "active",
       0.75,
       source.sourceKind === "memory_item" ? 1.2 : 1,
-      config.graphBuilderProvider === "llm" ? "llm" : "system",
+      config.graphBuilderProvider === "deterministic" ? "system" : config.graphBuilderProvider,
       now,
       now,
       this.stringify({
@@ -4864,7 +4947,7 @@ export class SQLiteRuntimeStore {
         confidence >= 0.7 ? "promoted" : "candidate",
         confidence,
         weight,
-        config.graphBuilderProvider === "llm" ? "llm" : "system",
+        config.graphBuilderProvider === "deterministic" ? "system" : config.graphBuilderProvider,
         now,
         now,
         this.stringify({

@@ -89,11 +89,6 @@ export function inspectOpenClawCompatibility(
         );
       }
     }
-    if (mode === "authoritative" && !plugin.present) {
-      warnings.push(
-        `plugins.entries["${plugin.id}"] is not present; this is acceptable if the plugin is not installed, but explicit enabled:false is safer for audited setups.`,
-      );
-    }
   }
 
   const capabilities = {

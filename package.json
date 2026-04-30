@@ -35,6 +35,12 @@
     "failure-corpus": "npm run build && node dist/src/tests/test-failure-corpus.js",
     "check": "npm test && npm run eval:memory && npm run benchmark && npm audit --omit=dev",
     "eval:locomo:build": "npm run build && node dist/src/evals/build-locomo-medium-suite.js",
-    "eval:locomo": "npm run eval:locomo:build && node dist/src/evals/run-eval-suite.js --suite artifacts/evals/locomo-medium-suite.json --report-prefix locomo-medium-eval-report"
+    "eval:locomo": "npm run eval:locomo:build && node dist/src/evals/run-eval-suite.js --suite artifacts/evals/locomo-medium-suite.json --report-prefix locomo-medium-eval-report",
+    "eval:locomo:standard": "npm run build && node scripts/run-locomo-standard.cjs",
+    "eval:longmemeval:standard": "npm run build && node scripts/run-longmemeval-siliconflow.cjs --data artifacts/datasets/longmemeval/longmemeval_s_cleaned.json --cases 500 --max-sessions 60",
+    "eval:personamem:standard": "npm run build && node scripts/run-personamem-standard.cjs",
+    "eval:prefeval10:standard": "npm run build && node scripts/run-prefeval10-standard.cjs",
+    "eval:standard:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-standard-benchmarks.ps1",
+    "eval:baseline:mini": "npm run build && node scripts/run-default-baseline-mini.cjs"
   }
 }

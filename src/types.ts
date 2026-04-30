@@ -307,7 +307,7 @@ export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "i
 export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
-export type RetrievalStrength = "off" | "light" | "auto" | "strict" | "forensic";
+export type RetrievalStrength = "low" | "medium" | "high" | "xhigh" | "custom";
 export type LlmPlannerMode = "off" | "shadow" | "auto";
 export type OpenClawNativeMode = "disabled" | "coexist" | "absorbed";
 export type RetrievalGraphProvider = "none" | "sqlite_graph" | "sqlite_edges" | "external";
@@ -315,10 +315,13 @@ export type RetrievalRagProvider = "none" | "sqlite_vec" | "brute_force" | "embe
 export type RetrievalRerankProvider = "none" | "deterministic" | "llm" | "specialist" | "model" | "external";
 export type EmbeddingProvider = "none" | "local_hash" | "external";
 export type GraphBuilderProvider = "none" | "deterministic" | "llm" | "external";
+export type EvidenceAnswerResolverProvider = "none" | "deterministic" | "llm" | "external";
 export type FeatureIsolationMode = "fail_closed" | "isolate_optional";
 export type HeavyRetrievalPolicy = "disabled" | "planner_only";
 export type HeavyRetrievalLanePolicy = "disabled" | "planner_only";
 export type RerankPlannerPolicy = "disabled" | "planner_only" | "candidate_overload_required";
+export type DagExpansionMode = "deterministic" | "planner_decides" | "delegated_agent";
+export type DagExpansionAgentProvider = "none" | "host_subagent" | "llm";
 export type BrainPackMode = "manual" | "scheduled";
 export type BrainPackRedactionMode = "strict" | "redact" | "report_only";
 export type BrainPackPrivateDataPolicy = "never" | "redacted_excerpt" | "private_archive_only";
@@ -869,6 +872,15 @@ export interface BridgeConfig {
   rerankModel?: string;
   rerankTimeoutMs: number;
   rerankFallbackToDeterministic: boolean;
+  evidenceAnswerResolverEnabled: boolean;
+  evidenceAnswerResolverProvider: EvidenceAnswerResolverProvider;
+  evidenceAnswerResolverModel?: string;
+  evidenceAnswerResolverTimeoutMs: number;
+  evidenceAnswerResolverFallbackToDeterministic: boolean;
+  dagExpansionMode: DagExpansionMode;
+  dagExpansionAgentProvider: DagExpansionAgentProvider;
+  dagExpansionAgentModel?: string;
+  dagExpansionAgentTimeoutMs: number;
   featureIsolationMode: FeatureIsolationMode;
   heavyRetrievalPolicy: HeavyRetrievalPolicy;
   ragPlannerPolicy: HeavyRetrievalLanePolicy;
@@ -884,6 +896,15 @@ export interface BridgeConfig {
   sqliteJournalMode: "delete" | "wal";
 }
 
+export interface DagExpansionExecution {
+  requestedMode: "deterministic" | "delegated_agent";
+  executedMode: "deterministic" | "delegated_agent";
+  agentProvider: DagExpansionAgentProvider;
+  status: "not_requested" | "answered" | "fallback_deterministic" | "safe_no_answer";
+  reason: string;
+  selectedSummaryIds: string[];
+}
+
 export interface RecallResult {
   items: ContextItem[];
   consumedTokens: number;
@@ -892,6 +913,7 @@ export interface RecallResult {
   answerCandidates?: AnswerCandidate[];
   strategy?: "raw_first" | "summary_navigation";
   rawCandidateCount?: number;
+  dagExpansion?: DagExpansionExecution;
 }
 
 export interface ProgressiveRetrievalStepRecord {
@@ -1017,6 +1039,12 @@ export interface RetrievalDecision {
     }>;
     stopCondition: string;
     sourceTraceRequired: boolean;
+    dagExpansion: {
+      mode: "deterministic" | "delegated_agent";
+      agentProvider: DagExpansionAgentProvider;
+      fallbackMode: "deterministic" | "safe_no_answer";
+      reason: string;
+    };
     fallback?: {
       reason: string;
       from: string;

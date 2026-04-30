@@ -12,34 +12,7 @@ export interface RetrievalPolicy {
 export class RetrievalPolicyResolver {
   resolve(strength: RetrievalStrength): RetrievalPolicy {
     switch (strength) {
-      case "off":
-        return {
-          strength,
-          sourceTraceRequired: false,
-          fullRawTraceRequired: false,
-          allowSummaryOnlyFinalFact: false,
-          allowUnverifiedHint: false,
-          evidencePresentation: "none",
-        };
-      case "strict":
-        return {
-          strength,
-          sourceTraceRequired: true,
-          fullRawTraceRequired: false,
-          allowSummaryOnlyFinalFact: false,
-          allowUnverifiedHint: false,
-          evidencePresentation: "show_when_needed",
-        };
-      case "forensic":
-        return {
-          strength,
-          sourceTraceRequired: true,
-          fullRawTraceRequired: true,
-          allowSummaryOnlyFinalFact: false,
-          allowUnverifiedHint: false,
-          evidencePresentation: "show_source_trace",
-        };
-      case "light":
+      case "low":
         return {
           strength,
           sourceTraceRequired: false,
@@ -48,7 +21,34 @@ export class RetrievalPolicyResolver {
           allowUnverifiedHint: true,
           evidencePresentation: "hidden_by_default",
         };
-      case "auto":
+      case "high":
+        return {
+          strength,
+          sourceTraceRequired: true,
+          fullRawTraceRequired: true,
+          allowSummaryOnlyFinalFact: false,
+          allowUnverifiedHint: false,
+          evidencePresentation: "show_source_trace",
+        };
+      case "xhigh":
+        return {
+          strength,
+          sourceTraceRequired: true,
+          fullRawTraceRequired: true,
+          allowSummaryOnlyFinalFact: false,
+          allowUnverifiedHint: false,
+          evidencePresentation: "show_source_trace",
+        };
+      case "custom":
+        return {
+          strength,
+          sourceTraceRequired: false,
+          fullRawTraceRequired: false,
+          allowSummaryOnlyFinalFact: true,
+          allowUnverifiedHint: true,
+          evidencePresentation: "hidden_by_default",
+        };
+      case "medium":
       default:
         return {
           strength,

@@ -1,6 +1,8 @@
 import {
   HeavyRetrievalLanePolicy,
   HeavyRetrievalPolicy,
+  DagExpansionAgentProvider,
+  DagExpansionMode,
   MemoryItemKind,
   RerankPlannerPolicy,
   RetrievalRoute,
@@ -110,6 +112,8 @@ export interface PlannerRuntimeSignals {
   strictModeRequiresRerankOnConflict?: boolean;
   estimatedCandidateCount?: number;
   candidateOverload?: boolean;
+  dagExpansionMode?: DagExpansionMode;
+  dagExpansionAgentProvider?: DagExpansionAgentProvider;
 }
 
 export interface ContextBudgetIntent {
@@ -159,6 +163,12 @@ export interface LlmPlannerPlan {
   retrieval: {
     strength: RetrievalStrength;
     sourceTraceRequired: boolean;
+    dagExpansion: {
+      mode: "deterministic" | "delegated_agent";
+      agentProvider: DagExpansionAgentProvider;
+      fallbackMode: "deterministic" | "safe_no_answer";
+      reason: string;
+    };
     candidateLayers: PlannerCandidateLayer[];
     routePlan: PlannerRouteStep[];
     progressive: boolean;

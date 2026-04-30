@@ -108,12 +108,13 @@ export class LLMPlanner {
   ): LlmPlannerPlan {
     const intent = this.classifyIntent(input.query, input.signals, input.deterministicDecision.route);
     const sourceTraceRequired =
-      input.signals.retrievalStrength === "strict" ||
-      input.signals.retrievalStrength === "forensic" ||
+      input.signals.retrievalStrength === "high" ||
+      input.signals.retrievalStrength === "xhigh" ||
       intent.primary === "precision_fact" ||
       intent.primary === "history_trace" ||
       (intent.primary === "architecture_reasoning" && HIGH_CONSTRAINT_RE.test(input.query));
     const candidateLayers = this.resolveCandidateLayers(input.query, input.deterministicDecision, intent.primary, input.signals, sourceTraceRequired);
+    const dagExpansion = this.resolveDagExpansion(input.query, input.signals, intent.primary, sourceTraceRequired);
     const routePlan = this.buildRouteSteps(candidateLayers, input.signals, sourceTraceRequired, intent.primary);
     const activation = this.activationPolicy.decide(input.query, input.signals);
     const context = this.buildContextBudget(input.signals, sourceTraceRequired);
@@ -128,6 +129,7 @@ export class LLMPlanner {
       retrieval: {
         strength: input.signals.retrievalStrength,
         sourceTraceRequired,
+        dagExpansion,
         candidateLayers,
         routePlan,
         progressive: candidateLayers.length > 1 || sourceTraceRequired,
@@ -144,7 +146,7 @@ export class LLMPlanner {
         markdownRuntimeFactSource: false,
         toolOutputAsSource: false,
         currentInstructionProtected: true,
-        summaryOnlyFinalFactAllowed: input.signals.retrievalStrength !== "forensic",
+        summaryOnlyFinalFactAllowed: input.signals.retrievalStrength !== "xhigh",
       },
       explain: {
         shortReason: this.explainIntent(intent.primary, input.deterministicDecision.route, sourceTraceRequired),
@@ -218,7 +220,7 @@ export class LLMPlanner {
     if (CONFLICT_RE.test(query) && HISTORY_RE.test(query)) return "history_trace";
     if (DEBUG_RE.test(query)) return "debug_runtime";
     if (HIGH_CONSTRAINT_RE.test(query)) return "architecture_reasoning";
-    if (signals.retrievalStrength === "strict" || signals.retrievalStrength === "forensic" || PRECISION_RE.test(query)) {
+    if (signals.retrievalStrength === "high" || signals.retrievalStrength === "xhigh" || PRECISION_RE.test(query)) {
       return HISTORY_RE.test(query) ? "history_trace" : "precision_fact";
     }
     if (PROJECT_RE.test(query) || deterministicRoute === "project_registry") {
@@ -345,6 +347,48 @@ export class LLMPlanner {
       );
   }
 
+  private resolveDagExpansion(
+    query: string,
+    signals: PlannerRuntimeSignals,
+    intent: PlannerIntent,
+    sourceTraceRequired: boolean,
+  ): LlmPlannerPlan["retrieval"]["dagExpansion"] {
+    const configuredMode = signals.dagExpansionMode ?? "deterministic";
+    const agentProvider = signals.dagExpansionAgentProvider ?? "none";
+    const agentConfigured = agentProvider !== "none";
+    const shouldDelegate =
+      sourceTraceRequired &&
+      agentConfigured &&
+      (
+        configuredMode === "delegated_agent" ||
+        (configuredMode === "planner_decides" && (
+          signals.queryComplexity === "high" ||
+          intent === "architecture_reasoning" ||
+          intent === "history_trace" ||
+          GRAPH_RELATION_RE.test(query) ||
+          Boolean(signals.candidateOverload)
+        ))
+      );
+
+    if (shouldDelegate) {
+      return {
+        mode: "delegated_agent",
+        agentProvider,
+        fallbackMode: "deterministic",
+        reason: "Planner selected delegated DAG expansion for a source-sensitive complex/multi-hop recall; deterministic expansion remains the safe fallback.",
+      };
+    }
+
+    return {
+      mode: "deterministic",
+      agentProvider,
+      fallbackMode: "deterministic",
+      reason: agentConfigured
+        ? "Planner selected in-process deterministic DAG expansion for this query."
+        : "Delegated DAG expansion is not configured; use deterministic SummaryDagResolver/SourceMessageResolver.",
+    };
+  }
+
   private buildRouteSteps(
     layers: PlannerCandidateLayer[],
     signals: PlannerRuntimeSignals,
@@ -455,6 +499,7 @@ export class LLMPlanner {
     const primary = this.asPlannerIntent(intentRecord.primary) ?? basePlan.intent.primary;
     const confidence = this.asNumber(intentRecord.confidence) ?? basePlan.intent.confidence;
     const candidateLayers = this.asCandidateLayerArray(retrievalRecord.candidateLayers) ?? basePlan.retrieval.candidateLayers;
+    const dagExpansion = this.mergeDagExpansion(basePlan.retrieval.dagExpansion, retrievalRecord);
     const sourceTraceRequired = typeof retrievalRecord.sourceTraceRequired === "boolean"
       ? retrievalRecord.sourceTraceRequired
       : basePlan.retrieval.sourceTraceRequired;
@@ -476,6 +521,7 @@ export class LLMPlanner {
       retrieval: {
         ...basePlan.retrieval,
         sourceTraceRequired,
+        dagExpansion,
         candidateLayers,
         routePlan: this.buildRouteSteps(candidateLayers, {
           ...basePlanToSignals(basePlan),
@@ -500,6 +546,29 @@ export class LLMPlanner {
     };
   }
 
+  private mergeDagExpansion(
+    base: LlmPlannerPlan["retrieval"]["dagExpansion"],
+    retrievalRecord: Record<string, unknown>,
+  ): LlmPlannerPlan["retrieval"]["dagExpansion"] {
+    const nested = this.asRecord(retrievalRecord.dagExpansion);
+    const rawMode = this.asString(nested.mode) ?? this.asString(retrievalRecord.dagExpansionMode);
+    if (rawMode !== "delegated_agent" && rawMode !== "deterministic") {
+      return base;
+    }
+    if (rawMode === "delegated_agent" && base.agentProvider === "none") {
+      return {
+        ...base,
+        mode: "deterministic",
+        reason: "LLMPlanner requested delegated DAG expansion, but no delegated expansion provider is configured; deterministic expansion is enforced.",
+      };
+    }
+    return {
+      ...base,
+      mode: rawMode,
+      reason: this.asString(nested.reason) ?? this.asString(retrievalRecord.dagExpansionReason) ?? base.reason,
+    };
+  }
+
   private parsePlannerJson(raw: string): Record<string, unknown> | null {
     const trimmed = raw.trim();
     const start = trimmed.indexOf("{");
@@ -515,7 +584,7 @@ export class LLMPlanner {
 
   private intentConfidence(query: string, signals: PlannerRuntimeSignals, intent: PlannerIntent): number {
     let score = 0.62;
-    if (signals.retrievalStrength === "strict" || signals.retrievalStrength === "forensic") score += 0.12;
+    if (signals.retrievalStrength === "high" || signals.retrievalStrength === "xhigh") score += 0.12;
     if (signals.hasMemoryItemHits || signals.hasProjectRegistry || signals.hasCompactedHistory) score += 0.08;
     if (PRECISION_RE.test(query) || HISTORY_RE.test(query) || PROJECT_RE.test(query)) score += 0.1;
     if (intent === "casual") score = 0.72;
@@ -577,7 +646,7 @@ export class LLMPlanner {
         return "Use BaseSummary as a navigation map into older source.";
       case "raw_sources":
         return sourceTraceRequired
-          ? "Raw source trace is required before final exact/strict/forensic answer."
+          ? "Raw source trace is required before final exact/high/xhigh answer."
           : "Raw source can expand a summary or memory hint if needed.";
       case "knowledge_export_index":
         return "Knowledge/Markdown index is export-only and advisory, never runtime fact authority.";
@@ -708,5 +777,7 @@ function basePlanToSignals(plan: LlmPlannerPlan): PlannerRuntimeSignals {
     laneCandidateRerankThreshold: 10,
     candidateAmbiguityMargin: 0.08,
     strictModeRequiresRerankOnConflict: true,
+    dagExpansionMode: "deterministic",
+    dagExpansionAgentProvider: "none",
   };
 }

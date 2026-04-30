@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { ContextItem, LoggerLike } from "./types";
 import {
   ConsoleLogger,
@@ -8,7 +10,7 @@ import {
   OpenClawPayloadAdapter,
   ToolConfigResult,
 } from "./host/OpenClawPayloadAdapter";
-import { OpenClawApiLike } from "./host/OpenClawHostTypes";
+import { OpenClawApiLike, OpenClawCliCommandLike } from "./host/OpenClawHostTypes";
 import {
   formatOpenClawCompatibilityFailure,
   OPENCLAW_COMPATIBILITY_PLUGIN_IDS,
@@ -20,6 +22,34 @@ import { createRuntimeLayerDependencies } from "./runtime/createRuntimeLayerDepe
 import { ChaunyomsRetrievalService } from "./runtime/ChaunyomsRetrievalService";
 import { StablePrefixAdapter } from "./data/StablePrefixAdapter";
 import { OmsTestService } from "./runtime/OmsTestService";
+
+interface OpenClawMemoryManagerSearchOptions {
+  maxResults?: unknown;
+  limit?: unknown;
+  minScore?: unknown;
+  onDebug?: (event: Record<string, unknown>) => void;
+}
+
+interface OpenClawMemoryManagerReadParams {
+  relPath?: unknown;
+  from?: unknown;
+  lines?: unknown;
+}
+
+interface OpenClawMemoryManagerSearchResult {
+  path: string;
+  startLine: number;
+  endLine: number;
+  score: number;
+  snippet: string;
+  source: string;
+  citation?: Record<string, unknown>;
+}
+
+interface BridgeToolResponse {
+  content?: Array<Record<string, unknown>>;
+  details?: Record<string, unknown>;
+}
 
 export class OpenClawBridge {
   private api?: OpenClawApiLike;
@@ -103,6 +133,7 @@ export class OpenClawBridge {
       });
     }
 
+    this.registerCli(api);
     this.registerMemorySlot(api);
 
     if (typeof api?.registerContextEngine === "function") {
@@ -209,6 +240,208 @@ export class OpenClawBridge {
     return { ok: true };
   }
 
+  private registerCli(api: OpenClawApiLike): void {
+    if (typeof api.registerCli !== "function") {
+      this.logger.info("openclaw_cli_registration_skipped", {
+        reason: "host_missing_registerCli",
+      });
+      return;
+    }
+
+    api.registerCli((ctx) => {
+      const program = ctx.program;
+      const memory = program
+        .command("memory")
+        .description("ChaunyOMS-backed OpenClaw memory facade. SQLite is authoritative; Markdown is export-only.");
+
+      memory
+        .command("status")
+        .description("Show ChaunyOMS memory/runtime status without touching OpenClaw memory-core files")
+        .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+        .option("--json", "Print JSON")
+        .option("--deep", "Include readiness details", false)
+        .option("--index", "Reindex OMS asset indexes before status", false)
+        .option("--fix", "Compatibility no-op; OMS status is source-of-truth", false)
+        .option("--verbose", "Verbose logging", false)
+        .action(async (opts: unknown) => {
+          const options = this.asRecord(opts);
+          if (this.asBoolean(options.index, false)) {
+            await this.retrieval.executeOpenClawMemoryIndex(this.buildCliPayload(options));
+          }
+          await this.printCliToolResponse(
+            await this.retrieval.executeOpenClawMemoryStatus(this.buildCliPayload(options)),
+            this.asBoolean(options.json, false),
+          );
+        });
+
+      memory
+        .command("search [query]")
+        .description("Search ChaunyOMS MemoryItems, summaries, raw source ledger, and optional retrieval enhancements")
+        .option("--query <text>", "Search query (alternative to positional argument)")
+        .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+        .option("--max-results <n>", "Max results", (value: string) => Number(value))
+        .option("--min-score <n>", "Minimum score", (value: string) => Number(value))
+        .option("--json", "Print JSON")
+        .action(async (queryArg: unknown, opts: unknown) => {
+          const options = this.asRecord(opts);
+          const query = typeof queryArg === "string" && queryArg.trim().length > 0
+            ? queryArg
+            : typeof options.query === "string"
+              ? options.query
+              : "";
+          await this.printCliToolResponse(
+            await this.retrieval.executeOpenClawMemorySearch({
+              ...this.buildCliPayload(options),
+              query,
+              maxResults: options.maxResults,
+              minScore: options.minScore,
+            }),
+            this.asBoolean(options.json, false),
+          );
+        });
+
+      memory
+        .command("index")
+        .description("Rebuild ChaunyOMS SQLite asset/search indexes; never regenerates Source from Markdown")
+        .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+        .option("--force", "Compatibility flag; OMS reindex is explicit and deterministic", false)
+        .option("--json", "Print JSON")
+        .option("--verbose", "Verbose logging", false)
+        .action(async (opts: unknown) => {
+          const options = this.asRecord(opts);
+          await this.printCliToolResponse(
+            await this.retrieval.executeOpenClawMemoryIndex(this.buildCliPayload(options)),
+            this.asBoolean(options.json, false),
+          );
+        });
+
+      memory
+        .command("promote")
+        .description("List or approve governed ChaunyOMS knowledge candidates")
+        .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+        .option("--id <id>", "Candidate id to approve when --apply is passed")
+        .option("--limit <n>", "Max candidates", (value: string) => Number(value))
+        .option("--min-score <n>", "Minimum score", (value: string) => Number(value))
+        .option("--min-recall-count <n>", "Compatibility flag for OpenClaw memory-core promote")
+        .option("--apply", "Approve the candidate identified by --id", false)
+        .option("--include-promoted", "Include promoted candidates", false)
+        .option("--json", "Print JSON")
+        .action(async (opts: unknown) => {
+          const options = this.asRecord(opts);
+          await this.printCliToolResponse(
+            await this.retrieval.executeOpenClawMemoryPromote({
+              ...this.buildCliPayload(options),
+              id: options.id,
+              limit: options.limit,
+              minScore: options.minScore,
+              includePromoted: options.includePromoted,
+              apply: options.apply,
+            }),
+            this.asBoolean(options.json, false),
+          );
+        });
+
+      memory
+        .command("promote-explain [selector]")
+        .description("Explain ChaunyOMS candidate score/status/review state")
+        .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+        .option("--include-promoted", "Include promoted candidates", false)
+        .option("--json", "Print JSON")
+        .action(async (selector: unknown, opts: unknown) => {
+          const options = this.asRecord(opts);
+          await this.printCliToolResponse(
+            await this.retrieval.executeOpenClawMemoryPromoteExplain({
+              ...this.buildCliPayload(options),
+              selector,
+              includePromoted: options.includePromoted,
+            }),
+            this.asBoolean(options.json, false),
+          );
+        });
+
+      const oms = program
+        .command("oms")
+        .description("ChaunyOMS diagnostics and OpenClaw compatibility commands");
+      this.registerSimpleOmsCliCommand(oms, "status", "Show OMS runtime status", "executeOmsStatus");
+      this.registerSimpleOmsCliCommand(oms, "doctor", "Run OMS doctor checks", "executeOmsDoctor");
+      this.registerSimpleOmsCliCommand(oms, "verify", "Verify OMS source trace integrity", "executeOmsVerify");
+      this.registerSimpleOmsCliCommand(oms, "setup-guide", "Print OMS/OpenClaw setup guidance", "executeOmsSetupGuide");
+    }, {
+      commands: ["memory", "oms"],
+      descriptors: [
+        {
+          name: "memory",
+          description: "ChaunyOMS-backed OpenClaw memory facade",
+          hasSubcommands: true,
+        },
+        {
+          name: "oms",
+          description: "ChaunyOMS diagnostics and compatibility commands",
+          hasSubcommands: true,
+        },
+      ],
+    });
+    this.logger.info("openclaw_cli_registered", {
+      commands: ["memory", "oms"],
+      markdownHotPath: false,
+    });
+  }
+
+  private registerSimpleOmsCliCommand(
+    root: OpenClawCliCommandLike,
+    name: string,
+    description: string,
+    method: "executeOmsStatus" | "executeOmsDoctor" | "executeOmsVerify" | "executeOmsSetupGuide",
+  ): void {
+    root
+      .command(name)
+      .description(description)
+      .option("--agent <id>", "Agent id (default: OMS/OpenClaw configured agent)")
+      .option("--scope <scope>", "Scope: agent or session")
+      .option("--json", "Print JSON")
+      .action(async (opts: unknown) => {
+        const options = this.asRecord(opts);
+        await this.printCliToolResponse(
+          await this.retrieval[method](this.buildCliPayload(options)),
+          this.asBoolean(options.json, false),
+        );
+      });
+  }
+
+  private buildCliPayload(options: Record<string, unknown>): Record<string, unknown> {
+    const config: Record<string, unknown> = {};
+    if (typeof options.agent === "string" && options.agent.trim().length > 0) {
+      config.agentId = options.agent.trim();
+    }
+    return {
+      config,
+      scope: typeof options.scope === "string" ? options.scope : "agent",
+      deep: options.deep,
+      verbose: options.verbose,
+      force: options.force,
+    };
+  }
+
+  private async printCliToolResponse(response: BridgeToolResponse, json: boolean): Promise<void> {
+    const details = response.details ?? {};
+    if (json) {
+      process.stdout.write(`${JSON.stringify(details, null, 2)}\n`);
+    } else {
+      const text = response.content
+        ?.map((item) => typeof item.text === "string" ? item.text : "")
+        .filter((line) => line.length > 0)
+        .join("\n\n");
+      process.stdout.write(`${text && text.length > 0 ? text : JSON.stringify(details, null, 2)}\n`);
+    }
+    if (details.ok === false) {
+      process.exitCode = 1;
+    }
+  }
+
+  private asBoolean(value: unknown, fallback: boolean): boolean {
+    return typeof value === "boolean" ? value : fallback;
+  }
+
   private registerMemorySlot(api: OpenClawApiLike): void {
     const capability = this.buildOpenClawMemoryCapability();
     const promptBuilder = capability.promptBuilder;
@@ -290,6 +523,17 @@ export class OpenClawBridge {
       await this.retrieval.executeOpenClawMemoryPromoteExplain(args);
     const nativeAbsorb = async (args?: unknown) =>
       await this.retrieval.executeOmsNativeAbsorb(args);
+    const getMemorySearchManager = async (args?: unknown) => ({
+      manager: this.buildOpenClawMemorySearchManager(
+        args,
+        memorySearch,
+        memoryGet,
+        memoryIndex,
+      ),
+    });
+    const resolveMemoryBackendConfig = (args?: unknown) =>
+      this.resolveOpenClawMemoryBackendConfig(args);
+    const closeAllMemorySearchManagers = async () => {};
     const promptBuilder = async (_payload?: unknown) => ({
       id: "oms",
       pluginId: "oms",
@@ -339,6 +583,9 @@ export class OpenClawBridge {
       memoryPromoteExplain,
       nativeAbsorb,
       absorbNative: nativeAbsorb,
+      getMemorySearchManager,
+      resolveMemoryBackendConfig,
+      closeAllMemorySearchManagers,
     };
     return {
       id: "oms",
@@ -362,6 +609,281 @@ export class OpenClawBridge {
       memorySearch,
       memoryGet,
     };
+  }
+
+  private buildOpenClawMemorySearchManager(
+    managerParams: unknown,
+    memorySearch: (args?: unknown) => Promise<unknown>,
+    memoryGet: (args?: unknown) => Promise<unknown>,
+    memoryIndex: (args?: unknown) => Promise<unknown>,
+  ): Record<string, unknown> {
+    const agentId = this.resolveOpenClawManagerAgentId(managerParams);
+    return {
+      search: async (
+        query: unknown,
+        options?: OpenClawMemoryManagerSearchOptions,
+      ): Promise<OpenClawMemoryManagerSearchResult[]> => {
+        const normalizedQuery = typeof query === "string" ? query.trim() : String(query ?? "").trim();
+        if (!normalizedQuery) {
+          return [];
+        }
+        options?.onDebug?.({
+          backend: "oms",
+          pluginId: "oms",
+          markdownHotPath: false,
+        });
+        const maxResults = this.resolveOpenClawManagerMaxResults(options);
+        const result = await memorySearch({
+          query: normalizedQuery,
+          limit: maxResults,
+          maxResults,
+          agentId,
+        });
+        return this.toOpenClawMemoryManagerSearchResults(
+          normalizedQuery,
+          result,
+          maxResults,
+        );
+      },
+      readFile: async (
+        params: OpenClawMemoryManagerReadParams,
+      ): Promise<{ text: string; path: string }> => {
+        const relPath = typeof params?.relPath === "string" ? params.relPath : "";
+        const query = this.decodeOpenClawMemoryQueryPath(relPath);
+        const result = query
+          ? await memorySearch({ query, agentId })
+          : await memoryGet({
+              ref: relPath,
+              id: relPath,
+              path: relPath,
+              full: true,
+              agentId,
+            });
+        return {
+          path: relPath,
+          text: this.sliceOpenClawManagerText(
+            this.extractToolResponseText(result),
+            params?.from,
+            params?.lines,
+          ),
+        };
+      },
+      status: (): Record<string, unknown> =>
+        this.buildOpenClawMemoryManagerStatus(managerParams, agentId),
+      sync: async (): Promise<void> => {
+        await memoryIndex({
+          reason: "openclaw-memory-manager-sync",
+          agentId,
+        });
+      },
+      probeEmbeddingAvailability: async (): Promise<Record<string, unknown>> => ({
+        ok: true,
+        provider: "oms",
+        model: this.runtime.getConfig().embeddingModel,
+        note:
+          "ChaunyOMS owns embedding/index readiness; OpenClaw native embedding provider is not required for the OMS runtime.",
+      }),
+      probeVectorAvailability: async (): Promise<boolean> =>
+        this.runtime.getConfig().ragEnabled && Boolean(this.runtime.getConfig().vectorExtensionPath),
+      close: async (): Promise<void> => {},
+    };
+  }
+
+  private resolveOpenClawMemoryBackendConfig(params?: unknown): Record<string, unknown> {
+    const record = this.asRecord(params);
+    const cfg = this.asRecord(record.cfg);
+    const memory = this.asRecord(cfg.memory);
+    const citations = typeof memory.citations === "string" ? memory.citations : "auto";
+    return {
+      // OpenClaw currently branches only on its native "qmd" backend. Returning
+      // the compatible non-qmd shape keeps native repair/audit paths from trying
+      // to own the store while the runtime status below still declares OMS as the
+      // authoritative memory manager.
+      backend: "builtin",
+      citations,
+      custom: {
+        activeRuntime: "oms",
+        authoritativeBackend: "chaunyoms-sqlite",
+        markdownHotPath: false,
+      },
+    };
+  }
+
+  private buildOpenClawMemoryManagerStatus(
+    managerParams: unknown,
+    agentId?: string,
+  ): Record<string, unknown> {
+    const config = this.runtime.getConfig();
+    const purpose = this.asRecord(managerParams).purpose;
+    const effectiveAgentId = agentId || config.agentId;
+    const dbPath = path.join(
+      config.dataDir,
+      "agents",
+      effectiveAgentId,
+      "chaunyoms-runtime.sqlite",
+    );
+    return {
+      backend: "oms",
+      files: 0,
+      chunks: 0,
+      dirty: false,
+      // OpenClaw doctor asks the active memory manager for a "status" context
+      // and then runs native memory-core artifact audits against workspaceDir.
+      // In authoritative OMS mode memory-core is intentionally disabled, so do
+      // not hand that native audit path a workspace. The real OMS workspace is
+      // still exposed below under custom.omsWorkspaceDir and through oms_status.
+      workspaceDir: purpose === "status" ? "" : config.workspaceDir,
+      dbPath,
+      provider: "oms",
+      model: "chaunyoms-sqlite",
+      requestedProvider: "oms",
+      sources: [
+        "source_messages",
+        "base_summaries",
+        "memory_items",
+        "evidence_atoms",
+        "retrieval_enhancements",
+      ],
+      extraPaths: [],
+      sourceCounts: {},
+      cache: {
+        enabled: false,
+        maxEntries: 0,
+      },
+      fts: {
+        enabled: true,
+        available: true,
+      },
+      vector: {
+        enabled: config.ragEnabled,
+        available: config.ragEnabled && Boolean(config.vectorExtensionPath),
+        extensionPath: config.vectorExtensionPath,
+        dims: config.embeddingDimensions,
+      },
+      custom: {
+        pluginId: "oms",
+        managerPurpose: purpose ?? null,
+        omsWorkspaceDir: config.workspaceDir,
+        markdownHotPath: false,
+        authoritativeSource: "ChaunyOMS SQLite MemoryItem/BaseSummary/Source",
+        featureIsolationMode: config.featureIsolationMode,
+        heavyRetrievalPolicy: config.heavyRetrievalPolicy,
+        graphEnabled: config.graphEnabled,
+        ragEnabled: config.ragEnabled,
+        rerankEnabled: config.rerankEnabled,
+      },
+    };
+  }
+
+  private toOpenClawMemoryManagerSearchResults(
+    query: string,
+    response: unknown,
+    maxResults: number,
+  ): OpenClawMemoryManagerSearchResult[] {
+    const responseRecord = this.asRecord(response);
+    const details = this.asRecord(responseRecord.details);
+    const hitCount = this.optionalNumber(details.hitCount) ??
+      this.optionalNumber(details.memoryItemHitCount) ??
+      this.optionalNumber(details.itemCount) ??
+      0;
+    const text = this.extractToolResponseText(response).trim();
+    if (!text || hitCount <= 0 || /^No standard retrieval hit found/i.test(text)) {
+      return [];
+    }
+    const lines = text.split(/\r?\n/);
+    return [{
+      path: this.encodeOpenClawMemoryQueryPath(query),
+      startLine: 1,
+      endLine: Math.max(1, lines.length),
+      score: this.resolveOpenClawManagerScore(details),
+      snippet: this.truncateOpenClawManagerSnippet(text),
+      source: String(details.retrievalHitType ?? details.route ?? "oms"),
+      citation: {
+        runtime: "oms",
+        query,
+        toolCompatibility: details.toolCompatibility ?? null,
+      },
+    }].slice(0, maxResults);
+  }
+
+  private resolveOpenClawManagerAgentId(params: unknown): string | undefined {
+    const record = this.asRecord(params);
+    const agentId = record.agentId;
+    return typeof agentId === "string" && agentId.trim().length > 0
+      ? agentId.trim()
+      : undefined;
+  }
+
+  private resolveOpenClawManagerMaxResults(
+    options?: OpenClawMemoryManagerSearchOptions,
+  ): number {
+    const raw = this.optionalNumber(options?.maxResults) ?? this.optionalNumber(options?.limit) ?? 10;
+    return Math.max(1, Math.min(50, Math.floor(raw)));
+  }
+
+  private resolveOpenClawManagerScore(details: Record<string, unknown>): number {
+    const explicit = this.optionalNumber(details.score);
+    if (explicit !== undefined && Number.isFinite(explicit)) {
+      return Math.max(0.01, Math.min(1, explicit));
+    }
+    const hitCount = this.optionalNumber(details.hitCount) ?? 1;
+    return Math.max(0.2, Math.min(1, hitCount / Math.max(hitCount, 1)));
+  }
+
+  private extractToolResponseText(response: unknown): string {
+    const content = this.asRecord(response).content;
+    if (!Array.isArray(content)) {
+      return "";
+    }
+    return content
+      .map((item) => {
+        const record = this.asRecord(item);
+        return typeof record.text === "string" ? record.text : "";
+      })
+      .filter((text) => text.length > 0)
+      .join("\n\n");
+  }
+
+  private encodeOpenClawMemoryQueryPath(query: string): string {
+    return `oms/query/${Buffer.from(query, "utf8").toString("base64url")}.md`;
+  }
+
+  private decodeOpenClawMemoryQueryPath(relPath: string): string | null {
+    const match = /^oms\/query\/([^/]+)\.md$/i.exec(relPath.replace(/\\/g, "/"));
+    if (!match) {
+      return null;
+    }
+    try {
+      return Buffer.from(match[1], "base64url").toString("utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  private sliceOpenClawManagerText(
+    text: string,
+    from: unknown,
+    lines: unknown,
+  ): string {
+    const start = Math.max(1, Math.floor(this.optionalNumber(from) ?? 1));
+    const count = Math.max(1, Math.floor(this.optionalNumber(lines) ?? text.split(/\r?\n/).length));
+    return text.split(/\r?\n/).slice(start - 1, start - 1 + count).join("\n");
+  }
+
+  private truncateOpenClawManagerSnippet(text: string): string {
+    const maxChars = 700;
+    return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
+  }
+
+  private optionalNumber(value: unknown): number | undefined {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    return undefined;
   }
 
   private normalizeMemoryRuntimeArgs(

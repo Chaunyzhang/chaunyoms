@@ -41,6 +41,9 @@ export class RecallQueryAnalyzer {
     if (options.allowRawFirst === false) {
       return false;
     }
+    if (options.requireRawSource) {
+      return true;
+    }
     // Raw-first history QA is intentionally scoped. Agent-level calls may still
     // use raw-first when SQLite/FTS has already narrowed the candidate ids; that
     // preserves exact marker recall without wide-scanning unrelated sessions.

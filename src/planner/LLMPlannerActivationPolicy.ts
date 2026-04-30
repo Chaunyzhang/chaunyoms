@@ -37,14 +37,6 @@ export class LLMPlannerActivationPolicy {
       };
     }
 
-    if (signals.retrievalStrength === "off") {
-      return {
-        mode: "bypass",
-        reason: "retrievalStrength=off; no memory, summary, source, or planner recall is allowed.",
-        llmInvoked: false,
-        triggers: ["retrieval_off"],
-      };
-    }
 
     if (EXPLICIT_TOOL_RE.test(normalized) || ID_LOOKUP_RE.test(normalized)) {
       return {
@@ -55,7 +47,7 @@ export class LLMPlannerActivationPolicy {
       };
     }
 
-    if (signals.retrievalStrength === "strict" || signals.retrievalStrength === "forensic") {
+    if (signals.retrievalStrength === "high" || signals.retrievalStrength === "xhigh") {
       triggers.push(`${signals.retrievalStrength}_requires_evidence_planning`);
     }
     if (PRECISION_FACT_RE.test(normalized)) {

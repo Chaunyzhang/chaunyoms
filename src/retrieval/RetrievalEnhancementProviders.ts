@@ -3,7 +3,7 @@
 export interface RetrievalEnhancementLaneStatus {
   enabled: boolean;
   provider: string;
-  authority: "candidate_only" | "ordering_only";
+  authority: "candidate_only" | "ordering_only" | "answer_resolution";
   active: boolean;
   fallback?: string;
   notes?: string[];
@@ -44,6 +44,10 @@ export interface RetrievalEnhancementStatus {
     minConfidence: number;
     candidateLimit: number;
     allowedRelations: string[];
+  };
+  evidenceAnswerResolver: RetrievalEnhancementLaneStatus & {
+    model?: string;
+    timeoutMs: number;
   };
   featureIsolationMode: BridgeConfig["featureIsolationMode"];
   maxEnhancementLatencyMs: number;
@@ -139,7 +143,7 @@ export class RetrievalEnhancementRegistry {
         enabled: config.graphEnabled,
         provider: config.graphProvider,
         authority: "candidate_only",
-        active: config.graphEnabled && config.graphProvider !== "none",
+        active: config.graphEnabled && (config.graphProvider === "sqlite_graph" || config.graphProvider === "sqlite_edges"),
         notes: config.graphProvider === "sqlite_edges"
           ? ["sqlite_edges is accepted as a compatibility alias; sqlite_graph is the final associative graph provider."]
           : [],
@@ -148,8 +152,8 @@ export class RetrievalEnhancementRegistry {
         enabled: config.ragEnabled,
         provider: config.ragProvider,
         authority: "candidate_only",
-        active: config.ragEnabled && config.ragProvider !== "none",
-        fallback: config.ragFallbackToBruteForce ? "brute_force" : undefined,
+        active: config.ragEnabled && config.ragProvider !== "none" && config.embeddingEnabled && config.embeddingProvider !== "none",
+        fallback: config.ragFallbackToBruteForce ? "brute_force_explicit" : undefined,
         embeddingEnabled: config.embeddingEnabled,
         embeddingProvider: config.embeddingProvider,
         embeddingModel: config.embeddingModel,
@@ -162,8 +166,8 @@ export class RetrievalEnhancementRegistry {
         enabled: config.rerankEnabled,
         provider: config.rerankProvider,
         authority: "ordering_only",
-        active: config.rerankEnabled && config.rerankProvider !== "none",
-        fallback: config.rerankFallbackToDeterministic ? "deterministic" : undefined,
+        active: config.rerankEnabled && config.rerankProvider === "deterministic",
+        fallback: config.rerankFallbackToDeterministic ? "deterministic_explicit" : undefined,
         maxCandidates: config.maxRerankCandidates,
         rerankModel: config.rerankModel,
         timeoutMs: config.rerankTimeoutMs,
@@ -171,12 +175,21 @@ export class RetrievalEnhancementRegistry {
       graphBuilder: {
         enabled: config.graphBuilderEnabled,
         provider: config.graphBuilderProvider,
-        active: config.graphBuilderEnabled && config.graphBuilderProvider !== "none",
+        active: config.graphBuilderEnabled && config.graphBuilderProvider === "deterministic",
         maxDepth: config.graphMaxDepth,
         maxFanout: config.graphMaxFanout,
         minConfidence: config.graphMinConfidence,
         candidateLimit: config.graphCandidateLimit,
         allowedRelations: config.graphAllowedRelations,
+      },
+      evidenceAnswerResolver: {
+        enabled: config.evidenceAnswerResolverEnabled,
+        provider: config.evidenceAnswerResolverProvider,
+        authority: "answer_resolution",
+        active: config.evidenceAnswerResolverEnabled && (config.evidenceAnswerResolverProvider === "deterministic" || Boolean(config.evidenceAnswerResolverModel?.trim())),
+        fallback: config.evidenceAnswerResolverFallbackToDeterministic ? "deterministic_explicit" : undefined,
+        model: config.evidenceAnswerResolverModel,
+        timeoutMs: config.evidenceAnswerResolverTimeoutMs,
       },
       featureIsolationMode: config.featureIsolationMode,
       maxEnhancementLatencyMs: config.maxEnhancementLatencyMs,
@@ -204,28 +217,28 @@ export class DeterministicReranker {
       ...(candidates.length >= threshold ? ["total_candidate_threshold_exceeded"] : []),
       ...(Object.values(laneCounts).some((count) => count >= laneThreshold) ? ["lane_candidate_threshold_exceeded"] : []),
       ...(topScoreMargin !== null && topScoreMargin <= ambiguityMargin ? ["top_candidate_score_ambiguous"] : []),
-      ...(options.strictConflict && config.strictModeRequiresRerankOnConflict ? ["strict_or_forensic_conflict"] : []),
+      ...(options.strictConflict && config.strictModeRequiresRerankOnConflict ? ["high_or_xhigh_conflict"] : []),
     ];
     const required = config.rerankPlannerPolicy !== "disabled" &&
       (options.force === true || reasons.length > 0);
     const modelLikeProvider = ["llm", "specialist", "model", "external"].includes(config.rerankProvider);
-    const providerAvailable = config.rerankEnabled &&
-      config.rerankProvider !== "none" &&
-      (!modelLikeProvider || config.rerankFallbackToDeterministic);
+    const deterministicConfigured = config.rerankEnabled && config.rerankProvider === "deterministic";
+    const providerAvailable = deterministicConfigured;
     const providerUnavailableReason = required && !providerAvailable
-      ? "configured_provider_unavailable_deterministic_fallback_used"
+      ? config.rerankProvider === "none" || !config.rerankEnabled
+        ? "rerank_provider_not_configured"
+        : modelLikeProvider
+          ? "rerank_model_provider_not_runtime_configured"
+          : "rerank_provider_unavailable"
       : undefined;
-    const sorted = required ? [...candidates].sort((left, right) => this.compare(left, right)) : [...candidates];
+    const deterministicCanRun = required && deterministicConfigured;
+    const sorted = deterministicCanRun ? [...candidates].sort((left, right) => this.compare(left, right)) : [...candidates];
     return {
       candidates: sorted,
       audit: {
         required,
-        used: required,
-        provider: required
-          ? config.rerankProvider === "deterministic"
-            ? "deterministic"
-            : "deterministic_fallback"
-          : "none",
+        used: deterministicCanRun,
+        provider: deterministicCanRun ? "deterministic" : "none",
         providerAvailable,
         providerUnavailableReason,
         candidateCount: candidates.length,

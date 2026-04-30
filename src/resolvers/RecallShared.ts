@@ -1,5 +1,7 @@
 ﻿import {
   AnswerCandidate,
+  DagExpansionAgentProvider,
+  LlmCaller,
   RawMessage,
 } from "../types";
 
@@ -82,6 +84,15 @@ export interface RecallOptions {
   allowRawFirst?: boolean;
   allowWideFallback?: boolean;
   includeSummaryItems?: boolean;
+  requireRawSource?: boolean;
+  dagExpansion?: {
+    mode: "deterministic" | "delegated_agent";
+    agentProvider: DagExpansionAgentProvider;
+    fallbackMode: "deterministic" | "safe_no_answer";
+    model?: string;
+    timeoutMs?: number;
+    llmCaller?: LlmCaller | null;
+  };
 }
 
 export function parseMessage(message: RawMessage): ParsedMessage {

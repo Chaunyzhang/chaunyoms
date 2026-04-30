@@ -35,6 +35,7 @@ export interface PlannerDecisionMetadata {
   }>;
   stopCondition: string;
   sourceTraceRequired: boolean;
+  dagExpansion: LlmPlannerPlan["retrieval"]["dagExpansion"];
   fallback?: LlmPlannerPlan["fallback"];
   deterministicRoute: RetrievalRoute;
   deterministicRoutePlan: RetrievalRoute[];
@@ -105,6 +106,7 @@ export class RetrievalRuntime {
       routeSteps: plan.retrieval.routePlan.map((step) => ({ ...step })),
       stopCondition: plan.retrieval.stopCondition,
       sourceTraceRequired: plan.retrieval.sourceTraceRequired,
+      dagExpansion: { ...plan.retrieval.dagExpansion },
       fallback: plan.fallback,
       deterministicRoute: deterministicDecision.route,
       deterministicRoutePlan: deterministicDecision.routePlan,

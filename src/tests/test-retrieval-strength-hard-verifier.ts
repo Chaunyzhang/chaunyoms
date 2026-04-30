@@ -1,127 +1,285 @@
 import { RetrievalVerifier } from "../retrieval/RetrievalVerifier";
+
 import { AnswerCandidate, ContextItem, SourceTrace } from "../types";
 
+
+
 function assert(condition: unknown, message: string): void {
+
   if (!condition) {
+
     throw new Error(message);
+
   }
+
 }
+
+
 
 const item: ContextItem = {
+
   kind: "message",
+
   tokenCount: 10,
+
   turnNumber: 7,
+
   role: "user",
+
   content: "Gateway port must stay 15432.",
+
+  metadata: { messageId: "m1" },
+
 };
 
+const summaryItem: ContextItem = {
+
+  kind: "summary",
+
+  tokenCount: 10,
+
+  turnNumber: 7,
+
+  content: "Summary says gateway port must stay 15432.",
+
+  metadata: { sourceSummaryId: "summary-1" },
+
+};
+
+
+
 function trace(overrides: Partial<SourceTrace> = {}): SourceTrace {
+
   return {
+
     route: "summary_tree",
+
     summaryId: "summary-1",
+
     sessionId: "session-1",
+
     agentId: "agent-1",
+
     strategy: "message_ids",
+
     verified: true,
+
     reason: "fixture",
+
     sourceMessageCount: 1,
+
     resolvedMessageCount: 1,
+
     messageIds: ["m1"],
+
     ...overrides,
+
   };
+
 }
+
+
 
 function answer(overrides: Partial<AnswerCandidate> = {}): AnswerCandidate {
+
   return {
+
     text: "15432",
+
     type: "unknown",
+
     confidence: 0.9,
+
     evidenceMessageIds: ["m1"],
+
     sourceVerified: true,
+
     reason: "fixture",
+
     ...overrides,
+
   };
+
 }
+
+
 
 function main(): void {
+
   const verifier = new RetrievalVerifier();
 
-  const off = verifier.verify({
-    retrievalStrength: "off",
+
+
+  const lowEmpty = verifier.verify({
+
+    retrievalStrength: "low",
+
     items: [],
+
     sourceTrace: [],
+
   });
-  assert(off.status === "sufficient", "retrievalStrength=off should not demand source recall");
-  assert(off.sourceTraceStatus === "not_required", "off mode source trace status should be not_required");
+
+  assert(lowEmpty.status === "insufficient", "low mode still needs at least one selected item or answer candidate");
+
+  assert(lowEmpty.sourceTraceStatus === "missing", "low mode with no evidence reports missing evidence");
+
+
 
   const light = verifier.verify({
-    retrievalStrength: "light",
+
+    retrievalStrength: "low",
+
     items: [item],
+
     sourceTrace: [],
+
   });
-  assert(light.status === "sufficient", "light mode may present retrieved context as hints");
-  assert(light.sourceTraceRequired === false, "light mode should not require source trace");
+
+  assert(light.status === "sufficient", "low mode may present retrieved context as hints");
+
+  assert(light.sourceTraceRequired === false, "low mode should not require source trace");
+
+
 
   const strictNoTrace = verifier.verify({
-    retrievalStrength: "strict",
+
+    retrievalStrength: "high",
+
     items: [item],
+
     sourceTrace: [],
+
   });
-  assert(strictNoTrace.status === "needs_expansion", "strict mode with items but no source trace must expand instead of finalize");
-  assert(strictNoTrace.recommendedAction === "trace_raw", "strict no-trace result should recommend raw tracing");
-  assert(strictNoTrace.sourceTraceStatus === "missing", "strict no-trace result should report missing trace");
+
+  assert(strictNoTrace.status === "needs_expansion", "high mode with items but no source trace must expand instead of finalize");
+
+  assert(strictNoTrace.recommendedAction === "trace_raw", "high no-trace result should recommend raw tracing");
+
+  assert(strictNoTrace.sourceTraceStatus === "missing", "high no-trace result should report missing trace");
+
+
 
   const strictNoItems = verifier.verify({
-    retrievalStrength: "strict",
+
+    retrievalStrength: "high",
+
     items: [],
+
     sourceTrace: [],
+
   });
-  assert(strictNoItems.status === "insufficient", "strict mode with no items/no trace must be insufficient");
-  assert(strictNoItems.recommendedAction === "no_answer", "strict no evidence should recommend no-answer");
+
+  assert(strictNoItems.status === "insufficient", "high mode with no items/no trace must be insufficient");
+
+  assert(strictNoItems.recommendedAction === "no_answer", "high no evidence should recommend no-answer");
+
+
 
   const strictVerifiedTrace = verifier.verify({
-    retrievalStrength: "strict",
+
+    retrievalStrength: "high",
+
     items: [item],
+
     sourceTrace: [trace()],
+
   });
-  assert(strictVerifiedTrace.status === "sufficient", "strict verified trace should be sufficient");
-  assert(strictVerifiedTrace.sourceTraceStatus === "verified", "strict verified trace should report verified status");
+
+  assert(strictVerifiedTrace.status === "sufficient", "high raw-backed verified trace should be sufficient");
+
+  assert(strictVerifiedTrace.sourceTraceStatus === "complete_raw", "high raw-backed trace should report complete_raw status");
+
+
 
   const strictVerifiedAnswer = verifier.verify({
-    retrievalStrength: "strict",
+
+    retrievalStrength: "high",
+
     items: [item],
+
     sourceTrace: [],
+
     answerCandidates: [answer()],
-  });
-  assert(strictVerifiedAnswer.status === "sufficient", "strict source-verified answer candidate should be sufficient");
-  assert(strictVerifiedAnswer.verifiedAnswerCount === 1, "strict verifier should count source-verified answer candidates");
 
-  const forensicCompleteRaw = verifier.verify({
-    retrievalStrength: "forensic",
+  });
+
+  assert(strictVerifiedAnswer.status === "needs_expansion", "high source-verified answer candidate without raw trace must expand to raw source");
+
+  assert(strictVerifiedAnswer.verifiedAnswerCount === 1, "high verifier should count source-verified answer candidates");
+
+
+
+  const highSummaryOnlyTrace = verifier.verify({
+
+    retrievalStrength: "high",
+
+    items: [summaryItem],
+
+    sourceTrace: [trace()],
+
+  });
+
+  assert(highSummaryOnlyTrace.status === "needs_expansion", "high summary-only trace must expand to original raw messages");
+
+  assert(highSummaryOnlyTrace.rawEvidenceItemCount === 0, "high summary-only trace should not count as raw evidence");
+
+
+
+  const xhighCompleteRaw = verifier.verify({
+
+    retrievalStrength: "xhigh",
+
     items: [item],
+
     sourceTrace: [trace({ strategy: "message_ids", verified: true, resolvedMessageCount: 1 })],
-  });
-  assert(forensicCompleteRaw.status === "sufficient", "forensic mode should accept complete raw trace");
-  assert(forensicCompleteRaw.sourceTraceStatus === "complete_raw", "forensic complete trace status should be complete_raw");
 
-  const forensicTraceOnly = verifier.verify({
-    retrievalStrength: "forensic",
+  });
+
+  assert(xhighCompleteRaw.status === "sufficient", "xhigh mode should accept complete raw trace");
+
+  assert(xhighCompleteRaw.sourceTraceStatus === "complete_raw", "xhigh complete trace status should be complete_raw");
+
+
+
+  const xhighTraceOnly = verifier.verify({
+
+    retrievalStrength: "xhigh",
+
     items: [item],
+
     sourceTrace: [trace({ strategy: "none", verified: true, resolvedMessageCount: 0 })],
-  });
-  assert(forensicTraceOnly.status === "needs_expansion", "forensic verified-but-incomplete trace must still expand");
-  assert(forensicTraceOnly.recommendedAction === "trace_raw", "forensic incomplete trace should request raw tracing");
 
-  const forensicSummaryOnly = verifier.verify({
-    retrievalStrength: "forensic",
-    items: [item],
-    sourceTrace: [],
-    answerCandidates: [answer({ sourceVerified: true })],
   });
-  assert(forensicSummaryOnly.status === "insufficient", "forensic mode must not accept answer-candidate-only evidence");
-  assert(forensicSummaryOnly.recommendedAction === "no_answer", "forensic answer-candidate-only evidence should recommend no-answer");
+
+  assert(xhighTraceOnly.status === "needs_expansion", "xhigh verified-but-incomplete trace must still expand");
+
+  assert(xhighTraceOnly.recommendedAction === "trace_raw", "xhigh incomplete trace should request raw tracing");
+
+
+
+  const xhighSummaryOnly = verifier.verify({
+
+    retrievalStrength: "xhigh",
+
+    items: [item],
+
+    sourceTrace: [],
+
+    answerCandidates: [answer({ sourceVerified: true })],
+
+  });
+
+  assert(xhighSummaryOnly.status === "needs_expansion", "xhigh mode must not accept answer-candidate-only evidence");
+
+  assert(xhighSummaryOnly.recommendedAction === "trace_raw", "xhigh answer-candidate-only evidence should recommend raw tracing when a raw item is available");
+
+
 
   console.log("test-retrieval-strength-hard-verifier passed");
+
 }
+
+
 
 main();

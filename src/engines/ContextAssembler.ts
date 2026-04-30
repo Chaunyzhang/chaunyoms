@@ -136,12 +136,17 @@ export class ContextAssembler {
     return this.summaryEntriesToItems(selected);
   }
 
-  assembleMemoryItems(memoryItemDraftStore: MemoryItemDraftRepository, budget: number): ContextItem[] {
+  assembleMemoryItems(
+    memoryItemDraftStore: MemoryItemDraftRepository,
+    budget: number,
+    options: { rawStore?: RawMessageRepository; sessionId?: string } = {},
+  ): ContextItem[] {
     if (budget <= 0) {
       return [];
     }
     const memories = [...memoryItemDraftStore.getAll()]
       .filter((entry) => entry.recordStatus === "active")
+      .filter((entry) => this.isDraftMemorySourceCompacted(entry, options.rawStore, options.sessionId))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, 8);
     return this.memoryInputEntriesToContextItems(memories, budget);
@@ -205,7 +210,14 @@ export class ContextAssembler {
         : this.buildRecallGuidanceFromCount(runtime.getSummaryCount(options.sessionId));
       const memoryItems = options.includeMemoryItems === false
         ? []
-        : this.memoryItemsToContextItems(runtime.getActiveMemoryItems(8), budget.recallBudget);
+        : this.memoryItemsToContextItems(
+          this.filterRuntimeMemoryItemsForDefaultContext(
+            runtime.getActiveMemoryItems(24),
+            runtime.getCompactedMessageIds,
+            options.sessionId,
+          ).slice(0, 8),
+          budget.recallBudget,
+        );
       const fixedPluginTokens = this.sumTokens(stablePrefix) +
         (recallGuidance?.tokenCount ?? 0) +
         this.sumTokens(memoryItems);
@@ -243,11 +255,11 @@ export class ContextAssembler {
     const { recallGuidance, memoryItems, summaries, recentTail } = runtimeRead;
     return this.planAndStore([
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
+      ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
       ...this.tagCandidateSource(memoryItems, "active_memory"),
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
-      ...this.tagCandidateSource(recentTail, "recent_tail"),
     ], budget);
   }
 
@@ -281,7 +293,10 @@ export class ContextAssembler {
       : this.buildRecallGuidance(summaryStore, options.sessionId);
     const memoryItems = options.includeMemoryItems === false
       ? []
-      : this.assembleMemoryItems(memoryItemDraftStore, budget.recallBudget);
+      : this.assembleMemoryItems(memoryItemDraftStore, budget.recallBudget, {
+        rawStore,
+        sessionId: options.sessionId,
+      });
     const fixedPluginTokens = this.sumTokens(stablePrefix) +
       (recallGuidance?.tokenCount ?? 0) +
       this.sumTokens(memoryItems);
@@ -310,11 +325,11 @@ export class ContextAssembler {
     );
     return this.planAndStore([
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
+      ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
       ...this.tagCandidateSource(memoryItems, "active_memory"),
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
-      ...this.tagCandidateSource(recentTail, "recent_tail"),
     ], budget);
   }
 
@@ -536,6 +551,59 @@ export class ContextAssembler {
     }
 
     return selected;
+  }
+
+  private isDraftMemorySourceCompacted(
+    memory: MemoryItemDraftEntry,
+    rawStore?: RawMessageRepository,
+    sessionId?: string,
+  ): boolean {
+    if (memory.sourceType !== "raw_message") {
+      return true;
+    }
+    if (!rawStore || memory.sourceIds.length === 0) {
+      return false;
+    }
+
+    const sourceMessages = rawStore.getByIds(memory.sourceIds, { sessionId });
+    if (sourceMessages.length !== memory.sourceIds.length) {
+      return false;
+    }
+
+    return sourceMessages.every((message) => message.compacted);
+  }
+
+  private filterRuntimeMemoryItemsForDefaultContext(
+    memories: MemoryItemEntry[],
+    getCompactedMessageIds: (messageIds: string[], sessionId?: string) => Set<string>,
+    sessionId?: string,
+  ): MemoryItemEntry[] {
+    const rawMessageSourceIds = [
+      ...new Set(memories
+        .filter((memory) => this.runtimeMemorySourceType(memory) === "raw_message")
+        .flatMap((memory) => memory.sourceIds ?? [])),
+    ];
+    const compactedSourceIds = getCompactedMessageIds(rawMessageSourceIds, sessionId);
+
+    return memories.filter((memory) => {
+      if (this.runtimeMemorySourceType(memory) !== "raw_message") {
+        return true;
+      }
+      const sourceIds = memory.sourceIds ?? [];
+      return sourceIds.length > 0 &&
+        sourceIds.every((sourceId) => compactedSourceIds.has(sourceId));
+    });
+  }
+
+  private runtimeMemorySourceType(memory: MemoryItemEntry): MemoryItemDraftEntry["sourceType"] | "unknown" {
+    const sourceType = memory.metadata?.draftSourceType;
+    if (sourceType === "raw_message" || sourceType === "observation" || sourceType === "snapshot") {
+      return sourceType;
+    }
+    if (memory.sourceTable === "memory_item_drafts") {
+      return (memory.sourceIds ?? []).length > 0 ? "raw_message" : "snapshot";
+    }
+    return "unknown";
   }
 
   private planAndStore(

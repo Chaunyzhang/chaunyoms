@@ -132,6 +132,23 @@ function detectLeak(text) {
   return LEAK_PATTERNS.some((pattern) => pattern.test(String(text || "").trim()));
 }
 
+function tableExists(db, tableName) {
+  const row = db.prepare(`
+    select 1 as found
+    from sqlite_master
+    where type = 'table' and name = ?
+    limit 1
+  `).get(tableName);
+  return Boolean(row?.found);
+}
+
+function countTable(db, tableName) {
+  if (!tableExists(db, tableName)) {
+    return 0;
+  }
+  return Number(db.prepare(`select count(*) as count from ${tableName}`).get()?.count ?? 0);
+}
+
 function isReplayLeakCandidate(row, preview) {
   const source = String(row.source || "").trim().toLowerCase();
   if (!["recent_tail", "raw_exact_search"].includes(source)) {
@@ -152,15 +169,14 @@ function main() {
 
   const db = new DatabaseSync(dbPath);
   try {
-    const counts = db.prepare(`
-      select
-        (select count(*) from messages) as messages,
-        (select count(*) from summaries) as summaries,
-        (select count(*) from memories) as memories,
-        (select count(*) from assets) as assets,
-        (select count(*) from context_runs) as context_runs,
-        (select count(*) from retrieval_candidates) as retrieval_candidates
-    `).get();
+    const counts = {
+      messages: countTable(db, "messages"),
+      summaries: countTable(db, "summaries"),
+      memories: countTable(db, "memory_items") || countTable(db, "memories"),
+      assets: countTable(db, "assets"),
+      context_runs: countTable(db, "context_runs"),
+      retrieval_candidates: countTable(db, "retrieval_candidates"),
+    };
 
     const leakRows = db.prepare(`
       select id, session_id, role, turn_number, substr(content, 1, 240) as preview

@@ -5,6 +5,7 @@
 } from "../types";
 import {
   deriveProjectIdentityFromMessages,
+  deriveProjectIdentityFromSummary,
   deriveProjectIdentityFromSnapshot,
   deriveProjectStatusFromSnapshot,
 } from "./projectIdentity";
@@ -26,23 +27,34 @@ export function buildProjectStateSnapshot(
   summaryStore: SummaryRepository,
   now = new Date(),
 ): ProjectStateSnapshot {
-  const latestMessages = rawStore.getAll().slice(-12);
-  const latestUser =
-    [...latestMessages].reverse().find((item) => item.role === "user")?.content ??
-    "(none)";
-  const latestAssistant =
+  const latestMessages = rawStore.getAll().filter((message) => message.compacted).slice(-12);
+  const latestSummary = summaryStore.getAllSummaries().at(-1);
+  const summaryText = latestSummary?.summary ?? "";
+  const summaryDecision = latestSummary?.decisions?.[0] ?? summaryText;
+  const summaryNext = latestSummary?.nextSteps?.[0] ?? summaryText;
+  const summaryBlocker = latestSummary?.blockers?.[0] ?? DEFAULT_NONE;
+  const compactedLatestUser = [...latestMessages].reverse().find((item) => item.role === "user")?.content;
+  const compactedLatestAssistant =
     [...latestMessages]
       .reverse()
       .find((item) => item.role === "assistant")
-      ?.content ?? "(none)";
-  const blocker =
+      ?.content;
+  const compactedBlocker =
     [...latestMessages]
       .reverse()
       .find((item) =>
         /(blocker|blocked|error|fail|issue|risk|阻塞|卡住|失败|报错)/i.test(item.content),
       )
-      ?.content ?? DEFAULT_NONE;
-  const latestSummary = summaryStore.getAllSummaries().at(-1);
+      ?.content;
+  const latestUser = summaryText
+    ? `summary:${latestSummary?.id ?? "latest"} ${summaryText}`
+    : compactedLatestUser ?? "(none)";
+  const latestAssistant = summaryDecision
+    ? `summary:${latestSummary?.id ?? "latest"} ${summaryDecision}`
+    : compactedLatestAssistant ?? "(none)";
+  const blocker = summaryBlocker !== DEFAULT_NONE
+    ? summaryBlocker
+    : compactedBlocker ?? DEFAULT_NONE;
 
   const dateLabel = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const active = latestUser !== "(none)" ? latestUser : "no active user thread recorded";
@@ -51,10 +63,10 @@ export function buildProjectStateSnapshot(
       ? latestAssistant
       : "no recent assistant decision recorded";
   const todo = "review follow-up actions from latest turn";
-  const next =
-    latestAssistant !== "(none)"
+  const next = summaryNext ||
+    (latestAssistant !== "(none)"
       ? latestAssistant
-      : "continue the active thread from the latest user request";
+      : "continue the active thread from the latest user request");
   const pending =
     latestUser !== "(none)"
       ? latestUser
@@ -78,7 +90,9 @@ export function buildProjectStateSnapshot(
     projectTitle: "",
     projectStatus: "active" as const,
   };
-  const projectIdentity = deriveProjectIdentityFromMessages(latestMessages, dateLabel);
+  const projectIdentity = latestSummary
+    ? deriveProjectIdentityFromSummary(latestSummary, dateLabel)
+    : deriveProjectIdentityFromMessages(latestMessages, dateLabel);
   return {
     ...preliminary,
     projectId: projectIdentity.projectId,

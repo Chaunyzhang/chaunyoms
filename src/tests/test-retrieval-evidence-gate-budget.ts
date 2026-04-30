@@ -8,7 +8,7 @@ function assert(condition: unknown, message: string): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const service = Object.create(ChaunyomsRetrievalService.prototype) as {
     contextPlanner: ContextPlanner;
     planRecallItems(query: string, result: RecallResult, retrievalBudget: {
@@ -17,7 +17,7 @@ function main(): void {
       summary: number;
       raw: number;
       perItem: { atom: number; summary: number; raw: number };
-    }): { items: ContextItem[]; consumedTokens: number };
+    }): Promise<{ items: ContextItem[]; consumedTokens: number }>;
     evaluateEvidenceGate(query: string, items: ContextItem[], result: RecallResult): {
       status: string;
       recommendedAction: string;
@@ -95,7 +95,7 @@ function main(): void {
     strategy: "summary_navigation",
   };
 
-  const planned = service.planRecallItems("工具结果是否保存", result, {
+  const planned = await service.planRecallItems("工具结果是否保存", result, {
     total: 900,
     atom: 250,
     summary: 300,
@@ -179,4 +179,4 @@ function main(): void {
   console.log("test-retrieval-evidence-gate-budget passed");
 }
 
-main();
+void main();

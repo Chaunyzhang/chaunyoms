@@ -53,6 +53,41 @@ export interface OpenClawToolDefinition {
   execute: (toolCallId: string, args: unknown) => Promise<unknown>;
 }
 
+export interface OpenClawCliContext {
+  program: {
+    command: (nameAndArgs: string) => OpenClawCliCommandLike;
+  };
+  config?: HostConfigLike;
+  workspaceDir?: string;
+  logger?: LoggerLike;
+}
+
+export interface OpenClawCliCommandLike {
+  description: (description: string) => OpenClawCliCommandLike;
+  option: (
+    flags: string,
+    description?: string,
+    parserOrDefault?: unknown,
+    defaultValue?: unknown,
+  ) => OpenClawCliCommandLike;
+  argument: (
+    flags: string,
+    description?: string,
+    defaultValue?: unknown,
+  ) => OpenClawCliCommandLike;
+  action: (handler: (...args: unknown[]) => unknown) => OpenClawCliCommandLike;
+  command: (nameAndArgs: string) => OpenClawCliCommandLike;
+}
+
+export interface OpenClawCliRegistrationOptions {
+  commands?: string[];
+  descriptors?: Array<{
+    name: string;
+    description: string;
+    hasSubcommands: boolean;
+  }>;
+}
+
 export interface OpenClawApiLike extends HostRecord {
   agent?: HostRecord;
   config?: HostConfigLike;
@@ -66,6 +101,10 @@ export interface OpenClawApiLike extends HostRecord {
   registerMemoryFlushPlan?: (resolver: unknown) => void;
   registerMemoryPromptSection?: (builder: unknown) => void;
   registerMemoryRuntime?: (runtime: unknown) => void;
+  registerCli?: (
+    registrar: (ctx: OpenClawCliContext) => void | Promise<void>,
+    opts?: OpenClawCliRegistrationOptions,
+  ) => void;
   registerTool?: (tool: OpenClawToolDefinition) => void;
   runtime?: HostContextNamespace;
   session?: HostRecord;

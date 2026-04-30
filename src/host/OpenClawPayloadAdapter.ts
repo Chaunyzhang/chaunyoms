@@ -214,7 +214,7 @@ export class OpenClawPayloadAdapter {
     if (config.knowledgePromotionEnabled && !config.knowledgePromotionManualReviewEnabled) {
       warnings.push("Knowledge promotion is automatic. Set knowledgePromotionManualReviewEnabled=true if you want a scored manual approval queue before Markdown writes.");
     }
-    if ((config.retrievalStrength === "strict" || config.retrievalStrength === "forensic") && !config.autoRecallEnabled) {
+    if ((config.retrievalStrength === "high" || config.retrievalStrength === "xhigh") && !config.autoRecallEnabled) {
       warnings.push(`${config.retrievalStrength} retrieval requires source recall, but autoRecallEnabled=false; exact evidence recall will be limited.`);
     }
     if (config.kbWriteEnabled && !config.kbExportEnabled) {
@@ -236,7 +236,7 @@ export class OpenClawPayloadAdapter {
       warnings.push("ragProvider=sqlite_vec has no vectorExtensionPath and ragFallbackToBruteForce=false; vector search will be unavailable on hosts without a bundled extension.");
     }
     if (config.ragEnabled && !config.embeddingEnabled) {
-      warnings.push("ragEnabled=true while embeddingEnabled=false; existing vectors can be read, but new source chunks will not be embedded.");
+      warnings.push("ragEnabled=true while embeddingEnabled=false; vector/RAG search will stay inactive because query embeddings are unavailable.");
     }
     if (config.graphEnabled && !config.graphBuilderEnabled) {
       warnings.push("graphEnabled=true while graphBuilderEnabled=false; existing graph edges can be read, but new associative edges will not be built.");
@@ -244,8 +244,20 @@ export class OpenClawPayloadAdapter {
     if (config.rerankEnabled && config.rerankProvider === "none") {
       warnings.push("rerankEnabled=true but rerankProvider=none; rerank enhancement will stay inactive.");
     }
-    if (config.rerankEnabled && ["llm", "specialist", "model", "external"].includes(config.rerankProvider) && !config.rerankFallbackToDeterministic) {
-      warnings.push("rerank provider is model/external without deterministic fallback; optional rerank failure may reduce recall ordering reliability.");
+    if (config.rerankEnabled && ["llm", "specialist", "model", "external"].includes(config.rerankProvider)) {
+      warnings.push("rerankProvider is model/external; rerank will stay inactive unless a concrete runtime provider is wired. Deterministic fallback is never implicit.");
+    }
+    if (config.evidenceAnswerResolverEnabled && config.evidenceAnswerResolverProvider === "none") {
+      warnings.push("evidenceAnswerResolverEnabled=true but evidenceAnswerResolverProvider=none; final evidence-to-answer resolution will stay inactive.");
+    }
+    if (config.evidenceAnswerResolverEnabled && ["llm", "external"].includes(config.evidenceAnswerResolverProvider) && !config.evidenceAnswerResolverModel) {
+      warnings.push("EvidenceAnswerResolver uses an LLM/external provider without evidenceAnswerResolverModel; it will fail closed because model configuration is required.");
+    }
+    if (config.dagExpansionMode === "planner_decides" && config.dagExpansionAgentProvider === "none") {
+      warnings.push("dagExpansionMode=planner_decides but dagExpansionAgentProvider=none; LLMPlanner can only choose deterministic DAG expansion.");
+    }
+    if (config.dagExpansionMode === "delegated_agent" && config.dagExpansionAgentProvider === "llm" && !config.dagExpansionAgentModel) {
+      warnings.push("delegated DAG expansion uses llm provider without dagExpansionAgentModel; it will fail closed unless the host supplies a default model.");
     }
     return {
       preset: config.configPreset,
@@ -459,15 +471,14 @@ export class OpenClawPayloadAdapter {
       baseConfig.knowledgeMarkdownEnabled,
     );
 
-    const retrievalStrength = this.resolveStringEnum(
+    const retrievalStrength = this.resolveRetrievalStrengthValue(
       [
         pluginConfig.retrievalStrength,
         pluginConfig.retrievalMode,
         pluginConfig.recallStrength,
       ],
-      ["off", "light", "auto", "strict", "forensic"],
       baseConfig.retrievalStrength,
-    ) as BridgeConfig["retrievalStrength"];
+    );
 
     const llmPlannerMode = this.resolveStringEnum(
       [
@@ -618,8 +629,32 @@ export class OpenClawPayloadAdapter {
           ],
           baseConfig.graphBuilderEnabled,
         );
+    const evidenceAnswerResolverEnabled = emergencyBrake
+      ? false
+      : this.resolveBooleanFlag(
+          [
+            pluginConfig.evidenceAnswerResolverEnabled,
+            pluginConfig.answerResolverEnabled,
+            this.inverseBoolean(pluginConfig.disableEvidenceAnswerResolver),
+          ],
+          baseConfig.evidenceAnswerResolverEnabled,
+        );
+    const dagExpansionMode = emergencyBrake
+      ? "deterministic"
+      : this.resolveStringEnum(
+          [pluginConfig.dagExpansionMode, pluginConfig.sourceExpansionMode, pluginConfig.summaryExpansionMode],
+          ["deterministic", "planner_decides", "delegated_agent"],
+          baseConfig.dagExpansionMode,
+        ) as BridgeConfig["dagExpansionMode"];
+    const dagExpansionAgentProvider = emergencyBrake
+      ? "none"
+      : this.resolveStringEnum(
+          [pluginConfig.dagExpansionAgentProvider, pluginConfig.sourceExpansionAgentProvider],
+          ["none", "host_subagent", "llm"],
+          baseConfig.dagExpansionAgentProvider,
+        ) as BridgeConfig["dagExpansionAgentProvider"];
 
-    return this.validateConfig({
+    return this.validateConfig(this.applyRetrievalStrengthPreset({
       dataDir,
       sessionId: this.resolveSessionId(payload, identityBaseConfig),
       agentId: this.resolveAgentId(payload, identityBaseConfig),
@@ -908,6 +943,34 @@ export class OpenClawPayloadAdapter {
         [pluginConfig.rerankFallbackToDeterministic],
         baseConfig.rerankFallbackToDeterministic,
       ),
+      evidenceAnswerResolverEnabled,
+      evidenceAnswerResolverProvider: this.resolveStringEnum(
+        [pluginConfig.evidenceAnswerResolverProvider, pluginConfig.answerResolverProvider],
+        ["none", "deterministic", "llm", "external"],
+        baseConfig.evidenceAnswerResolverProvider,
+      ) as BridgeConfig["evidenceAnswerResolverProvider"],
+      evidenceAnswerResolverModel: this.resolveOptionalString(
+        pluginConfig.evidenceAnswerResolverModel,
+        baseConfig.evidenceAnswerResolverModel,
+      ),
+      evidenceAnswerResolverTimeoutMs: this.resolveNumberConfig(
+        [pluginConfig.evidenceAnswerResolverTimeoutMs, pluginConfig.answerResolverTimeoutMs],
+        baseConfig.evidenceAnswerResolverTimeoutMs,
+      ),
+      evidenceAnswerResolverFallbackToDeterministic: this.resolveBooleanFlag(
+        [pluginConfig.evidenceAnswerResolverFallbackToDeterministic],
+        baseConfig.evidenceAnswerResolverFallbackToDeterministic,
+      ),
+      dagExpansionMode,
+      dagExpansionAgentProvider,
+      dagExpansionAgentModel: this.resolveOptionalString(
+        pluginConfig.dagExpansionAgentModel,
+        baseConfig.dagExpansionAgentModel,
+      ),
+      dagExpansionAgentTimeoutMs: this.resolveNumberConfig(
+        [pluginConfig.dagExpansionAgentTimeoutMs, pluginConfig.sourceExpansionAgentTimeoutMs],
+        baseConfig.dagExpansionAgentTimeoutMs,
+      ),
       featureIsolationMode: this.resolveStringEnum(
         [pluginConfig.featureIsolationMode, pluginConfig.optionalFeatureIsolationMode],
         ["fail_closed", "isolate_optional"],
@@ -943,7 +1006,7 @@ export class OpenClawPayloadAdapter {
       ),
       emergencyBrake,
       sqliteJournalMode,
-    });
+    }));
   }
 
   private resolvePresetDefaults(
@@ -974,6 +1037,63 @@ export class OpenClawPayloadAdapter {
           semanticCandidateLimit: baseConfig.semanticCandidateLimit,
         };
     }
+  }
+
+  private resolveRetrievalStrengthValue(
+    candidates: unknown[],
+    fallback: BridgeConfig["retrievalStrength"],
+  ): BridgeConfig["retrievalStrength"] {
+    const allowed: BridgeConfig["retrievalStrength"][] = ["low", "medium", "high", "xhigh", "custom"];
+    const legacyAliases: Record<string, BridgeConfig["retrievalStrength"]> = {
+      off: "low",
+      light: "low",
+      auto: "medium",
+      strict: "high",
+      forensic: "xhigh",
+    };
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") {
+        continue;
+      }
+      const normalized = candidate.trim().toLowerCase();
+      if ((allowed as string[]).includes(normalized)) {
+        return normalized as BridgeConfig["retrievalStrength"];
+      }
+      if (legacyAliases[normalized]) {
+        return legacyAliases[normalized];
+      }
+    }
+    return fallback;
+  }
+
+  private applyRetrievalStrengthPreset(config: BridgeConfig): BridgeConfig {
+    if (config.retrievalStrength === "custom") {
+      return config;
+    }
+    if (config.retrievalStrength === "high") {
+      return {
+        ...config,
+        autoRecallEnabled: config.emergencyBrake ? false : true,
+      };
+    }
+    if (config.retrievalStrength !== "xhigh") {
+      return config;
+    }
+    const enabled = !config.emergencyBrake;
+    return {
+      ...config,
+      autoRecallEnabled: enabled,
+      ragEnabled: enabled && config.ragProvider !== "none",
+      graphEnabled: enabled && config.graphProvider !== "none",
+      rerankEnabled: enabled && config.rerankProvider !== "none",
+      graphBuilderEnabled: enabled && config.graphBuilderProvider !== "none",
+      embeddingEnabled: enabled && config.embeddingProvider !== "none",
+      evidenceAnswerResolverEnabled: enabled && config.evidenceAnswerResolverProvider !== "none",
+      heavyRetrievalPolicy: "planner_only",
+      ragPlannerPolicy: "planner_only",
+      graphPlannerPolicy: "planner_only",
+      rerankPlannerPolicy: "candidate_overload_required",
+    };
   }
 
   private hasDirectoryValue(value: unknown): value is string {
@@ -1764,6 +1884,9 @@ export class OpenClawPayloadAdapter {
     ) {
       errors.push("semanticCandidateLimit must be a non-negative integer");
     }
+    if (!["low", "medium", "high", "xhigh", "custom"].includes(config.retrievalStrength)) {
+      errors.push("retrievalStrength must be low, medium, high, xhigh, or custom");
+    }
     if (!["off", "shadow", "auto"].includes(config.llmPlannerMode)) {
       errors.push("llmPlannerMode must be off, shadow, or auto");
     }
@@ -1827,6 +1950,24 @@ export class OpenClawPayloadAdapter {
     }
     if (!["none", "deterministic", "llm", "external"].includes(config.graphBuilderProvider)) {
       errors.push("graphBuilderProvider must be none, deterministic, llm, or external");
+    }
+    if (!["none", "deterministic", "llm", "external"].includes(config.evidenceAnswerResolverProvider)) {
+      errors.push("evidenceAnswerResolverProvider must be none, deterministic, llm, or external");
+    }
+    if (!Number.isFinite(config.evidenceAnswerResolverTimeoutMs) || config.evidenceAnswerResolverTimeoutMs < 1 || !Number.isInteger(config.evidenceAnswerResolverTimeoutMs)) {
+      errors.push("evidenceAnswerResolverTimeoutMs must be a positive integer");
+    }
+    if (!["deterministic", "planner_decides", "delegated_agent"].includes(config.dagExpansionMode)) {
+      errors.push("dagExpansionMode must be deterministic, planner_decides, or delegated_agent");
+    }
+    if (!["none", "host_subagent", "llm"].includes(config.dagExpansionAgentProvider)) {
+      errors.push("dagExpansionAgentProvider must be none, host_subagent, or llm");
+    }
+    if (config.dagExpansionMode === "delegated_agent" && config.dagExpansionAgentProvider === "none") {
+      errors.push("dagExpansionMode=delegated_agent requires dagExpansionAgentProvider to be host_subagent or llm");
+    }
+    if (!Number.isFinite(config.dagExpansionAgentTimeoutMs) || config.dagExpansionAgentTimeoutMs < 1 || !Number.isInteger(config.dagExpansionAgentTimeoutMs)) {
+      errors.push("dagExpansionAgentTimeoutMs must be a positive integer");
     }
     if (!Number.isFinite(config.graphMaxDepth) || config.graphMaxDepth < 1 || !Number.isInteger(config.graphMaxDepth)) {
       errors.push("graphMaxDepth must be a positive integer");
@@ -1990,4 +2131,3 @@ export class OpenClawPayloadAdapter {
     return candidates.find(isHostRecord) ?? null;
   }
 }
-

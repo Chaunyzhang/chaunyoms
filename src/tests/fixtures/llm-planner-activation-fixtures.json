@@ -16,12 +16,15 @@
     "expectedTriggers": ["explicit_tool_or_id_lookup"]
   },
   {
-    "name": "retrieval off disables planner recall",
+    "name": "low retrieval still allows planner recall",
     "query": "刚才那个端口是多少",
-    "retrievalStrength": "off",
-    "expectedMode": "bypass",
-    "expectedTriggers": ["retrieval_off"],
-    "skipPlan": true
+    "retrievalStrength": "low",
+    "signals": { "hasCompactedHistory": true },
+    "expectedMode": "llm_planner",
+    "expectedIntent": "history_trace",
+    "expectSourceTraceRequired": true,
+    "expectedLayers": ["base_summaries", "raw_sources"],
+    "expectedTriggers": ["precision_fact_signal", "implicit_history_reference"]
   },
   {
     "name": "Chinese exact earlier port needs source trace",
@@ -36,7 +39,7 @@
   {
     "name": "Shadow mode does not invoke LLM caller",
     "query": "刚才那个端口是多少",
-    "retrievalStrength": "strict",
+    "retrievalStrength": "high",
     "plannerMode": "shadow",
     "hasLlmCaller": true,
     "signals": { "hasCompactedHistory": true },
@@ -46,7 +49,7 @@
     "expectSourceTraceRequired": true,
     "expectedFallbackFrom": "not_required",
     "expectedLayers": ["base_summaries", "raw_sources"],
-    "expectedTriggers": ["strict_requires_evidence_planning", "precision_fact_signal", "implicit_history_reference"]
+    "expectedTriggers": ["high_requires_evidence_planning", "precision_fact_signal", "implicit_history_reference"]
   },
   {
     "name": "Chinese earlier path uses summaries then raw source",

@@ -30,6 +30,24 @@ export class RecallResolver {
 
     return this.summaryNavigation.resolve(query, summaryStore, rawStore, recallBudget, options);
   }
+
+  async resolveAsync(
+    query: string,
+    summaryStore: SummaryRepository,
+    rawStore: RawMessageRepository,
+    recallBudget: number,
+    options: RecallOptions = {},
+  ): Promise<RecallResult> {
+    const understanding = this.queryAnalyzer.analyze(query);
+    if (this.queryAnalyzer.shouldUseRawFirst(understanding, options)) {
+      const rawResult = this.rawRecall.resolve(query, understanding, rawStore, recallBudget, options);
+      if (rawResult.items.length > 0 || (rawResult.answerCandidates?.length ?? 0) > 0) {
+        return rawResult;
+      }
+    }
+
+    return await this.summaryNavigation.resolveDelegated(query, summaryStore, rawStore, recallBudget, options);
+  }
 }
 
 export type { RecallOptions } from "./RecallShared";

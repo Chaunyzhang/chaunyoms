@@ -41,8 +41,8 @@ export class SummaryNavigationRecallResolver {
         route: "summary_tree",
         summaryId: hit.id,
       }));
-      const summaryItem = options.includeSummaryItems ? this.buildSummaryItem(hit) : null;
-      const rawRequired = this.queryRequiresRawSource(query);
+      const rawRequired = options.requireRawSource === true || this.queryRequiresRawSource(query);
+      const summaryItem = options.includeSummaryItems && !rawRequired ? this.buildSummaryItem(hit) : null;
       const atomItems = rawRequired ? [] : this.buildEvidenceAtomItems(hit, query, terms, exactAnchors);
       for (const atom of atomItems) {
         if (consumedTokens + atom.tokenCount > recallBudget && items.length > 0) {
@@ -92,6 +92,257 @@ export class SummaryNavigationRecallResolver {
     }
 
     return { items, consumedTokens, sourceTrace, dagTrace, strategy: "summary_navigation" };
+  }
+
+
+  async resolveDelegated(
+    query: string,
+    summaryStore: SummaryRepository,
+    rawStore: RawMessageRepository,
+    recallBudget: number,
+    options: RecallOptions,
+  ): Promise<RecallResult> {
+    const requested = options.dagExpansion;
+    if (!requested || requested.mode !== "delegated_agent") {
+      return this.resolve(query, summaryStore, rawStore, recallBudget, options);
+    }
+
+    if (requested.agentProvider !== "llm" || !requested.llmCaller) {
+      return this.delegatedFallback(
+        query,
+        summaryStore,
+        rawStore,
+        recallBudget,
+        options,
+        requested.agentProvider !== "llm"
+          ? "Configured delegated DAG provider has no runtime executor in this host; falling back to deterministic resolver."
+          : "Delegated DAG expansion requested without an LLM caller; falling back to deterministic resolver.",
+      );
+    }
+
+    const traversal = this.dagResolver.resolve(query, summaryStore, {
+      sessionId: options.sessionId,
+      maxRoots: 5,
+      maxLeaves: 12,
+      maxChildrenPerBranch: 6,
+    });
+    const summaries = summaryStore.getActiveSummaries({ sessionId: options.sessionId });
+    const byId = new Map(summaries.map((summary) => [summary.id, summary]));
+    const candidateIds = [
+      ...traversal.trace.map((step) => step.summaryId),
+      ...traversal.summaries.map((summary) => summary.id),
+      ...summaryStore.search(query, { sessionId: options.sessionId }).map((summary) => summary.id),
+    ].filter((id, index, ids) => ids.indexOf(id) === index && byId.has(id)).slice(0, 24);
+
+    if (candidateIds.length === 0) {
+      return this.delegatedFallback(query, summaryStore, rawStore, recallBudget, options, "No DAG summary candidates were available for delegated expansion.");
+    }
+
+    const prompt = this.buildDelegatedDagPrompt(query, candidateIds.map((id) => byId.get(id)!));
+    try {
+      const rawSelection = await this.withTimeout(
+        requested.llmCaller.call({
+          model: requested.model,
+          prompt,
+          temperature: 0,
+          maxOutputTokens: 700,
+          responseFormat: "json",
+        }),
+        requested.timeoutMs ?? 120000,
+      );
+      const selectedIds = this.parseDelegatedSummaryIds(rawSelection)
+        .filter((id, index, ids) => ids.indexOf(id) === index && byId.has(id))
+        .slice(0, 8);
+      if (selectedIds.length === 0) {
+        return this.delegatedFallback(query, summaryStore, rawStore, recallBudget, options, "Delegated DAG agent returned no valid summary ids.");
+      }
+      const selectedSummaries = selectedIds.map((id) => byId.get(id)!);
+      const rawResult = this.buildRawRecallFromSummaries(query, selectedSummaries, rawStore, recallBudget, options, traversal.trace);
+      return {
+        ...rawResult,
+        dagExpansion: {
+          requestedMode: "delegated_agent",
+          executedMode: "delegated_agent",
+          agentProvider: requested.agentProvider,
+          status: rawResult.items.length > 0 ? "answered" : "safe_no_answer",
+          reason: rawResult.items.length > 0
+            ? "LLM delegated DAG expansion selected source summaries and OMS expanded them to raw messages."
+            : "LLM delegated DAG expansion selected summaries but no raw messages could be resolved.",
+          selectedSummaryIds: selectedIds,
+        },
+      };
+    } catch (error) {
+      return this.delegatedFallback(
+        query,
+        summaryStore,
+        rawStore,
+        recallBudget,
+        options,
+        `Delegated DAG expansion failed (${error instanceof Error ? error.message : "unknown error"}); falling back to deterministic resolver.`,
+      );
+    }
+  }
+
+  private delegatedFallback(
+    query: string,
+    summaryStore: SummaryRepository,
+    rawStore: RawMessageRepository,
+    recallBudget: number,
+    options: RecallOptions,
+    reason: string,
+  ): RecallResult {
+    const requested = options.dagExpansion;
+    if (requested?.fallbackMode === "safe_no_answer") {
+      return {
+        items: [],
+        consumedTokens: 0,
+        sourceTrace: [],
+        dagTrace: [],
+        strategy: "summary_navigation",
+        dagExpansion: {
+          requestedMode: "delegated_agent",
+          executedMode: "delegated_agent",
+          agentProvider: requested.agentProvider,
+          status: "safe_no_answer",
+          reason,
+          selectedSummaryIds: [],
+        },
+      };
+    }
+    const fallback = this.resolve(query, summaryStore, rawStore, recallBudget, {
+      ...options,
+      dagExpansion: undefined,
+    });
+    return {
+      ...fallback,
+      dagExpansion: {
+        requestedMode: "delegated_agent",
+        executedMode: "deterministic",
+        agentProvider: requested?.agentProvider ?? "none",
+        status: "fallback_deterministic",
+        reason,
+        selectedSummaryIds: [],
+      },
+    };
+  }
+
+  private buildRawRecallFromSummaries(
+    query: string,
+    summaries: SummaryEntry[],
+    rawStore: RawMessageRepository,
+    recallBudget: number,
+    options: RecallOptions,
+    dagTrace: RecallResult["dagTrace"],
+  ): RecallResult {
+    const terms = queryTerms(query);
+    const exactAnchors = query.match(/\b[A-Z][A-Z0-9_]{2,}\b|\b\d{2,}\b/g) ?? [];
+    const items: RecallResult["items"] = [];
+    const sourceTrace: RecallResult["sourceTrace"] = [];
+    let consumedTokens = 0;
+    for (const summary of summaries) {
+      const resolution = this.sourceResolver.resolve(rawStore, summary);
+      sourceTrace.push(SourceMessageResolver.traceFromResolution(resolution, {
+        route: "summary_tree",
+        summaryId: summary.id,
+      }));
+      const messages = this.prioritizeMessages(
+        options.sessionId
+          ? resolution.messages.filter((message) => message.sessionId === options.sessionId)
+          : resolution.messages,
+        query,
+        terms,
+        exactAnchors,
+      );
+      for (const message of messages) {
+        if (consumedTokens + message.tokenCount > recallBudget && items.length > 0) {
+          return { items, consumedTokens, sourceTrace, dagTrace, strategy: "summary_navigation" };
+        }
+        consumedTokens += message.tokenCount;
+        items.push({
+          kind: "message",
+          tokenCount: message.tokenCount,
+          turnNumber: message.turnNumber,
+          role: message.role,
+          content: message.content,
+          metadata: {
+            ...(message.metadata ?? {}),
+            messageId: message.id,
+            sourceSummaryId: summary.id,
+            sourceResolutionStrategy: resolution.strategy,
+            sourceVerified: resolution.verified,
+            dagExpansionMode: "delegated_agent",
+            dagExpansionAgentProvider: options.dagExpansion?.agentProvider,
+          },
+        });
+      }
+    }
+    return { items, consumedTokens, sourceTrace, dagTrace, strategy: "summary_navigation" };
+  }
+
+  private buildDelegatedDagPrompt(query: string, summaries: SummaryEntry[]): string {
+    const candidates = summaries.map((summary) => ({
+      id: summary.id,
+      level: summary.summaryLevel ?? 1,
+      kind: summary.nodeKind ?? "leaf",
+      turns: `${summary.startTurn}-${summary.endTurn}`,
+      parentSummaryIds: summary.parentSummaryIds ?? (summary.parentSummaryId ? [summary.parentSummaryId] : []),
+      childSummaryIds: summary.childSummaryIds ?? summary.sourceSummaryIds ?? [],
+      summary: this.truncate(summary.summary, 500),
+      exactFacts: summary.exactFacts.slice(0, 8),
+      constraints: summary.constraints.slice(0, 6),
+      decisions: summary.decisions.slice(0, 6),
+      keyEntities: (summary.keyEntities ?? []).slice(0, 10),
+      keywords: summary.keywords.slice(0, 12),
+    }));
+    return [
+      "You are the delegated ChaunyOMS DAG expansion sub-agent.",
+      "Goal: choose only the summary ids that should be expanded back to raw source messages for the user query.",
+      "Hard rules:",
+      "- Return JSON only: {\"selectedSummaryIds\":[\"id\"],\"reason\":\"short reason\"}.",
+      "- Never invent ids. Choose ids only from the provided candidates.",
+      "- Prefer leaf nodes when available; choose branch nodes only when their children are missing or all needed.",
+      "- Choose the smallest sufficient set. Raw messages will be expanded by OMS after your selection.",
+      `Query: ${query}`,
+      `Candidates: ${JSON.stringify(candidates)}`,
+    ].join("\n");
+  }
+
+  private parseDelegatedSummaryIds(raw: string): string[] {
+    const trimmed = raw.trim();
+    const jsonText = trimmed.startsWith("{") ? trimmed : trimmed.match(/\{[\s\S]*\}/)?.[0];
+    if (!jsonText) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(jsonText) as { selectedSummaryIds?: unknown; summaryIds?: unknown };
+      const ids = Array.isArray(parsed.selectedSummaryIds)
+        ? parsed.selectedSummaryIds
+        : Array.isArray(parsed.summaryIds) ? parsed.summaryIds : [];
+      return ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        .map((id) => id.trim());
+    } catch {
+      return [];
+    }
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("delegated DAG expansion timed out")), Math.max(1, timeoutMs));
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  private truncate(value: string, maxLength: number): string {
+    return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
   }
 
   private buildEvidenceAtomItems(

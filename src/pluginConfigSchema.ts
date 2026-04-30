@@ -123,8 +123,8 @@ export const pluginConfigSchema = {
     },
     retrievalStrength: {
       type: "string",
-      enum: ["off", "light", "auto", "strict", "forensic"],
-      description: "Single retrieval policy knob. Controls recall depth, source-trace requirements, and evidence presentation.",
+      enum: ["low", "medium", "high", "xhigh", "custom"],
+      description: "Single retrieval policy knob aligned with model effort naming. low is light, medium is balanced/default, high requires source-backed answers, xhigh opens heavy retrieval lanes including RAG/Graph/Rerank, and custom honors explicit lane toggles.",
     },
     llmPlannerMode: {
       type: "string",
@@ -288,26 +288,26 @@ export const pluginConfigSchema = {
     graphProvider: {
       type: "string",
       enum: ["none", "sqlite_graph", "sqlite_edges", "external"],
-      description: "Graph provider. sqlite_graph is the local associative graph; sqlite_edges remains a compatibility alias.",
+      description: "Graph provider. Default none. sqlite_graph is the local associative graph; sqlite_edges remains a compatibility alias; external requires a real configured runtime provider.",
     },
     ragProvider: {
       type: "string",
       enum: ["none", "sqlite_vec", "brute_force", "embedding", "external"],
-      description: "RAG provider. sqlite_vec is the preferred local vector path; brute_force is the isolated fallback when extensions are unavailable.",
+      description: "RAG provider. Default none. sqlite_vec is the preferred configured local vector path; brute_force is an explicit local fallback, never implicit.",
     },
     rerankProvider: {
       type: "string",
       enum: ["none", "deterministic", "llm", "specialist", "model", "external"],
-      description: "Rerank provider. deterministic is local fallback; llm/specialist/external are optional heavier orderers.",
+      description: "Rerank provider. Default none. deterministic is an explicit local orderer; llm/specialist/model/external require real provider wiring and never fall back implicitly.",
     },
     embeddingEnabled: {
       type: "boolean",
-      description: "Enable embedding writes/jobs for RAG. Default false so existing hot path stays unchanged.",
+      description: "Enable embedding writes/jobs for RAG. Default false; RAG cannot run unless embeddings are explicitly configured.",
     },
     embeddingProvider: {
       type: "string",
       enum: ["none", "local_hash", "external"],
-      description: "Embedding generator. local_hash is deterministic and dependency-free; external is reserved for model-backed embeddings.",
+      description: "Embedding generator. Default none keeps vector search off without a real embedding runtime. local_hash is explicit dev/test fallback; external is reserved for model-backed embeddings.",
     },
     embeddingModel: {
       type: "string",
@@ -352,7 +352,7 @@ export const pluginConfigSchema = {
     },
     ragFallbackToBruteForce: {
       type: "boolean",
-      description: "If sqlite_vec is unavailable, fall back to local TypeScript cosine search instead of failing the main OMS path.",
+      description: "Explicitly allow sqlite_vec to fall back to local TypeScript cosine search if the vector extension is unavailable. Default false.",
     },
     graphBuilderEnabled: {
       type: "boolean",
@@ -361,7 +361,7 @@ export const pluginConfigSchema = {
     graphBuilderProvider: {
       type: "string",
       enum: ["none", "deterministic", "llm", "external"],
-      description: "Graph edge builder. deterministic is local safe default; llm/external are optional.",
+      description: "Graph edge builder. Default none. deterministic is explicit local/dev construction; llm/external require real configured runtime providers and never masquerade as deterministic.",
     },
     graphMaxDepth: {
       type: "number",
@@ -400,7 +400,48 @@ export const pluginConfigSchema = {
     },
     rerankFallbackToDeterministic: {
       type: "boolean",
-      description: "Use deterministic local rerank if llm/specialist/external rerank is unavailable.",
+      description: "Explicit fallback flag for model/external rerank. Default false; no deterministic fallback is implicit.",
+    },
+    evidenceAnswerResolverEnabled: {
+      type: "boolean",
+      description: "Enable final evidence-to-answer resolution. Default false; resolver cannot run without an explicit provider.",
+    },
+    evidenceAnswerResolverProvider: {
+      type: "string",
+      enum: ["none", "deterministic", "llm", "external"],
+      description: "EvidenceAnswerResolver provider. Default none. deterministic is explicit local resolution; llm/external require configured model/runtime and hard source validation.",
+    },
+    evidenceAnswerResolverModel: {
+      type: "string",
+      description: "Required model id for llm/external EvidenceAnswerResolver providers.",
+    },
+    evidenceAnswerResolverTimeoutMs: {
+      type: "number",
+      minimum: 1,
+      description: "Timeout budget for evidence-to-answer model resolution.",
+    },
+    evidenceAnswerResolverFallbackToDeterministic: {
+      type: "boolean",
+      description: "Explicit fallback from llm/external EvidenceAnswerResolver to deterministic. Default false; no fallback is implicit.",
+    },
+    dagExpansionMode: {
+      type: "string",
+      enum: ["deterministic", "planner_decides", "delegated_agent"],
+      description: "DAG raw-source expansion mode. deterministic uses in-process SummaryDagResolver/SourceMessageResolver; planner_decides lets LLMPlanner choose; delegated_agent allows a configured sub-agent style expansion lane.",
+    },
+    dagExpansionAgentProvider: {
+      type: "string",
+      enum: ["none", "host_subagent", "llm"],
+      description: "Provider for delegated DAG expansion. Default none; delegated_agent is unavailable until this is explicitly configured.",
+    },
+    dagExpansionAgentModel: {
+      type: "string",
+      description: "Optional model for delegated DAG expansion agent/provider.",
+    },
+    dagExpansionAgentTimeoutMs: {
+      type: "number",
+      minimum: 1,
+      description: "Timeout budget for delegated DAG expansion agent/provider.",
     },
     featureIsolationMode: {
       type: "string",

@@ -11,6 +11,7 @@ import { OpenClawNativeAbsorber } from "../native/OpenClawNativeAbsorber";
 import { RetrievalVerifier, RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
+import { EvidenceAnswerResolution, EvidenceAnswerResolver } from "../resolvers/EvidenceAnswerResolver";
 import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
 import { EnvironmentDoctor } from "../system/EnvironmentDoctor";
 import {
@@ -100,6 +101,7 @@ interface RecallTextDiagnostics {
   persistentEvidenceAtomHitCount?: number;
   transientEvidenceAtomHitCount?: number;
   retrievalVerification?: RetrievalVerificationResult;
+  evidenceAnswer?: EvidenceAnswerResolution;
 }
 
 interface PlannerAuditContext {
@@ -128,6 +130,7 @@ export class ChaunyomsRetrievalService {
   private readonly planValidator = new PlanValidator();
   private readonly retrievalRuntime = new RetrievalRuntime();
   private readonly retrievalVerifier = new RetrievalVerifier();
+  private readonly evidenceAnswerResolver = new EvidenceAnswerResolver();
   private readonly deterministicReranker = new DeterministicReranker();
   private readonly fixedPrefixProvider: FixedPrefixProvider;
 
@@ -202,32 +205,33 @@ export class ChaunyomsRetrievalService {
         retrievalStrength,
       },
     };
-    const stores = await this.runtime.getSessionStores(context);
-    const { rawStore, summaryStore, projectStore } = stores;
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
-
-    if (retrievalStrength === "off") {
+    if (this.getBooleanArg(args, "losslessFastPath", false) ||
+      this.getBooleanArg(args, "directGrep", false)) {
+      const direct = await this.executeOmsGrep({
+        ...(this.isRecord(args) ? args : {}),
+        query,
+      });
       return {
-        content: [{
-          type: "text",
-          text: "ChaunyOMS retrieval is off for this request; no memory, summary, knowledge, or source recall layers were consulted.",
-        }],
+        ...direct,
         details: {
+          ...(this.isRecord(direct.details) ? direct.details : {}),
           ok: true,
           query,
-          route: "recent_tail",
-          retrievalStrength,
-          retrievalHitType: "disabled",
-          sourceTraceRequired: false,
-          evidencePresentation: "none",
-          consultedLayers: [],
+          retrievalHitType: "raw_exact_search",
+          recallStrategy: "lossless_direct_grep",
+          losslessFastPath: true,
+          autoRecall: false,
+          autoRecallReason: "losslessFastPath/directGrep requested; bypassed planner/rerank/evidence-answer stack.",
         },
       };
     }
 
+    const stores = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, projectStore } = stores;
     const scope = this.getScopeArg(args);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
@@ -361,13 +365,22 @@ export class ChaunyomsRetrievalService {
       const recallBudget = retrievalBudget.total;
       const rawFtsMessageIds = rawFtsHints.map((hit) => hit.message.id);
       const recallStartedAt = Date.now();
-      const result = this.recallResolver.resolve(query, summaryStore, rawStore, recallBudget, {
+      const result = await this.recallResolver.resolveAsync(query, summaryStore, rawStore, recallBudget, {
         sessionId: scopedSessionId,
         rawHintMessageIds: rawFtsMessageIds,
         rawCandidateMessageIds: rawFtsMessageIds,
         allowRawFirst: decision.reason !== "keyword_query_with_compacted_history",
         allowWideFallback: this.allowWideRawFallback(args, decision),
         includeSummaryItems: true,
+        requireRawSource: this.isHardSourceTraceRequired(context),
+        dagExpansion: {
+          mode: decision.planner?.dagExpansion.mode ?? "deterministic",
+          agentProvider: decision.planner?.dagExpansion.agentProvider ?? context.config.dagExpansionAgentProvider,
+          fallbackMode: decision.planner?.dagExpansion.fallbackMode ?? "deterministic",
+          model: context.config.dagExpansionAgentModel,
+          timeoutMs: context.config.dagExpansionAgentTimeoutMs,
+          llmCaller: this.runtime.getLlmCaller(),
+        },
       });
       timings.resolveMs = Date.now() - recallStartedAt;
       const atomStartedAt = Date.now();
@@ -388,7 +401,7 @@ export class ChaunyomsRetrievalService {
         semanticExpansion,
         recallBudget,
       );
-      const planned = this.planRecallItems(query, enhancedResult, retrievalBudget, context.config, decision);
+      const planned = await this.planRecallItems(query, enhancedResult, retrievalBudget, context.config, decision);
       timings.planMs = Date.now() - planStartedAt;
       const evidenceGate = this.evaluateEvidenceGate(query, planned.items, enhancedResult);
       const retrievalVerification = this.retrievalVerifier.verify({
@@ -397,6 +410,21 @@ export class ChaunyomsRetrievalService {
         sourceTrace: enhancedResult.sourceTrace,
         answerCandidates: enhancedResult.answerCandidates,
         recallResult: enhancedResult,
+      });
+      const evidenceAnswer = await this.evidenceAnswerResolver.resolve({
+        query,
+        items: planned.items,
+        sourceTrace: enhancedResult.sourceTrace,
+        answerCandidates: enhancedResult.answerCandidates,
+        retrievalStrength,
+        config: {
+          enabled: context.config.evidenceAnswerResolverEnabled,
+          provider: context.config.evidenceAnswerResolverProvider,
+          model: context.config.evidenceAnswerResolverModel,
+          timeoutMs: context.config.evidenceAnswerResolverTimeoutMs,
+          fallbackToDeterministic: context.config.evidenceAnswerResolverFallbackToDeterministic,
+        },
+        llmCaller: this.runtime.getLlmCaller(),
       });
       const persistentEvidenceAtomHitCount = atomResult.items.filter((item) =>
         item.metadata?.persistentEvidenceAtom === true,
@@ -420,14 +448,15 @@ export class ChaunyomsRetrievalService {
         route: decision.route,
         retrievalStrength,
         usageFeedbackEnabled: context.config.usageFeedbackEnabled,
-        answerUsed: retrievalVerification.status === "sufficient" && retrievalVerification.recommendedAction === "answer",
-        verifiedAnswerUsed: retrievalVerification.verifiedTraceCount > 0 || retrievalVerification.verifiedAnswerCount > 0,
+        answerUsed: evidenceAnswer.status === "answered",
+        verifiedAnswerUsed: evidenceAnswer.status === "answered" && evidenceAnswer.sourceVerified,
         planner: decision.planner ?? null,
         plannerRunId: decision.planner?.runId ?? null,
         plannerIntent: decision.planner?.intent.primary ?? null,
         selectedPlan: decision.planner?.selectedPlan ?? "deterministic",
         sourceTraceRequired: this.isSourceTraceRequired(decision, context),
         retrievalVerification,
+        evidenceAnswer,
         evidenceGate,
         progressiveRetrievalSteps,
         rerankAudit: planned.rerankAudit,
@@ -461,6 +490,7 @@ export class ChaunyomsRetrievalService {
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
           retrievalVerification,
+          evidenceAnswer,
         }) }],
         details: {
           ok: true,
@@ -476,6 +506,8 @@ export class ChaunyomsRetrievalService {
           transientEvidenceAtomHitCount,
           evidenceGate,
           retrievalVerification,
+          evidenceAnswer,
+          dagExpansion: enhancedResult.dagExpansion ?? null,
           progressiveRetrievalSteps,
           rerankAudit: planned.rerankAudit,
           rawFtsHintCount: rawFtsHints.length,
@@ -645,21 +677,45 @@ export class ChaunyomsRetrievalService {
     if (!query) {
       return this.buildMissingQueryResponse("oms_grep");
     }
-    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const assumeRuntimeFresh = this.getBooleanArg(args, "assumeRuntimeFresh", false) ||
+      this.getBooleanArg(args, "skipRuntimeMirror", false);
+    const runtimeStore = await this.runtime.getRuntimeStore(context, {
+      ensure: !assumeRuntimeFresh,
+      mirror: !assumeRuntimeFresh,
+    });
     const limit = this.getNumberArg(args, "limit", 10);
     const contextTurns = this.getNumberArg(args, "contextTurns", 1);
     const scope = this.getScopeArg(args);
+    const fastOnly = this.getBooleanArg(args, "fastOnly", false) ||
+      this.getBooleanArg(args, "losslessFastPath", false) ||
+      this.getBooleanArg(args, "directGrep", false);
+    const includeFreshTail = this.getBooleanArg(args, "includeFreshTail", false) ||
+      this.getBooleanArg(args, "losslessFastPath", false);
+    const recentTailTurns = Math.max(0, Math.min(16, Math.floor(this.getNumberArg(args, "recentTailTurns", 8))));
+    const maxCharsPerHit = Math.max(240, Math.min(20000, Math.floor(this.getNumberArg(args, "maxCharsPerHit", fastOnly ? 1600 : 4000))));
+    const maxCharsPerFreshTail = Math.max(240, Math.min(20000, Math.floor(this.getNumberArg(args, "maxCharsPerFreshTail", fastOnly ? 1200 : 4000))));
+    const startedAt = Date.now();
+    const scopedSessionId = scope === "session" ? context.sessionId : undefined;
+    const freshTail = includeFreshTail
+      ? runtimeStore.getAssemblyRecentTailByTokens(9000, recentTailTurns, scopedSessionId)
+      : [];
     const hits = runtimeStore.grepMessages(query, {
-      sessionId: scope === "session" ? context.sessionId : undefined,
+      sessionId: scopedSessionId,
       limit,
       contextTurns,
+      fastOnly,
     });
+    const grepMs = Date.now() - startedAt;
+    const freshTailText = freshTail.length > 0
+      ? ["## Fresh tail", ...freshTail.map((message) => `${message.role}: ${this.truncateText(message.content, maxCharsPerFreshTail)}`)].join("\n")
+      : "";
+    const hitText = hits.length > 0
+      ? ["## Grep hits", hits.map((hit, index) => this.formatGrepHit(index + 1, hit, maxCharsPerHit)).join("\n\n---\n\n")].join("\n")
+      : `No raw message hit found for query: ${query}`;
     return {
       content: [{
         type: "text",
-        text: hits.length > 0
-          ? hits.map((hit, index) => this.formatGrepHit(index + 1, hit)).join("\n\n---\n\n")
-          : `No raw message hit found for query: ${query}`,
+        text: [freshTailText, hitText].filter(Boolean).join("\n\n"),
       }],
       details: {
         ok: true,
@@ -667,7 +723,14 @@ export class ChaunyomsRetrievalService {
         scope,
         runtimeStore: runtimeStore.isEnabled() ? "sqlite" : "disabled",
         dbPath: runtimeStore.getPath(),
+        assumeRuntimeFresh,
         hitCount: hits.length,
+        freshTailCount: freshTail.length,
+        includeFreshTail,
+        fastOnly,
+        maxCharsPerHit,
+        maxCharsPerFreshTail,
+        grepMs,
         retrievalHitType: "raw_exact_search",
       },
     };
@@ -940,6 +1003,13 @@ export class ChaunyomsRetrievalService {
     const configGuidance = this.payloadAdapter.describeConfigGuidance(context.config);
     const openClawCompatibility = this.payloadAdapter.inspectOpenClawCompatibility();
     const recommendedConfig = {
+      agents: {
+        defaults: {
+          memorySearch: {
+            enabled: false,
+          },
+        },
+      },
       plugins: {
         slots: {
           memory: "oms",
@@ -980,7 +1050,6 @@ export class ChaunyomsRetrievalService {
           "memory-core": { enabled: false },
           "active-memory": { enabled: false },
           "memory-wiki": { enabled: false },
-          dreaming: { enabled: false },
         },
       },
     };
@@ -1005,7 +1074,8 @@ export class ChaunyomsRetrievalService {
       checklist: [
         "Run oms_doctor after install; it verifies config, SQLite availability, source edges, and asset governance.",
         "Bind both plugins.slots.memory and plugins.slots.contextEngine to oms before enabling authoritative mode.",
-        "Disable OpenClaw memory-core, active-memory, memory-wiki, and dreaming so no Markdown-first fact source coexists with ChaunyOMS.",
+        "Disable OpenClaw memory-core, active-memory, and memory-wiki so no Markdown-first fact source coexists with ChaunyOMS; if a future Dream/Dreaming plugin is installed, leave it disabled or route it through OMS absorbed mode.",
+        "Disable OpenClaw native agents.defaults.memorySearch.enabled in authoritative OMS mode; otherwise OpenClaw doctor can still probe the disabled memory-core facade.",
         "Keep sqliteJournalMode=delete unless the deployment needs concurrent reads/writes and supports WAL files reliably.",
         "Leave knowledgePromotionEnabled=false until raw recall/compaction are stable for the project.",
         "Enable knowledgePromotionManualReviewEnabled=true when promotion is enabled and the UI wants a review queue.",
@@ -1413,9 +1483,9 @@ export class ChaunyomsRetrievalService {
       retrievalEnhancements: this.buildRetrievalEnhancementDiagnostics(context.config),
       openClawNativeMode: context.config.openClawNativeMode,
       sourceTraceRequired: this.isSourceTraceRequired(decision, context),
-      evidencePresentation: context.config.retrievalStrength === "forensic"
+      evidencePresentation: context.config.retrievalStrength === "xhigh"
         ? "show_source_trace"
-        : context.config.retrievalStrength === "strict"
+        : context.config.retrievalStrength === "high"
           ? "show_when_needed"
           : "hidden_by_default",
       emergencyBrake: context.config.emergencyBrake,
@@ -1755,9 +1825,25 @@ export class ChaunyomsRetrievalService {
 
   private resolveRetrievalStrength(args: unknown, fallback: RetrievalStrength): RetrievalStrength {
     const value = this.getStringArg(args, "retrievalStrength").toLowerCase();
-    return ["off", "light", "auto", "strict", "forensic"].includes(value)
-      ? value as RetrievalStrength
-      : fallback;
+    switch (value) {
+      case "low":
+      case "medium":
+      case "high":
+      case "xhigh":
+      case "custom":
+        return value;
+      case "off":
+      case "light":
+        return "low";
+      case "auto":
+        return "medium";
+      case "strict":
+        return "high";
+      case "forensic":
+        return "xhigh";
+      default:
+        return fallback;
+    }
   }
 
   private getNumberArg(args: unknown, key: string, fallback: number): number {
@@ -1835,7 +1921,7 @@ export class ChaunyomsRetrievalService {
     const deepRecall = this.isRecord(args) && (args.deepRecall === true || args.qualityMode === true);
     const maxItems = this.getOptionalNumberArg(args, "maxItems");
     const maxCharsPerItem = this.getOptionalNumberArg(args, "maxCharsPerItem");
-    const forcedTrace = retrievalStrength === "strict" || retrievalStrength === "forensic";
+    const forcedTrace = retrievalStrength === "high" || retrievalStrength === "xhigh";
     return {
       maxItems: Math.max(1, Math.min(12, Math.floor(maxItems ?? (deepRecall ? 8 : 4)))),
       maxCharsPerItem: Math.max(240, Math.min(2000, Math.floor(maxCharsPerItem ?? (deepRecall ? 1200 : 700)))),
@@ -2154,18 +2240,18 @@ export class ChaunyomsRetrievalService {
     }));
   }
 
-  private planRecallItems(
+  private async planRecallItems(
     query: string,
     result: RecallResult,
     retrievalBudget: RetrievalBudgetPlan,
     config: LifecycleContext["config"] = DEFAULT_BRIDGE_CONFIG,
     decision?: RetrievalDecision,
-  ): {
+  ): Promise<{
     items: ContextItem[];
     consumedTokens: number;
     plan: ReturnType<ContextPlanner["plan"]>;
     rerankAudit: RerankAudit;
-  } {
+  }> {
     const answerEvidenceIds = new Set((result.answerCandidates ?? []).flatMap((candidate) => candidate.evidenceMessageIds));
     const recallItems = result.items.map((item) =>
       this.buildBudgetAwareRecallItem(query, item, this.layerPerItemBudget(this.classifyRecallLayer(item), retrievalBudget)),
@@ -2206,10 +2292,11 @@ export class ChaunyomsRetrievalService {
         strictConflict: this.hasStrictCandidateConflict(config.retrievalStrength, result),
       },
     );
-    const orderedCandidates = reranked.candidates.map((candidate) => ({
+    const modelReranked = await this.tryModelRerank(query, reranked, config);
+    const orderedCandidates = modelReranked.candidates.map((candidate) => ({
       ...candidate.payload,
-      reasons: reranked.audit.used
-        ? [...candidate.payload.reasons, `rerank:${reranked.audit.provider}`]
+      reasons: modelReranked.audit.used
+        ? [...candidate.payload.reasons, `rerank:${modelReranked.audit.provider}`]
         : candidate.payload.reasons,
     }));
     const layerLimitedCandidates = this.applyRecallLayerBudgets(orderedCandidates, retrievalBudget);
@@ -2218,12 +2305,187 @@ export class ChaunyomsRetrievalService {
       items: plan.selected.map((candidate) => candidate.item),
       consumedTokens: plan.selectedTokens,
       plan,
-      rerankAudit: reranked.audit,
+      rerankAudit: modelReranked.audit,
     };
   }
 
+  private async tryModelRerank<T>(
+    query: string,
+    reranked: {
+      candidates: Array<{
+        id: string;
+        lane: string;
+        score: number;
+        sourceVerified?: boolean;
+        authority?: string;
+        tokenCount?: number;
+        payload: T;
+      }>;
+      audit: RerankAudit;
+    },
+    config: LifecycleContext["config"],
+  ): Promise<typeof reranked> {
+    if (!reranked.audit.required || reranked.audit.used) {
+      return reranked;
+    }
+    if (!config.rerankEnabled || config.rerankProvider !== "llm") {
+      return reranked;
+    }
+    if (!config.rerankModel?.trim()) {
+      return {
+        ...reranked,
+        audit: {
+          ...reranked.audit,
+          providerUnavailableReason: "rerank_model_required",
+        },
+      };
+    }
+    const llmCaller = this.runtime.getLlmCaller();
+    if (!llmCaller) {
+      return {
+        ...reranked,
+        audit: {
+          ...reranked.audit,
+          providerUnavailableReason: "rerank_llm_caller_unavailable",
+        },
+      };
+    }
+    try {
+      const orderedIds = await this.callLlmReranker(query, reranked.candidates, config);
+      const byId = new Map(reranked.candidates.map((candidate) => [candidate.id, candidate]));
+      const ordered = orderedIds
+        .map((id) => byId.get(id))
+        .filter((candidate): candidate is (typeof reranked.candidates)[number] => Boolean(candidate));
+      const seen = new Set(ordered.map((candidate) => candidate.id));
+      const completeOrder = [
+        ...ordered,
+        ...reranked.candidates.filter((candidate) => !seen.has(candidate.id)),
+      ];
+      return {
+        candidates: completeOrder,
+        audit: {
+          ...reranked.audit,
+          used: true,
+          provider: "llm",
+          providerAvailable: true,
+          providerUnavailableReason: undefined,
+          orderedCandidateIds: completeOrder.map((candidate) => candidate.id),
+        },
+      };
+    } catch (error) {
+      if (config.rerankFallbackToDeterministic) {
+        const fallback = new DeterministicReranker().rerank(reranked.candidates, {
+          ...config,
+          rerankEnabled: true,
+          rerankProvider: "deterministic",
+        }, { force: true });
+        return {
+          candidates: fallback.candidates,
+          audit: {
+            ...fallback.audit,
+            provider: "deterministic_fallback",
+            providerUnavailableReason: `explicit_deterministic_fallback_used:${error instanceof Error ? error.message : String(error)}`,
+          },
+        };
+      }
+      return {
+        ...reranked,
+        audit: {
+          ...reranked.audit,
+          providerUnavailableReason: `rerank_llm_failed:${error instanceof Error ? error.message : String(error)}`,
+        },
+      };
+    }
+  }
+
+  private async callLlmReranker<T>(
+    query: string,
+    candidates: Array<{
+      id: string;
+      lane: string;
+      score: number;
+      sourceVerified?: boolean;
+      authority?: string;
+      tokenCount?: number;
+      payload: T;
+    }>,
+    config: LifecycleContext["config"],
+  ): Promise<string[]> {
+    const llmCaller = this.runtime.getLlmCaller();
+    if (!llmCaller) {
+      throw new Error("llm_caller_missing");
+    }
+    const prompt = [
+      "You are ChaunyOMS Rerank. Order candidate ids by usefulness for answering the query.",
+      'Return JSON only: {"orderedIds":["id"]}.' ,
+      "Prefer source-verified raw/atom evidence over weak hints when relevance is comparable.",
+      `query=${JSON.stringify(query)}`,
+      `candidates=${JSON.stringify(candidates.slice(0, config.maxRerankCandidates).map((candidate) => ({
+        id: candidate.id,
+        lane: candidate.lane,
+        score: candidate.score,
+        sourceVerified: candidate.sourceVerified === true,
+        authority: candidate.authority,
+        tokenCount: candidate.tokenCount,
+        preview: this.previewRerankPayload(candidate.payload),
+      })))}`,
+    ].join("\n");
+    const raw = await this.withTimeout(
+      llmCaller.call({
+        model: config.rerankModel,
+        prompt,
+        temperature: 0,
+        maxOutputTokens: 160,
+        responseFormat: "json",
+      }),
+      config.rerankTimeoutMs,
+    );
+    const parsed = this.parseJsonObject(raw) as { orderedIds?: unknown };
+    if (!Array.isArray(parsed.orderedIds)) {
+      throw new Error("rerank_response_missing_orderedIds");
+    }
+    return parsed.orderedIds.map((id) => String(id)).filter(Boolean);
+  }
+
+  private previewRerankPayload(payload: unknown): string {
+    const item = typeof payload === "object" && payload !== null && "item" in payload
+      ? (payload as { item?: { content?: unknown } }).item
+      : null;
+    const content = typeof item?.content === "string"
+      ? item.content
+      : JSON.stringify(payload);
+    return content.slice(0, 500);
+  }
+
+  private parseJsonObject(raw: string): Record<string, unknown> {
+    const trimmed = raw.trim();
+    const jsonText = trimmed.startsWith("{")
+      ? trimmed
+      : trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1);
+    if (!jsonText || !jsonText.startsWith("{")) {
+      throw new Error("invalid_json_response");
+    }
+    return JSON.parse(jsonText) as Record<string, unknown>;
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
   private hasStrictCandidateConflict(retrievalStrength: RetrievalStrength, result: RecallResult): boolean {
-    if (retrievalStrength !== "strict" && retrievalStrength !== "forensic") {
+    if (retrievalStrength !== "high" && retrievalStrength !== "xhigh") {
       return false;
     }
     const sourceBackedAnswers = (result.answerCandidates ?? [])
@@ -2826,6 +3088,8 @@ export class ChaunyomsRetrievalService {
         strictModeRequiresRerankOnConflict: context.config.strictModeRequiresRerankOnConflict,
         estimatedCandidateCount: scopedMemoryItemHits.length + (routeContext.hasCompactedHistory ? 1 : 0),
         candidateOverload: scopedMemoryItemHits.length >= context.config.laneCandidateRerankThreshold,
+        dagExpansionMode: context.config.dagExpansionMode,
+        dagExpansionAgentProvider: context.config.dagExpansionAgentProvider,
       },
     });
     const validation = this.planValidator.validate(plannerResult.plan);
@@ -2954,6 +3218,19 @@ export class ChaunyomsRetrievalService {
           "",
         ].join("\n")
       : "";
+    const evidenceAnswer = diagnostics.evidenceAnswer
+      ? [
+          "Evidence answer resolver:",
+          diagnostics.evidenceAnswer.status === "answered"
+            ? `- answer=${diagnostics.evidenceAnswer.answer} (${diagnostics.evidenceAnswer.type}, confidence=${diagnostics.evidenceAnswer.confidence}, sourceVerified=${diagnostics.evidenceAnswer.sourceVerified})`
+            : `- status=${diagnostics.evidenceAnswer.status}`,
+          `- reason=${diagnostics.evidenceAnswer.reason}`,
+          diagnostics.evidenceAnswer.alternatives.length > 0
+            ? `- alternatives=${diagnostics.evidenceAnswer.alternatives.map((item) => `${item.answer}:${item.confidence}`).join(", ")}`
+            : "",
+          "",
+        ].filter((line) => line.length > 0).join("\n")
+      : "";
     const summaryItems = items.filter((item) => item.kind === "summary");
     const messageItems = items
       .filter((item) => item.kind !== "summary")
@@ -3008,6 +3285,7 @@ export class ChaunyomsRetrievalService {
       gate,
       budget,
       verifier,
+      evidenceAnswer,
       localMatchText,
       messages,
       omitted,
@@ -3387,16 +3665,16 @@ export class ChaunyomsRetrievalService {
     };
   }
 
-  private formatGrepHit(index: number, hit: OmsGrepHit): string {
+  private formatGrepHit(index: number, hit: OmsGrepHit, maxCharsPerMessage = 4000): string {
     const before = hit.before.map((message) =>
-      `  before [turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+      `  before [turn ${message.turnNumber}] ${message.role}: ${this.truncateText(message.content, maxCharsPerMessage)}`,
     );
     const after = hit.after.map((message) =>
-      `  after [turn ${message.turnNumber}] ${message.role}: ${message.content}`,
+      `  after [turn ${message.turnNumber}] ${message.role}: ${this.truncateText(message.content, maxCharsPerMessage)}`,
     );
     return [
       `${index}. [score ${hit.score}] [turn ${hit.message.turnNumber}] ${hit.message.role} ${hit.message.id}`,
-      hit.message.content,
+      this.truncateText(hit.message.content, maxCharsPerMessage),
       ...before,
       ...after,
     ].join("\n");
@@ -3590,13 +3868,13 @@ export class ChaunyomsRetrievalService {
 
   private isSourceTraceRequired(decision: RetrievalDecision, context: LifecycleContext): boolean {
     return decision.planner?.sourceTraceRequired === true ||
-      context.config.retrievalStrength === "strict" ||
-      context.config.retrievalStrength === "forensic";
+      context.config.retrievalStrength === "high" ||
+      context.config.retrievalStrength === "xhigh";
   }
 
   private isHardSourceTraceRequired(context: LifecycleContext): boolean {
-    return context.config.retrievalStrength === "strict" ||
-      context.config.retrievalStrength === "forensic";
+    return context.config.retrievalStrength === "high" ||
+      context.config.retrievalStrength === "xhigh";
   }
 
   private explainAutoRecall(decision: RetrievalDecision, context: LifecycleContext): string | null {

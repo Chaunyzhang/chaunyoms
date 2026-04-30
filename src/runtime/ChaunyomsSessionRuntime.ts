@@ -822,9 +822,16 @@ export class ChaunyomsSessionRuntime {
     return await this.ensureSession(context.sessionId, context.config);
   }
 
-  async getRuntimeStore(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SQLiteRuntimeStore> {
-    await this.ensureSession(context.sessionId, context.config);
-    await this.sessionData.mirrorRuntimeState();
+  async getRuntimeStore(
+    context: Pick<LifecycleContext, "sessionId" | "config">,
+    options: { mirror?: boolean; ensure?: boolean } = {},
+  ): Promise<SQLiteRuntimeStore> {
+    if (options.ensure !== false) {
+      await this.ensureSession(context.sessionId, context.config);
+    }
+    if (options.mirror !== false) {
+      await this.sessionData.mirrorRuntimeState();
+    }
     return this.sessionData.getRuntimeStore();
   }
 
