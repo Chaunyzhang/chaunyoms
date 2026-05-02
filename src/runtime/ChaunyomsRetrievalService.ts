@@ -11,6 +11,7 @@ import { OpenClawNativeAbsorber } from "../native/OpenClawNativeAbsorber";
 import { RetrievalVerifier, RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallResolver } from "../resolvers/RecallResolver";
+import { RecallQueryAnalyzer } from "../resolvers/RecallQueryAnalyzer";
 import { EvidenceAnswerResolution, EvidenceAnswerResolver } from "../resolvers/EvidenceAnswerResolver";
 import { scoreIntentRoleMatch } from "../resolvers/RecallIntentRoles";
 import { EnvironmentDoctor } from "../system/EnvironmentDoctor";
@@ -28,6 +29,7 @@ import {
   SemanticCandidate,
   SourceTrace,
   SummaryEntry,
+  SummaryRepository,
   DagTraversalStep,
 } from "../types";
 import {
@@ -129,6 +131,7 @@ export class ChaunyomsRetrievalService {
   private readonly llmPlanner = new LLMPlanner(() => this.runtime.getLlmCaller());
   private readonly planValidator = new PlanValidator();
   private readonly retrievalRuntime = new RetrievalRuntime();
+  private readonly recallQueryAnalyzer = new RecallQueryAnalyzer();
   private readonly retrievalVerifier = new RetrievalVerifier();
   private readonly evidenceAnswerResolver = new EvidenceAnswerResolver();
   private readonly deterministicReranker = new DeterministicReranker();
@@ -150,6 +153,7 @@ export class ChaunyomsRetrievalService {
     const scope = this.getScopeArg(args);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
+    const recallSearchQueries = this.buildRecallSearchQueries(query);
     const semanticExpansion = await this.collectSemanticExpansion({
       query,
       context,
@@ -157,7 +161,7 @@ export class ChaunyomsRetrievalService {
       runtimeStore,
       allowIndexing: false,
       memoryItems: runtimeStore.listMemoryItems({ agentId: context.config.agentId }),
-      summaryHits: stores.summaryStore.search(query, { sessionId: scopedSessionId }),
+      summaryHits: this.collectSummarySearchHits(stores.summaryStore, recallSearchQueries, scopedSessionId),
       projects: stores.projectStore.getAll().filter((project) => project.status !== "archived"),
       matchedProject: decision.matchedProjectId
         ? stores.projectStore.findById(decision.matchedProjectId)
@@ -209,8 +213,13 @@ export class ChaunyomsRetrievalService {
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
-    if (this.getBooleanArg(args, "losslessFastPath", false) ||
-      this.getBooleanArg(args, "directGrep", false)) {
+    if (
+      !context.config.forceDagOnlyRecall &&
+      (
+        this.getBooleanArg(args, "losslessFastPath", false) ||
+        this.getBooleanArg(args, "directGrep", false)
+      )
+    ) {
       const direct = await this.executeOmsGrep({
         ...(this.isRecord(args) ? args : {}),
         query,
@@ -235,6 +244,7 @@ export class ChaunyomsRetrievalService {
     const scope = this.getScopeArg(args);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
+    const recallSearchQueries = this.buildRecallSearchQueries(query);
     if (this.isPlannerValidationBlocked(decision)) {
       await this.recordPlannerAuditOnly(context, query, decision, "memory_retrieve_planner_blocked", {
         validationBlocked: true,
@@ -274,7 +284,7 @@ export class ChaunyomsRetrievalService {
         agentId: context.config.agentId,
         includeRetrievalUsage: context.config.usageFeedbackEnabled,
       }),
-      summaryHits: summaryStore.search(query, { sessionId: scopedSessionId }),
+      summaryHits: this.collectSummarySearchHits(summaryStore, recallSearchQueries, scopedSessionId),
       projects: activeProjects,
       matchedProject,
     });
@@ -354,23 +364,25 @@ export class ChaunyomsRetrievalService {
       const startedAt = Date.now();
       const ftsStartedAt = Date.now();
       const rawFtsHints = this.shouldUseFtsRecallHints(args, context)
-        ? (await this.runtime.getRuntimeStore(context)).grepMessages(query, {
-            sessionId: scopedSessionId,
-            limit: this.resolveRawFtsHintLimit(args),
-            contextTurns: 0,
-          })
+        ? await this.collectRawFtsHints(
+          context,
+          this.buildRecallSearchQueries(query),
+          scopedSessionId,
+          this.resolveRawFtsHintLimit(args),
+        )
         : [];
       timings.ftsMs = Date.now() - ftsStartedAt;
       const retrievalBudget = this.resolveRetrievalBudgetPlan(args, context.totalBudget);
       const recallBudget = retrievalBudget.total;
       const rawFtsMessageIds = rawFtsHints.map((hit) => hit.message.id);
       const recallStartedAt = Date.now();
+      const dagOnlyRecall = this.shouldPreferDagOnlyRecall(query, summaryStore, context);
       const result = await this.recallResolver.resolveAsync(query, summaryStore, rawStore, recallBudget, {
         sessionId: scopedSessionId,
         rawHintMessageIds: rawFtsMessageIds,
         rawCandidateMessageIds: rawFtsMessageIds,
-        allowRawFirst: decision.reason !== "keyword_query_with_compacted_history",
-        allowWideFallback: this.allowWideRawFallback(args, decision),
+        allowRawFirst: dagOnlyRecall ? false : decision.reason !== "keyword_query_with_compacted_history",
+        allowWideFallback: dagOnlyRecall ? false : this.allowWideRawFallback(args, decision),
         includeSummaryItems: true,
         requireRawSource: this.isHardSourceTraceRequired(context),
         dagExpansion: {
@@ -673,6 +685,19 @@ export class ChaunyomsRetrievalService {
 
   async executeOmsGrep(args: unknown): Promise<ToolResponse> {
     const context = this.resolveContext(args);
+    if (context.config.forceDagOnlyRecall) {
+      return {
+        content: [{
+          type: "text",
+          text: "oms_grep is disabled in this environment because forceDagOnlyRecall=true. Use memory_retrieve so OMS stays on the summary/DAG navigation path.",
+        }],
+        details: {
+          ok: false,
+          reason: "forceDagOnlyRecall_enabled",
+          query: this.getQuery(args),
+        },
+      };
+    }
     const query = this.getQuery(args);
     if (!query) {
       return this.buildMissingQueryResponse("oms_grep");
@@ -3097,15 +3122,136 @@ export class ChaunyomsRetrievalService {
       context.config.llmPlannerMode === "auto" &&
       plannerResult.plan.activation.mode === "llm_planner" &&
       validation.accepted;
-    const decision = this.retrievalRuntime.decisionFromPlan({
+    const decision = this.applyOpenClawRecallOverride(
+      query,
+      context,
+      this.retrievalRuntime.decisionFromPlan({
       plan: plannerResult.plan,
       validation,
       deterministicDecision,
       usePlanner,
-    });
+      }),
+      routeContext.hasCompactedHistory || rawStore.getAll({ sessionId: context.sessionId }).length > 0,
+    );
     return {
       decision,
     };
+  }
+
+  private applyOpenClawRecallOverride(
+    query: string,
+    context: LifecycleContext,
+    decision: RetrievalDecision,
+    hasHistoricalStore: boolean,
+  ): RetrievalDecision {
+    if (context.config.openClawRuntimeProfile !== "lightweight") {
+      return decision;
+    }
+    if (!hasHistoricalStore) {
+      return decision;
+    }
+    if (!this.isLosslessStyleFactRecallQuery(query) && !this.isDagOnlyKeywordRecallQuery(query)) {
+      return decision;
+    }
+    if (decision.route === "summary_tree" && decision.requiresSourceRecall) {
+      return decision;
+    }
+    return {
+      ...decision,
+      route: "summary_tree",
+      reason: "lightweight_fact_qa_forces_summary_tree",
+      requiresSourceRecall: true,
+      canAnswerDirectly: false,
+      routePlan: ["summary_tree", "recent_tail"],
+      explanation: "This is a historical fact lookup under the lightweight OpenClaw profile, so OMS should follow the summary/DAG-to-source recall chain instead of answering from volatile context or substrate memory.",
+    };
+  }
+
+  private isLosslessStyleFactRecallQuery(query: string): boolean {
+    return /^(who|what|where|when|which)\b|how\s+(?:long|much|many)\b|(?:什么|哪里|哪儿|何时|什么时候|多久|多长|多少)/i.test(query.trim());
+  }
+
+  private isDagOnlyKeywordRecallQuery(query: string): boolean {
+    const understanding = this.recallQueryAnalyzer.analyze(query);
+    if (understanding.historyQa) {
+      return true;
+    }
+    if (understanding.terms.length === 0 || understanding.terms.length > 8) {
+      return false;
+    }
+    if (this.referencesCurrentWork(query)) {
+      return false;
+    }
+    if (/(status|state|progress|next step|next action|todo|pending|blocker|decision|knowledge|doc|docs|architecture|project|repo|branch|build|test)/i.test(query)) {
+      return false;
+    }
+    return understanding.answerType !== "unknown" || understanding.transcriptLike;
+  }
+
+  private buildRecallSearchQueries(query: string): string[] {
+    const understanding = new RecallQueryAnalyzer().analyze(query);
+    const variants = new Set<string>();
+    const trimmed = query.trim();
+    if (trimmed) {
+      variants.add(trimmed);
+    }
+    const termLine = understanding.terms.slice(0, 6).join(" ").trim();
+    if (termLine) {
+      variants.add(termLine);
+    }
+    const hintLine = understanding.eventHints
+      .filter((hint, index, array) => hint.length >= 3 && array.indexOf(hint) === index)
+      .slice(0, 6)
+      .join(" ")
+      .trim();
+    if (hintLine) {
+      variants.add(hintLine);
+    }
+    return [...variants];
+  }
+
+  private collectSummarySearchHits(
+    summaryStore: SummaryRepository,
+    queries: string[],
+    sessionId?: string,
+  ): SummaryEntry[] {
+    const byId = new Map<string, SummaryEntry>();
+    for (const query of queries) {
+      for (const hit of summaryStore.search(query, { sessionId })) {
+        if (!byId.has(hit.id)) {
+          byId.set(hit.id, hit);
+        }
+      }
+    }
+    return [...byId.values()];
+  }
+
+  private async collectRawFtsHints(
+    context: LifecycleContext,
+    queries: string[],
+    sessionId: string | undefined,
+    limit: number,
+  ): Promise<OmsGrepHit[]> {
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const byId = new Map<string, OmsGrepHit>();
+    for (const query of queries) {
+      for (const hit of runtimeStore.grepMessages(query, {
+        sessionId,
+        limit,
+        contextTurns: 0,
+      })) {
+        if (!byId.has(hit.message.id)) {
+          byId.set(hit.message.id, hit);
+        }
+        if (byId.size >= limit) {
+          break;
+        }
+      }
+      if (byId.size >= limit) {
+        break;
+      }
+    }
+    return [...byId.values()];
   }
 
   private classifyQueryComplexity(query: string): "low" | "medium" | "high" {
@@ -3377,6 +3523,23 @@ export class ChaunyomsRetrievalService {
 
   private shouldProbeMemoryItems(query: string): boolean {
     return /(current|latest|now|currently|updated|correction|after correction|exact|parameter|constraint|decision|rule|setting|config|remember|must|当前|最新|修正后|参数|约束|决策|规则|配置|记住)/i.test(query);
+  }
+
+  private shouldPreferDagOnlyRecall(
+    query: string,
+    summaryStore: SummaryRepository,
+    context: LifecycleContext,
+  ): boolean {
+    if (context.config.forceDagOnlyRecall) {
+      return true;
+    }
+    if (context.config.openClawRuntimeProfile !== "lightweight") {
+      return false;
+    }
+    if (summaryStore.getAllSummaries().length === 0) {
+      return false;
+    }
+    return this.isLosslessStyleFactRecallQuery(query) || this.isDagOnlyKeywordRecallQuery(query);
   }
 
   private formatMemoryItemText(query: string, items: MemoryItemEntry[]): string {

@@ -183,6 +183,7 @@ export interface OmsRuntimeStatus {
     | "laneCandidateRerankThreshold"
     | "candidateAmbiguityMargin"
     | "strictModeRequiresRerankOnConflict"
+    | "openClawRuntimeProfile"
     | "emergencyBrake"
     | "sqliteJournalMode"
   >;
@@ -503,7 +504,7 @@ export class ChaunyomsSessionRuntime {
       payload.metadata ?? {},
     );
     const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
-    const knowledgeIntent = payload.role === "user"
+    const knowledgeIntent = payload.role === "user" && payload.config.openClawRuntimeProfile !== "lightweight"
       ? await this.knowledgeIntentClassifier.classifyUserMessage(sanitized.text, payload.config)
       : null;
     const message: RawMessage = {
@@ -560,7 +561,7 @@ export class ChaunyomsSessionRuntime {
     const assembleOptions = {
       includeStablePrefix: !this.config.emergencyBrake,
       includeSummaries: !this.config.emergencyBrake,
-      includeMemoryItems: !this.config.emergencyBrake,
+      includeMemoryItems: !this.config.emergencyBrake && this.config.openClawRuntimeProfile !== "lightweight",
       activeQuery,
       sessionId: context.sessionId,
     };
@@ -581,6 +582,12 @@ export class ChaunyomsSessionRuntime {
         this.config.workspaceDir,
         assembleOptions,
       );
+      const items = this.injectLightweightRecallGuidanceIfNeeded(
+        result.items,
+        rawStore,
+        summaryStore,
+        context,
+      );
       this.sessionData.recordContextPlan({
         sessionId: context.sessionId,
         agentId: this.config.agentId,
@@ -595,17 +602,22 @@ export class ChaunyomsSessionRuntime {
         },
       });
       return {
-        items: result.items,
-        estimatedTokens: result.items.reduce((sum, item) => sum + item.tokenCount, 0),
+        items,
+        estimatedTokens: items.reduce((sum, item) => sum + item.tokenCount, 0),
         importedMessages: synced.importedMessages,
       };
     } catch (sqliteError) {
       this.logger.warn("assemble_sqlite_failed_runtime_tail_fallback", {
         error: sqliteError instanceof Error ? sqliteError.message : String(sqliteError),
       });
-      const fallback = this.buildRuntimeMessageTailFallback(
+      const fallback = this.injectLightweightRecallGuidanceIfNeeded(
+        this.buildRuntimeMessageTailFallback(
         context,
         Math.max(context.totalBudget - context.systemPromptTokens, 0),
+        ),
+        rawStore,
+        summaryStore,
+        context,
       );
       this.contextViewStore.setItems(fallback);
       return {
@@ -764,6 +776,13 @@ export class ChaunyomsSessionRuntime {
       context.config,
       context.runtimeMessages,
     );
+    const lightweightCompaction = this.config.openClawRuntimeProfile === "lightweight"
+      ? await this.runLightweightAfterTurnCompaction(
+        context,
+        rawStore,
+        summaryStore,
+      )
+      : null;
 
     const { knowledgeStore } = await this.ensureSession(
       context.sessionId,
@@ -793,9 +812,18 @@ export class ChaunyomsSessionRuntime {
       semanticCandidateLimit: this.config.semanticCandidateLimit,
       lastCompactionDiagnostics: this.lastCompactionDiagnostics,
       emergencyBrake: this.config.emergencyBrake,
+      openClawRuntimeProfile: this.config.openClawRuntimeProfile,
+      lightweightCompaction,
     };
     this.logger.info("after_turn_stats", stats);
     await this.writeStatsLog(context.sessionId, stats);
+
+    if (this.config.openClawRuntimeProfile === "lightweight") {
+      return {
+        stats,
+        importedMessages: synced.importedMessages,
+      };
+    }
 
     await this.writeNavigationArtifactsIfPending(
       context,
@@ -1152,6 +1180,51 @@ export class ChaunyomsSessionRuntime {
       this.config.maxFreshTailTurns,
     );
   }
+
+  private injectLightweightRecallGuidanceIfNeeded(
+    items: ContextItem[],
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    context: LifecycleContext,
+  ): ContextItem[] {
+    if (this.config.openClawRuntimeProfile !== "lightweight") {
+      return items;
+    }
+    const alreadyHasGuidance = items.some((item) => item.metadata?.layer === "oms_recall_guidance");
+    const alreadyHasSystemPolicy = items.some((item) => item.metadata?.layer === "oms_recall_policy");
+    if (alreadyHasGuidance && alreadyHasSystemPolicy) {
+      return items;
+    }
+    const prefixed: ContextItem[] = [
+      ...(alreadyHasSystemPolicy ? [] : [this.assembler.buildOpenClawRecallSystemItem()]),
+      ...items,
+    ];
+    const summaryCount = summaryStore.getAllSummaries({ sessionId: context.sessionId }).length;
+    const rawCount = rawStore.getAll({ sessionId: context.sessionId }).length;
+    if (summaryCount > 0 || rawCount < Math.max(this.config.maxFreshTailTurns * 2, 6)) {
+      return prefixed;
+    }
+    const guidanceText = [
+      "[oms_recall_guidance]",
+      "Earlier turns may be outside the visible recent tail.",
+      this.config.forceDagOnlyRecall
+        ? "For exact prior facts, use memory_retrieve and follow the summary/DAG recall path; direct raw-message grep is disabled in this environment."
+        : "For exact prior facts, use memory_retrieve first and oms_grep for direct raw-message lookup.",
+      "Do not answer 'not found' until recall has been tried.",
+    ].join("\n");
+    const guidance: ContextItem = {
+      kind: "summary",
+      tokenCount: estimateTokens(guidanceText),
+      content: guidanceText,
+      metadata: {
+        layer: "oms_recall_guidance",
+        profile: "lightweight",
+        rawMessageCount: rawCount,
+        summaryCount,
+      },
+    };
+    return [guidance, ...prefixed];
+  }
   private inspectSummaryIntegrity(): SummaryIntegrityInspection {
     return this.sessionData.inspectSummaryIntegrity();
   }
@@ -1231,6 +1304,55 @@ export class ChaunyomsSessionRuntime {
     }
     await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
     this.navigationSnapshotPending = false;
+  }
+
+  private async runLightweightAfterTurnCompaction(
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+  ): Promise<{ attempted: boolean; status: string; reason?: string; summaryId?: string } | null> {
+    if (this.config.emergencyBrake) {
+      return { attempted: false, status: "skipped", reason: "emergency_brake_enabled" };
+    }
+    const eligibleTurnCount = this.compactionEngine.countEligibleTurnsForCompaction(
+      rawStore,
+      summaryStore,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+      context.sessionId,
+    );
+    if (eligibleTurnCount < Math.max(1, this.config.compactionBatchTurns)) {
+      return { attempted: false, status: "skipped", reason: "insufficient_closed_turns" };
+    }
+    const candidate = this.compactionEngine.selectTurnsForCompaction(
+      rawStore,
+      summaryStore,
+      this.config.freshTailTokens,
+      this.config.maxFreshTailTurns,
+      this.config.compactionBatchTurns,
+      context.sessionId,
+    );
+    if (!candidate) {
+      return { attempted: false, status: "skipped", reason: "no_compaction_candidate" };
+    }
+    const compaction = await this.compactionCoordinator.runSerializedCompaction(
+      rawStore,
+      summaryStore,
+      context,
+      true,
+    );
+    if (compaction.status === "compacted" || compaction.status === "deduped") {
+      return {
+        attempted: true,
+        status: compaction.status,
+        summaryId: compaction.summary.id,
+      };
+    }
+    return {
+      attempted: true,
+      status: compaction.status,
+      reason: compaction.reason,
+    };
   }
 
   private async rollUpSummaryTree(

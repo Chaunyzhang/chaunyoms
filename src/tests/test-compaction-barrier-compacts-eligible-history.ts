@@ -47,10 +47,10 @@ async function main(): Promise<void> {
             responseFormat: params.responseFormat,
           });
           return [
-            "# Level-1 Memory Extraction",
+            "# Recall Summary",
             "## Scope",
             "Compacted source span for eligible history.",
-            "## Exact Anchors",
+            "## Exact Facts",
             "- freshTailTurns=1",
             "## Retrieval Cues",
             "- eligible-history",
@@ -92,7 +92,7 @@ async function main(): Promise<void> {
         config,
         id: `tool-${turn}`,
         role: "tool",
-        content: `TOOL_SHOULD_NOT_ENTER_LEVEL_ONE_SOURCE ${"tool output ".repeat(120)}`,
+        content: `TOOL_SHOULD_NOT_ENTER_RECALL_SUMMARY_SOURCE ${"tool output ".repeat(120)}`,
         turnNumber: turn,
       });
     }
@@ -118,19 +118,21 @@ async function main(): Promise<void> {
       stores.summaryStore.getAllSummaries({ sessionId }).length > 0,
       "expected barrier compaction to create at least one summary",
     );
-    const levelOneSummaryCalls = summaryCalls.filter((call) => call.prompt.includes("level-1 memory extraction"));
-    assert(levelOneSummaryCalls.length > 0, "expected at least one level-1 summary generation call");
+    const recallSummaryCalls = summaryCalls.filter((call) =>
+      call.prompt.includes("Recall Summary") || call.prompt.includes("source-backed summary"),
+    );
+    assert(recallSummaryCalls.length > 0, "expected at least one recall summary generation call");
     assert(
-      levelOneSummaryCalls.every((call) => !call.prompt.includes("TOOL_SHOULD_NOT_ENTER_LEVEL_ONE_SOURCE")),
-      "expected tool output to be excluded from level-1 summary source prompts",
+      recallSummaryCalls.every((call) => !call.prompt.includes("TOOL_SHOULD_NOT_ENTER_RECALL_SUMMARY_SOURCE")),
+      "expected tool output to be excluded from recall summary source prompts",
     );
     assert(
-      levelOneSummaryCalls.every((call) => (call.maxOutputTokens ?? 0) > config.summaryMaxOutputTokens),
-      "expected level-1 summary output budget to be based on source size instead of fixed config limit",
+      recallSummaryCalls.every((call) => (call.maxOutputTokens ?? 0) > config.summaryMaxOutputTokens),
+      "expected recall summary output budget to be based on source size instead of fixed config limit",
     );
     assert(
-      levelOneSummaryCalls.every((call) => call.responseFormat === "text"),
-      "expected level-1 summary generation to request Markdown text, not JSON",
+      recallSummaryCalls.every((call) => call.responseFormat === "text"),
+      "expected recall summary generation to request Markdown text, not JSON",
     );
     const summaries = stores.summaryStore.getAllSummaries({ sessionId });
     assert(

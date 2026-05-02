@@ -65,6 +65,16 @@ async function main(): Promise<void> {
     "expected guidance to warn about weak knowledge promotion inputs",
   );
 
+  const lightweightContext = adapter.resolveLifecycleContext({
+    config: {
+      openClawRuntimeProfile: "lightweight",
+    },
+  }, DEFAULT_BRIDGE_CONFIG);
+  assert(
+    lightweightContext.config.openClawRuntimeProfile === "lightweight",
+    "expected lightweight OpenClaw runtime profile to resolve",
+  );
+
   console.log("test-config-presets-and-guidance passed");
 }
 

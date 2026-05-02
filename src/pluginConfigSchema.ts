@@ -45,6 +45,11 @@ export const pluginConfigSchema = {
       enum: ["advisory", "authoritative"],
       description: "Alias for mode, kept for explicit OpenClaw compatibility configuration.",
     },
+    openClawRuntimeProfile: {
+      type: "string",
+      enum: ["standard", "lightweight"],
+      description: "OpenClaw runtime profile. lightweight favors host compatibility by minimizing per-turn LLM side work and generating only leaf summaries for recall.",
+    },
     contextWindow: {
       type: "number",
       exclusiveMinimum: 0,
@@ -100,6 +105,10 @@ export const pluginConfigSchema = {
     autoRecallEnabled: {
       type: "boolean",
       description: "Allow automatic source recall when the route requires historical detail.",
+    },
+    forceDagOnlyRecall: {
+      type: "boolean",
+      description: "Disable direct raw-source shortcuts and force recall to stay on the summary/DAG navigation path before any source expansion.",
     },
     agentVaultMirrorEnabled: {
       type: "boolean",

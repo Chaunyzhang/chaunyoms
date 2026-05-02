@@ -142,7 +142,7 @@ export class OpenClawBridge {
           info: {
             id,
             name: id === "oms" ? "OMS" : "Chaunyoms",
-            version: "0.1.0",
+            version: "1.0.0-beta.1",
             ownsCompaction: true,
           },
           bootstrap: this.bootstrap.bind(this),
@@ -592,7 +592,7 @@ export class OpenClawBridge {
       pluginId: "oms",
       kind: "memory",
       name: "ChaunyOMS Memory",
-      version: "0.1.0",
+      version: "1.0.0-beta.1",
       description:
         "Authoritative OpenClaw memory slot backed by ChaunyOMS SQLite MemoryItem/BaseSummary/Source data; Markdown is export-only.",
       ownsLongTermMemory: true,
@@ -894,6 +894,10 @@ export class OpenClawBridge {
   }
 
   private registerTools(api: OpenClawApiLike): void {
+    const resolvedConfig = this.payloadAdapter.resolveLifecycleContext(
+      undefined,
+      this.runtime.getConfig(),
+    ).config;
     const register = (
       name: string,
       description: string,
@@ -1957,23 +1961,30 @@ export class OpenClawBridge {
         await this.retrieval.executeOmsBackfillAtoms(args),
     );
 
-    register(
-      "oms_grep",
-      "Search the SQLite runtime raw-message ledger for exact/source-level evidence and return adjacent context. Defaults to agent scope; pass scope=session to limit to the current session.",
-      {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Keyword or phrase to find in raw messages." },
-          limit: { type: "number", description: "Maximum hits to return. Default 10." },
-          contextTurns: { type: "number", description: "Adjacent turns to include around each hit. Default 1." },
-          scope: { type: "string", enum: ["agent", "session"] },
+    if (!resolvedConfig.forceDagOnlyRecall) {
+      register(
+        "oms_grep",
+        "Search the SQLite runtime raw-message ledger for exact/source-level evidence and return adjacent context. Defaults to agent scope; pass scope=session to limit to the current session.",
+        {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Keyword or phrase to find in raw messages." },
+            limit: { type: "number", description: "Maximum hits to return. Default 10." },
+            contextTurns: { type: "number", description: "Adjacent turns to include around each hit. Default 1." },
+            scope: { type: "string", enum: ["agent", "session"] },
+          },
+          required: ["query"],
+          additionalProperties: false,
         },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      async (_toolCallId: string, args: unknown) =>
-        await this.retrieval.executeOmsGrep(args),
-    );
+        async (_toolCallId: string, args: unknown) =>
+          await this.retrieval.executeOmsGrep(args),
+      );
+    } else {
+      this.logger.info("tool_registration_skipped", {
+        tool: "oms_grep",
+        reason: "forceDagOnlyRecall_true",
+      });
+    }
 
     register(
       "oms_expand",

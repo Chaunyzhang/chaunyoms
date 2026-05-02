@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import { estimateTokens } from "../utils/tokenizer";
 import { RuntimeMessageIngress } from "./RuntimeMessageIngress";
@@ -14,6 +16,7 @@ import { MemoryExtractionEngine } from "../engines/MemoryExtractionEngine";
 import { KnowledgeIntentClassifier } from "../engines/KnowledgeIntentClassifier";
 import { SessionDataStores } from "../data/SessionDataLayer";
 import { SecretIngressGate } from "./SecretIngressGate";
+import { getOpenClawHomeDir } from "../host/HostPathResolver";
 
 interface RuntimeIngressDependencies {
   runtimeIngress: RuntimeMessageIngress;
@@ -42,7 +45,8 @@ export class RuntimeIngressService {
     }
 
     const { rawStore, memoryItemDraftStore } = await this.deps.ensureSession(sessionId, config);
-    const inspectedMessages = runtimeMessages.map((message) => ({
+    const alignedRuntimeMessages = await this.alignWithOpenClawSessionStore(sessionId, config, runtimeMessages);
+    const inspectedMessages = alignedRuntimeMessages.map((message) => ({
       message,
       decision: this.deps.runtimeIngress.inspect(message),
     }));
@@ -94,7 +98,7 @@ export class RuntimeIngressService {
         message.metadata ?? {},
       );
       currentTurn = this.resolveRuntimeTurnNumber(currentTurn, message.role);
-      const knowledgeIntent = message.role === "user"
+      const knowledgeIntent = message.role === "user" && config.openClawRuntimeProfile !== "lightweight"
         ? await this.deps.knowledgeIntentClassifier.classifyUserMessage(sanitized.text, config)
         : null;
       const rawMessage: RawMessage = {
@@ -253,5 +257,110 @@ export class RuntimeIngressService {
       }
     }
     return new Date().toISOString();
+  }
+
+  private async alignWithOpenClawSessionStore(
+    sessionId: string,
+    config: IngestPayload["config"],
+    runtimeMessages: RuntimeMessageSnapshot[],
+  ): Promise<RuntimeMessageSnapshot[]> {
+    const runtimeConversation = runtimeMessages.filter((message) =>
+      message.role === "user" || message.role === "assistant",
+    );
+    const runtimeAssistantCount = runtimeConversation.filter((message) => message.role === "assistant").length;
+    const runtimeUserCount = runtimeConversation.filter((message) => message.role === "user").length;
+    if (runtimeUserCount === 0 || runtimeAssistantCount >= runtimeUserCount) {
+      return runtimeMessages;
+    }
+
+    const sessionMessages = await this.readOpenClawSessionMessages(config.agentId, sessionId);
+    const sessionAssistantCount = sessionMessages.filter((message) => message.role === "assistant").length;
+    if (sessionAssistantCount <= runtimeAssistantCount) {
+      return runtimeMessages;
+    }
+
+    const nonConversationRuntimeMessages = runtimeMessages.filter((message) =>
+      message.role !== "user" && message.role !== "assistant",
+    );
+    return [...sessionMessages, ...nonConversationRuntimeMessages];
+  }
+
+  private async readOpenClawSessionMessages(
+    agentId: string,
+    sessionId: string,
+  ): Promise<RuntimeMessageSnapshot[]> {
+    const sessionPath = path.join(
+      getOpenClawHomeDir(),
+      "agents",
+      agentId,
+      "sessions",
+      `${sessionId}.jsonl`,
+    );
+    try {
+      const raw = await readFile(sessionPath, "utf8");
+      const lines = raw.split(/\r?\n/).filter(Boolean);
+      const snapshots: RuntimeMessageSnapshot[] = [];
+      for (const line of lines) {
+        const record = JSON.parse(line) as {
+          type?: string;
+          id?: string;
+          timestamp?: string;
+          message?: {
+            role?: string;
+            content?: unknown;
+            timestamp?: number | string;
+          };
+        };
+        if (record.type !== "message") {
+          continue;
+        }
+        const role = record.message?.role;
+        if (role !== "user" && role !== "assistant") {
+          continue;
+        }
+        const text = this.extractTextFromSessionContent(record.message?.content);
+        if (!text) {
+          continue;
+        }
+        snapshots.push({
+          sourceKey: record.id ? `session:${record.id}` : `session-derived:${role}:${this.normalizeMessageText(text)}`,
+          id: typeof record.id === "string" ? record.id : undefined,
+          role,
+          content: record.message?.content,
+          text,
+          timestamp: record.timestamp ?? record.message?.timestamp,
+          metadata: {
+            source: "openclaw_session_store",
+            origin: "openclaw_session_store",
+            sessionStoreSessionId: sessionId,
+          },
+        });
+      }
+      return snapshots.slice(-24);
+    } catch {
+      return [];
+    }
+  }
+
+  private extractTextFromSessionContent(content: unknown): string {
+    if (typeof content === "string") {
+      return content.trim();
+    }
+    if (!Array.isArray(content)) {
+      return "";
+    }
+    return content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        if (part && typeof part === "object" && "text" in part && typeof (part as { text?: unknown }).text === "string") {
+          return (part as { text: string }).text;
+        }
+        return "";
+      })
+      .filter((value) => value.trim().length > 0)
+      .join("\n")
+      .trim();
   }
 }

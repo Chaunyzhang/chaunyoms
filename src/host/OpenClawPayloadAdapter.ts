@@ -525,6 +525,14 @@ export class OpenClawPayloadAdapter {
       ["delete", "wal"],
       baseConfig.sqliteJournalMode,
     ) as BridgeConfig["sqliteJournalMode"];
+    const openClawRuntimeProfile = this.resolveStringEnum(
+      [
+        pluginConfig.openClawRuntimeProfile,
+        pluginConfig.runtimeProfile,
+      ],
+      ["standard", "lightweight"],
+      baseConfig.openClawRuntimeProfile,
+    ) as BridgeConfig["openClawRuntimeProfile"];
 
     const usageFeedbackEnabled = emergencyBrake
       ? false
@@ -727,6 +735,10 @@ export class OpenClawPayloadAdapter {
       runtimeCaptureEnabled,
       memoryItemEnabled,
       autoRecallEnabled,
+      forceDagOnlyRecall: this.resolveBooleanFlag(
+        [pluginConfig.forceDagOnlyRecall, pluginConfig.disableDirectRawRecall],
+        baseConfig.forceDagOnlyRecall,
+      ),
       agentVaultMirrorEnabled,
       summaryMarkdownMirrorEnabled,
       memoryItemMarkdownMirrorEnabled,
@@ -1004,6 +1016,7 @@ export class OpenClawPayloadAdapter {
         [pluginConfig.maxRerankCandidates, pluginConfig.rerankCandidateLimit],
         baseConfig.maxRerankCandidates,
       ),
+      openClawRuntimeProfile,
       emergencyBrake,
       sqliteJournalMode,
     }));

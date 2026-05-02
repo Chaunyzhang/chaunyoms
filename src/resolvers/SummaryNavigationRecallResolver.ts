@@ -5,7 +5,7 @@ import {
   SummaryEntry,
   SummaryRepository,
 } from "../types";
-import { SourceMessageResolver } from "./SourceMessageResolver";
+import { SourceMessageResolution, SourceMessageResolver } from "./SourceMessageResolver";
 import { SummaryDagResolver } from "./SummaryDagResolver";
 import { RecallOptions, queryTerms, textHasTerm } from "./RecallShared";
 import { scoreIntentRoleMatch } from "./RecallIntentRoles";
@@ -33,6 +33,7 @@ export class SummaryNavigationRecallResolver {
     const items: RecallResult["items"] = [];
     const sourceTrace: RecallResult["sourceTrace"] = [];
     const dagTrace: RecallResult["dagTrace"] = traversal.trace;
+    const seenMessageIds = new Set<string>();
     let consumedTokens = 0;
 
     for (const hit of hits) {
@@ -56,19 +57,23 @@ export class SummaryNavigationRecallResolver {
         continue;
       }
 
-      const messages = this.prioritizeMessages(
-        options.sessionId
-          ? resolution.messages.filter((message) => message.sessionId === options.sessionId)
-          : resolution.messages,
+      const messages = this.expandAndPrioritizeMessages(
+        rawStore,
+        resolution,
         query,
+        options,
         terms,
         exactAnchors,
       );
       for (const message of messages) {
+        if (seenMessageIds.has(message.id)) {
+          continue;
+        }
         if (consumedTokens + message.tokenCount > recallBudget && items.length > 0) {
           return { items, consumedTokens, sourceTrace, dagTrace, strategy: "summary_navigation" };
         }
 
+        seenMessageIds.add(message.id);
         consumedTokens += message.tokenCount;
         items.push({
           kind: "message" as const,
@@ -238,6 +243,7 @@ export class SummaryNavigationRecallResolver {
     const exactAnchors = query.match(/\b[A-Z][A-Z0-9_]{2,}\b|\b\d{2,}\b/g) ?? [];
     const items: RecallResult["items"] = [];
     const sourceTrace: RecallResult["sourceTrace"] = [];
+    const seenMessageIds = new Set<string>();
     let consumedTokens = 0;
     for (const summary of summaries) {
       const resolution = this.sourceResolver.resolve(rawStore, summary);
@@ -245,18 +251,22 @@ export class SummaryNavigationRecallResolver {
         route: "summary_tree",
         summaryId: summary.id,
       }));
-      const messages = this.prioritizeMessages(
-        options.sessionId
-          ? resolution.messages.filter((message) => message.sessionId === options.sessionId)
-          : resolution.messages,
+      const messages = this.expandAndPrioritizeMessages(
+        rawStore,
+        resolution,
         query,
+        options,
         terms,
         exactAnchors,
       );
       for (const message of messages) {
+        if (seenMessageIds.has(message.id)) {
+          continue;
+        }
         if (consumedTokens + message.tokenCount > recallBudget && items.length > 0) {
           return { items, consumedTokens, sourceTrace, dagTrace, strategy: "summary_navigation" };
         }
+        seenMessageIds.add(message.id);
         consumedTokens += message.tokenCount;
         items.push({
           kind: "message",
@@ -477,23 +487,117 @@ export class SummaryNavigationRecallResolver {
     };
   }
 
+  private expandAndPrioritizeMessages(
+    rawStore: RawMessageRepository,
+    resolution: SourceMessageResolution,
+    query: string,
+    options: RecallOptions,
+    queryTerms: string[],
+    exactAnchors: string[],
+  ): ReturnType<RawMessageRepository["getByRange"]> {
+    const anchorMessages = options.sessionId
+      ? resolution.messages.filter((message) => message.sessionId === options.sessionId)
+      : resolution.messages;
+    const neighborhood = this.buildLocalNeighborhood(rawStore, resolution, options, anchorMessages);
+    const prioritized = this.prioritizeMessages(neighborhood, query, queryTerms, exactAnchors, anchorMessages);
+    if (prioritized.length > 0) {
+      return prioritized;
+    }
+    return anchorMessages;
+  }
+
+  private buildLocalNeighborhood(
+    rawStore: RawMessageRepository,
+    resolution: SourceMessageResolution,
+    options: RecallOptions,
+    anchorMessages: RawMessage[],
+  ): RawMessage[] {
+    if (anchorMessages.length === 0) {
+      return [];
+    }
+
+    const sessionId = options.sessionId ?? resolution.binding.sessionId;
+    const scopedQuery = sessionId ? { sessionId } : {};
+    const turnNumbers = anchorMessages.map((message) => message.turnNumber).filter(Number.isFinite);
+    const sequences = anchorMessages
+      .map((message) => message.sequence)
+      .filter((sequence): sequence is number => Number.isFinite(sequence));
+    const turnMin = turnNumbers.length > 0 ? Math.min(...turnNumbers) : resolution.binding.turnStart;
+    const turnMax = turnNumbers.length > 0 ? Math.max(...turnNumbers) : resolution.binding.turnEnd;
+    const sequenceMin = sequences.length > 0 ? Math.min(...sequences) : resolution.binding.sequenceMin;
+    const sequenceMax = sequences.length > 0 ? Math.max(...sequences) : resolution.binding.sequenceMax;
+    const turnPadding = anchorMessages.length <= 2 ? 1 : 2;
+    const sequencePadding = Math.max(2, Math.min(8, anchorMessages.length * 2));
+    const byId = new Map<string, RawMessage>();
+
+    const addMessages = (messages: RawMessage[]): void => {
+      for (const message of messages) {
+        if (options.sessionId && message.sessionId !== options.sessionId) {
+          continue;
+        }
+        byId.set(message.id, message);
+      }
+    };
+
+    addMessages(anchorMessages);
+    if (Number.isFinite(turnMin) && Number.isFinite(turnMax)) {
+      addMessages(rawStore.getByRange(
+        Math.max(1, (turnMin as number) - turnPadding),
+        (turnMax as number) + turnPadding,
+        scopedQuery,
+      ));
+    }
+    if (Number.isFinite(sequenceMin) && Number.isFinite(sequenceMax)) {
+      addMessages(rawStore.getBySequenceRange(
+        Math.max(1, (sequenceMin as number) - sequencePadding),
+        (sequenceMax as number) + sequencePadding,
+        scopedQuery,
+      ));
+    }
+
+    return [...byId.values()].sort((left, right) => {
+      const leftSequence = Number.isFinite(left.sequence) ? left.sequence as number : Number.MAX_SAFE_INTEGER;
+      const rightSequence = Number.isFinite(right.sequence) ? right.sequence as number : Number.MAX_SAFE_INTEGER;
+      if (leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+      }
+      if (left.turnNumber !== right.turnNumber) {
+        return left.turnNumber - right.turnNumber;
+      }
+      return left.createdAt.localeCompare(right.createdAt);
+    });
+  }
+
   private prioritizeMessages(
     messages: ReturnType<RawMessageRepository["getByRange"]>,
     query: string,
     queryTerms: string[],
     exactAnchors: string[],
+    anchorMessages: RawMessage[] = [],
   ): ReturnType<RawMessageRepository["getByRange"]> {
+    const anchorIds = new Set(anchorMessages.map((message) => message.id));
+    const anchorTurns = anchorMessages.map((message) => message.turnNumber).filter(Number.isFinite);
+    const minAnchorTurn = anchorTurns.length > 0 ? Math.min(...anchorTurns) : null;
+    const maxAnchorTurn = anchorTurns.length > 0 ? Math.max(...anchorTurns) : null;
     const scored = messages.map((message, index) => ({
       message,
       index,
-      score: this.scoreMessage(message.content, query, queryTerms, exactAnchors),
+      score: this.scoreMessage(
+        message,
+        query,
+        queryTerms,
+        exactAnchors,
+        anchorIds,
+        minAnchorTurn,
+        maxAnchorTurn,
+      ),
     }));
 
     if (!scored.some((item) => item.score > 0)) {
       return messages;
     }
 
-    return scored
+    const selected = scored
       .sort((left, right) => {
         if (right.score !== left.score) {
           return right.score - left.score;
@@ -503,15 +607,33 @@ export class SummaryNavigationRecallResolver {
         }
         return left.index - right.index;
       })
+      .filter((item) => item.score > 0 || anchorIds.has(item.message.id))
+      .slice(0, Math.max(4, anchorMessages.length + 2))
       .map((item) => item.message);
+
+    return selected.sort((left, right) => {
+      const leftSequence = Number.isFinite(left.sequence) ? left.sequence as number : Number.MAX_SAFE_INTEGER;
+      const rightSequence = Number.isFinite(right.sequence) ? right.sequence as number : Number.MAX_SAFE_INTEGER;
+      if (leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+      }
+      if (left.turnNumber !== right.turnNumber) {
+        return left.turnNumber - right.turnNumber;
+      }
+      return left.createdAt.localeCompare(right.createdAt);
+    });
   }
 
   private scoreMessage(
-    content: string,
+    message: RawMessage,
     query: string,
     queryTerms: string[],
     exactAnchors: string[],
+    anchorIds: Set<string>,
+    minAnchorTurn: number | null,
+    maxAnchorTurn: number | null,
   ): number {
+    const content = message.content;
     const lower = content.toLowerCase();
     let score = 0;
 
@@ -531,7 +653,28 @@ export class SummaryNavigationRecallResolver {
       score += 2;
     }
 
-    score += scoreIntentRoleMatch(query, content).score;
+    const contentScore = score + scoreIntentRoleMatch(query, content).score;
+
+    if (anchorIds.has(message.id)) {
+      score = contentScore + 5;
+    } else if (contentScore > 0 && minAnchorTurn !== null && maxAnchorTurn !== null) {
+      const turnDistance = message.turnNumber < minAnchorTurn
+        ? minAnchorTurn - message.turnNumber
+        : message.turnNumber > maxAnchorTurn
+          ? message.turnNumber - maxAnchorTurn
+          : 0;
+      if (turnDistance === 0) {
+        score = contentScore + 4;
+      } else if (turnDistance === 1) {
+        score = contentScore + 2;
+      } else if (turnDistance === 2) {
+        score = contentScore + 1;
+      } else {
+        score = contentScore;
+      }
+    } else {
+      score = contentScore;
+    }
 
     return score;
   }

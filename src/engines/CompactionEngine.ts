@@ -49,6 +49,8 @@ const LEVEL_ONE_TARGET_RATIO = 0.12;
 const COMPACTION_BATCH_TARGET_TOKENS = 24000;
 const COMPACTION_BATCH_MIN_TOKENS = 12000;
 const COMPACTION_BATCH_MAX_TOKENS = 48000;
+const DETERMINISTIC_FALLBACK_MAX_FACTS = 8;
+const DETERMINISTIC_FALLBACK_MAX_ENTITIES = 12;
 
 function isSummarySourceMessage(message: RawMessage): boolean {
   return message.role === "user" || message.role === "assistant";
@@ -99,6 +101,41 @@ export class CompactionEngine {
 
   canUseLlmSummary(): boolean {
     return this.llmCaller !== null;
+  }
+
+  countEligibleTurnsForCompaction(
+    rawStore: RawMessageRepository,
+    summaryStore: SummaryRepository,
+    freshTailTokens: number,
+    maxFreshTailTurns: number,
+    sessionId?: string,
+  ): number {
+    const query = { sessionId };
+    const allMessages = rawStore.getAll(query);
+    const lastClosedTurn = this.resolveLastClosedTurn(allMessages);
+    if (lastClosedTurn <= 0) {
+      return 0;
+    }
+
+    const coveredTurns = summaryStore.getCoveredTurns(query);
+    const uncompacted = rawStore
+      .getUncompactedMessages(query)
+      .filter(
+        (message) =>
+          message.turnNumber <= lastClosedTurn &&
+          !coveredTurns.has(message.turnNumber),
+      );
+    const turnNumbers = [...new Set(uncompacted.map((message) => message.turnNumber))];
+    if (turnNumbers.length === 0) {
+      return 0;
+    }
+
+    const protectedTurns = this.selectProtectedTailTurns(
+      uncompacted,
+      freshTailTokens,
+      maxFreshTailTurns,
+    );
+    return turnNumbers.filter((turnNumber) => !protectedTurns.has(turnNumber)).length;
   }
 
   selectTurnsForCompaction(
@@ -161,7 +198,7 @@ export class CompactionEngine {
       return null;
     }
 
-    const outputBudget = this.resolveLevelOneOutputBudget(messages, maxOutputTokens);
+    const outputBudget = this.resolveRecallSummaryOutputBudget(messages, maxOutputTokens);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         const prompt = this.buildPrompt(messages, attempt, outputBudget);
@@ -176,6 +213,13 @@ export class CompactionEngine {
         if (parsed && !this.isLongerThanSource(parsed, messages)) {
           return parsed;
         }
+        if (parsed && this.isLongerThanSource(parsed, messages)) {
+          this.logger.warn("summary_generation_oversized", {
+            attempt,
+            sourceTokens: this.sumSummarySourceTokens(messages),
+            summaryTokens: estimateTokens(parsed.summary),
+          });
+        }
       } catch (error) {
         this.logger.warn("summary_generation_failed", {
           attempt,
@@ -184,7 +228,7 @@ export class CompactionEngine {
       }
     }
 
-    return null;
+    return this.buildDeterministicFallbackSummary(messages);
   }
 
   async runCompaction(
@@ -376,37 +420,24 @@ export class CompactionEngine {
     const sourceTokenCount = this.sumSummarySourceTokens(sourceMessages);
 
     return [
-      "You are generating a high-quality level-1 memory extraction in Markdown.",
-      "This is not a JSON object and not a short abstract. It is the cleaned nutrient layer that later rollups, knowledge intake, and source recall will use.",
-      "Treat the task like a careful meeting-minutes distillation: remove noise, repeated boilerplate, tool chatter, acknowledgements, false starts, and clearly corrected mistakes while preserving usable substance.",
-      "Do not optimize for brevity. Optimize for functional retention, downstream retrieval, knowledge intake, and future rollups.",
-      `The source span is about ${sourceTokenCount} tokens. Let the length follow functional retention needs. Roughly ${LEVEL_ONE_TARGET_RATIO * 100}% of useful source density is a starting heuristic for information-rich spans, not a hard cap.`,
-      `The API output budget is set to ${maxOutputTokens} tokens so the extraction can be as rich as needed, but the final extraction must never exceed the source length.`,
-      "Keep enough detail that later retrieval can answer source-specific questions without immediately reopening every raw message.",
-      "A good level-1 extraction preserves section structure, named mechanisms, comparisons, caveats, exact values, source-local terminology, and testable claims.",
-      "Write atomic bullets where possible: one constraint, decision, failure mode, next step, claim, or exact anchor per bullet.",
-      "Keep constraints, decisions, and failure modes in separate sections so downstream evidence atoms do not collapse different memory types together.",
-      "Correct only errors that are clearly corrected by the source itself. Preserve uncertainty and disagreement instead of smoothing them away.",
-      "Do not invent connective tissue, conclusions, citations, or facts that are not supported by the source.",
+      "You are generating a compact recall-oriented source-backed summary in Markdown.",
+      "This summary is a navigation card for later recall, not a full analytic substrate.",
+      "Prefer short, concrete, retrieval-friendly notes over rich explanation.",
+      "Preserve exact values, named entities, places, dates, durations, titles, and store/product names when they appear.",
+      "Do not invent facts. Do not paraphrase away the key terms that someone would later grep for.",
+      `The source span is about ${sourceTokenCount} tokens and the output budget is ${maxOutputTokens} tokens.`,
+      "If the source is mostly practical discussion, capture only the smallest set of facts and cues needed to find the original source later.",
       "Return Markdown only. Do not wrap it in a code fence.",
       attempt > 1
-        ? "Important: suppress reasoning and emit the final Markdown extraction immediately."
+        ? "Important: if the first attempt was too verbose, return a shorter recall card with fewer bullets and no extra narration."
         : "",
-      "Use this Markdown shape when useful:",
-      "# Level-1 Memory Extraction",
+      "Use this Markdown shape:",
+      "# Recall Summary",
       "## Scope",
-      "## Cleaned Substance",
-      "## Mechanisms And Claims",
-      "## Exact Anchors",
-      "## Constraints",
-      "## Decisions",
-      "## Failure Modes",
-      "## Next Steps",
-      "## Open Questions",
-      "## Conflicts / Ambiguities",
-      "## Candidate Evidence Atoms",
+      "## Exact Facts",
       "## Retrieval Cues",
       "## Key Entities",
+      "## Notes",
       "",
       transcript,
     ].join("\n");
@@ -453,7 +484,7 @@ export class CompactionEngine {
       return null;
     }
 
-    const outputBudget = this.resolveLevelOneOutputBudget(messages, maxOutputTokens);
+    const outputBudget = this.resolveRecallSummaryOutputBudget(messages, maxOutputTokens);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         const prompt = this.buildPrompt(messages, attempt, outputBudget);
@@ -479,7 +510,7 @@ export class CompactionEngine {
     return null;
   }
 
-  private resolveLevelOneOutputBudget(messages: RawMessage[], _configuredMaxOutputTokens: number): number {
+  private resolveRecallSummaryOutputBudget(messages: RawMessage[], _configuredMaxOutputTokens: number): number {
     const sourceTokenCount = this.sumSummarySourceTokens(messages);
     return Math.max(1, sourceTokenCount);
   }
@@ -505,11 +536,12 @@ export class CompactionEngine {
       ...headings,
       ...[...summary.matchAll(/`([^`]{2,80})`/g)].map((match) => match[1].trim()),
     ])].slice(0, 24);
-    const exactAnchorLines = this.extractSectionLines(summary, /^(exact anchors?|mechanisms? and claims?|claims?|facts?)$/i, 40);
+    const exactAnchorLines = this.extractSectionLines(summary, /^(exact anchors?|exact facts?|mechanisms? and claims?|claims?|facts?)$/i, 40);
     const exactFacts = [...new Set([
       ...exactAnchorLines,
       ...summary
         .split(/\r?\n/)
+        .filter((line) => !/^#{1,3}\s+/.test(line))
         .filter((line) => /(?:https?:\/\/|arxiv|local-synthetic|20\d{2}-\d{2}-\d{2}|[A-Za-z0-9_-]+\.(?:ts|md|json|sqlite)|\b\d+(?:\.\d+)?\b)/.test(line))
         .map((line) => line.replace(/^[-*]\s*/, "").trim())
         .filter(Boolean),
@@ -517,7 +549,7 @@ export class CompactionEngine {
     return {
       summary,
       keywords,
-      toneTag: "markdown level-1 extraction",
+      toneTag: "markdown recall summary",
       memoryType: "general",
       phase: "active",
       constraints: this.extractSectionLines(summary, /^(constraints?|limits?|musts?)$/i),
@@ -557,6 +589,103 @@ export class CompactionEngine {
     return collected.slice(0, limit);
   }
 
+  private buildDeterministicFallbackSummary(messages: RawMessage[]): SummaryResult {
+    const exactFacts = this.collectDeterministicExactFacts(messages);
+    const keyEntities = this.collectDeterministicKeyEntities(messages);
+    const retrievalCues = [...new Set([
+      ...exactFacts,
+      ...keyEntities,
+    ])].slice(0, DETERMINISTIC_FALLBACK_MAX_ENTITIES);
+    const startTurn = messages[0]?.turnNumber ?? 0;
+    const endTurn = messages[messages.length - 1]?.turnNumber ?? startTurn;
+    const scopeLine = `Turns ${startTurn}-${endTurn}; ${messages.length} source messages.`;
+    const notes = this.collectDeterministicNotes(messages);
+    const markdown = [
+      "# Recall Summary",
+      "## Scope",
+      `- ${scopeLine}`,
+      "## Exact Facts",
+      ...(exactFacts.length > 0 ? exactFacts.map((fact) => `- ${fact}`) : ["- No stable exact facts extracted; use retrieval cues to reopen raw source."]),
+      "## Retrieval Cues",
+      ...(retrievalCues.length > 0 ? retrievalCues.map((cue) => `- ${cue}`) : ["- reopen raw source messages for this turn range"]),
+      "## Key Entities",
+      ...(keyEntities.length > 0 ? keyEntities.map((entity) => `- ${entity}`) : ["- None"]),
+      "## Notes",
+      ...(notes.length > 0 ? notes.map((note) => `- ${note}`) : ["- Deterministic fallback summary generated because model output was unavailable or invalid."]),
+    ].join("\n");
+    return this.markdownToSummaryResult(markdown) ?? {
+      summary: markdown,
+      keywords: retrievalCues.slice(0, 24),
+      toneTag: "deterministic recall summary",
+      memoryType: "general",
+      phase: "active",
+      constraints: [],
+      decisions: [],
+      blockers: [],
+      nextSteps: [],
+      keyEntities,
+      exactFacts,
+      promotionIntent: "candidate",
+      openQuestions: [],
+      conflicts: [],
+      candidateAtomPreviews: [],
+    };
+  }
+
+  private collectDeterministicExactFacts(messages: RawMessage[]): string[] {
+    const facts: string[] = [];
+    const patterns = [
+      /\b[A-Z][A-Za-z&'/-]+(?:\s+[A-Z][A-Za-z&'/-]+){0,5}\b/g,
+      /\b\d+(?:\.\d+)?\s+(?:minutes?|hours?|days?|weeks?|months?|years?)(?:\s+each\s+way)?\b/gi,
+      /\$\d+(?:,\d{3})*(?:\.\d{2})?\b/g,
+      /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?\b/gi,
+      /"[^"]{2,100}"/g,
+    ];
+    for (const message of messages) {
+      const text = message.content;
+      for (const pattern of patterns) {
+        for (const match of text.matchAll(pattern)) {
+          const value = String(match[0]).replace(/\s+/g, " ").trim();
+          if (value.length >= 2) {
+            facts.push(value);
+          }
+        }
+      }
+      if (facts.length >= DETERMINISTIC_FALLBACK_MAX_FACTS) {
+        break;
+      }
+    }
+    return [...new Set(facts)].slice(0, DETERMINISTIC_FALLBACK_MAX_FACTS);
+  }
+
+  private collectDeterministicKeyEntities(messages: RawMessage[]): string[] {
+    const entities: string[] = [];
+    for (const message of messages) {
+      for (const match of message.content.matchAll(/\b[A-Z][A-Za-z0-9&'/-]+(?:\s+[A-Z][A-Za-z0-9&'/-]+){0,5}\b/g)) {
+        const value = String(match[0]).replace(/\s+/g, " ").trim();
+        if (value.length >= 2) {
+          entities.push(value);
+        }
+      }
+      if (entities.length >= DETERMINISTIC_FALLBACK_MAX_ENTITIES) {
+        break;
+      }
+    }
+    return [...new Set(entities)].slice(0, DETERMINISTIC_FALLBACK_MAX_ENTITIES);
+  }
+
+  private collectDeterministicNotes(messages: RawMessage[]): string[] {
+    const notes: string[] = [];
+    for (const message of messages.slice(0, 4)) {
+      const trimmed = message.content.replace(/\s+/g, " ").trim();
+      if (!trimmed) {
+        continue;
+      }
+      notes.push(trimmed.length > 180 ? `${trimmed.slice(0, 177)}...` : trimmed);
+    }
+    return notes;
+  }
+
   private buildSourceRefs(messages: RawMessage[]): SummaryEntry["sourceRefs"] {
     return messages.filter(isSummarySourceMessage).map((message) => ({
       messageId: message.id,
@@ -579,7 +708,7 @@ export class CompactionEngine {
         return;
       }
       chunks.push({
-        id: `l1sec-${this.hash(`${summaryId}|${section}|${text}`).slice(0, 20)}`,
+        id: `recallsec-${this.hash(`${summaryId}|${section}|${text}`).slice(0, 20)}`,
         section,
         text,
         tokenCount: estimateTokens(text),

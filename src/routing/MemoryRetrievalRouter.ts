@@ -1,6 +1,7 @@
 ﻿import { RetrievalDecision, RetrievalLayerScore, RetrievalRoute } from "../types";
 
 const FACT_RECALL_RE = /(原话|原文|精确|准确|参数|细节|约束|配置|quote|exact|verbatim|parameter|constraint|detail)/i;
+const FACT_QA_RE = /^(who|what|where|when|which)\b|how\s+(?:long|much|many)\b|(?:什么|哪里|哪儿|何时|什么时候|多久|多长|多少)/i;
 const CURRENT_FACT_RE = /(current|latest|now|currently|updated|correction|after correction|现在|当前|最新|修正后|更新后)/i;
 const PROJECT_STATE_RE = /(当前状态|项目状态|进度|下一步|待办|未解决|阻塞|决策|status|state|progress|next step|next action|todo|pending|blocker|blocked|decision|where we left off)/i;
 const CURRENT_WORK_RE = /(这个项目|当前任务|当前工作|这件事|我们现在|当前主线|this project|current task|current work|our work|what we are doing)/i;
@@ -91,10 +92,18 @@ export class MemoryRetrievalRouter {
       );
     }
 
-    if (needsFacts || asksHistory) {
+    if (
+      needsFacts ||
+      asksHistory ||
+      (FACT_QA_RE.test(normalized) && context.hasCompactedHistory && !asksProjectState && !referencesCurrentWork)
+    ) {
       return this.decision(
         "summary_tree",
-        needsFacts ? "fact_question_requires_source_recall" : "historical_recall_query",
+        needsFacts
+          ? "fact_question_requires_source_recall"
+          : asksHistory
+            ? "historical_recall_query"
+            : "fact_qa_requires_source_recall",
         false,
         true,
         false,
@@ -260,6 +269,9 @@ export class MemoryRetrievalRouter {
     const complexTask = COMPLEX_TASK_RE.test(query) || context.queryComplexity === "high";
 
     if (needsFacts) add("summary_tree", 8, "fact_or_exact_recall_terms");
+    if (FACT_QA_RE.test(query) && context.hasCompactedHistory && !asksProjectState && !referencesCurrentWork) {
+      add("summary_tree", 7, "fact_qa_requires_source_recall");
+    }
     if (needsFacts && asksCurrentFact) add("memory_item", 6, "current_fact_terms");
     if (asksHistory) add("summary_tree", 7, "historical_recall_terms");
     if (context.hasCompactedHistory) add("summary_tree", 2, "compacted_history_available");

@@ -307,6 +307,7 @@ export type KnowledgeDocBucket = "raw" | "decisions" | "patterns" | "facts" | "i
 export type KnowledgeOrigin = "manual" | "native" | "imported" | "synthesized";
 export type KnowledgeIntakeMode = "conservative" | "balanced" | "aggressive";
 export type ConfigPreset = "safe" | "balanced" | "enhanced_recall";
+export type OpenClawRuntimeProfile = "standard" | "lightweight";
 export type RetrievalStrength = "low" | "medium" | "high" | "xhigh" | "custom";
 export type LlmPlannerMode = "off" | "shadow" | "auto";
 export type OpenClawNativeMode = "disabled" | "coexist" | "absorbed";
@@ -802,6 +803,7 @@ export interface BridgeConfig {
   runtimeCaptureEnabled: boolean;
   memoryItemEnabled: boolean;
   autoRecallEnabled: boolean;
+  forceDagOnlyRecall: boolean;
   agentVaultMirrorEnabled: boolean;
   summaryMarkdownMirrorEnabled: boolean;
   memoryItemMarkdownMirrorEnabled: boolean;
@@ -839,6 +841,7 @@ export interface BridgeConfig {
   brainPackIncludeRawTranscript: BrainPackPrivateDataPolicy;
   brainPackIncludeToolOutputs: BrainPackPrivateDataPolicy;
   brainPackDeterministicOrdering: boolean;
+  openClawRuntimeProfile: OpenClawRuntimeProfile;
   openClawNativeMode: OpenClawNativeMode;
   openClawNativeMemoryCoreMode?: OpenClawNativeMode;
   openClawNativeActiveMemoryMode?: OpenClawNativeMode;
