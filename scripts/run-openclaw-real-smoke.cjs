@@ -68,7 +68,14 @@ async function main() {
 
   const runtimeReport = JSON.parse(String(runtimeReportResult.stdout || "{}"));
   const smokeReport = JSON.parse(String(smokeReportResult.stdout || "{}"));
-  const finalAssistantReply = [...(harnessReport.results || [])]
+  const lastTurnResult = Array.isArray(harnessReport.results) && harnessReport.results.length > 0
+    ? harnessReport.results[harnessReport.results.length - 1]
+    : null;
+  const finalAssistantReply =
+    typeof lastTurnResult?.assistantReply === "string"
+      ? lastTurnResult.assistantReply.trim()
+      : "";
+  const previousNonEmptyAssistantReply = [...(harnessReport.results || [])]
     .reverse()
     .map((item) => item.assistantReply)
     .find((value) => typeof value === "string" && value.trim().length > 0) ?? "";
@@ -80,6 +87,8 @@ async function main() {
     sessionKey: harnessReport.sessionKey,
     realSessionId: harnessReport.realSessionId,
     finalAssistantReply,
+    lastTurnAssistantReply: finalAssistantReply,
+    previousNonEmptyAssistantReply,
     harnessReport,
     runtimeReport,
     smokeReport,
@@ -87,6 +96,9 @@ async function main() {
 
   const reportPath = path.join(outDir, "report.json");
   await fsp.writeFile(reportPath, JSON.stringify(report, null, 2), "utf8");
+  if (!finalAssistantReply) {
+    throw new Error(`Final turn assistant reply was empty for case ${path.relative(repoRoot, caseFile)}. Previous non-empty reply: ${previousNonEmptyAssistantReply || "(none)"}`);
+  }
   process.stdout.write(`${JSON.stringify({ reportPath, realSessionId: harnessReport.realSessionId }, null, 2)}\n`);
 }
 

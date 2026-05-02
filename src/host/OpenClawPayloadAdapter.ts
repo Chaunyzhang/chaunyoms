@@ -5,6 +5,11 @@ import { BridgeConfig, ConfigPreset, LoggerLike, RawMessage } from "../types";
 import { DEFAULT_BRIDGE_CONFIG } from "./OpenClawHostServices";
 import { getOpenClawConfigPath, getOpenClawHomeDir } from "./HostPathResolver";
 import { HostRecord, isHostRecord, OpenClawApiLike } from "./OpenClawHostTypes";
+import { OpenClawConfigResolver } from "./OpenClawConfigResolver";
+import { OpenClawConfigGuidanceAdvisor } from "./OpenClawConfigGuidanceAdvisor";
+import { OpenClawModelResolver } from "./OpenClawModelResolver";
+import { OpenClawRuntimeMessageExtractor } from "./OpenClawRuntimeMessageExtractor";
+import { OpenClawToolConfigResolver } from "./OpenClawToolConfigResolver";
 import {
   inspectOpenClawCompatibility,
   OpenClawCompatibilityReport,
@@ -81,6 +86,38 @@ interface OpenClawPayloadLike extends Record<string, unknown> {
 }
 
 export class OpenClawPayloadAdapter {
+  private readonly configGuidanceAdvisor = new OpenClawConfigGuidanceAdvisor();
+  private readonly configResolver = new OpenClawConfigResolver({
+    applyRetrievalStrengthPreset: this.applyRetrievalStrengthPreset.bind(this),
+    buildDataDir: this.buildDataDir.bind(this),
+    buildKnowledgeBaseDir: this.buildKnowledgeBaseDir.bind(this),
+    buildMemoryVaultDir: this.buildMemoryVaultDir.bind(this),
+    firstRecordCandidate: this.firstRecordCandidate.bind(this),
+    hasDirectoryValue: this.hasDirectoryValue.bind(this),
+    inverseBoolean: this.inverseBoolean.bind(this),
+    resolveAgentId: this.resolveAgentId.bind(this),
+    resolveBooleanFlag: this.resolveBooleanFlag.bind(this),
+    resolveConfiguredContextWindow: this.resolveConfiguredContextWindow.bind(this),
+    resolveDirectoryValue: this.resolveDirectoryValue.bind(this),
+    resolveNumberConfig: this.resolveNumberConfig.bind(this),
+    resolveOptionalString: this.resolveOptionalString.bind(this),
+    resolveOptionalStringEnum: this.resolveOptionalStringEnum.bind(this),
+    resolvePluginConfig: this.resolvePluginConfig.bind(this),
+    resolvePresetDefaults: this.resolvePresetDefaults.bind(this),
+    resolveRetrievalStrengthValue: this.resolveRetrievalStrengthValue.bind(this),
+    resolveSessionId: this.resolveSessionId.bind(this),
+    resolveStringEnum: this.resolveStringEnum.bind(this),
+    resolveStringList: this.resolveStringList.bind(this),
+    resolveStringValue: this.resolveStringValue.bind(this),
+    validateConfig: this.validateConfig.bind(this),
+  });
+  private readonly modelResolver = new OpenClawModelResolver(() => this.getApi());
+  private readonly runtimeMessageExtractor = new OpenClawRuntimeMessageExtractor();
+  private readonly toolConfigResolver = new OpenClawToolConfigResolver(
+    () => this.getApi(),
+    () => this.getLogger(),
+  );
+
   constructor(
     private readonly getApi: () => OpenClawApiLike | undefined,
     private readonly getLogger: () => LoggerLike,
@@ -122,41 +159,7 @@ export class OpenClawPayloadAdapter {
   }
 
   resolveToolConfig(): ToolConfigResult {
-    const api = this.getApi();
-    const runtimeConfig =
-      api?.config ??
-      api?.pluginConfig ??
-      api?.runtime?.config ??
-      api?.context?.config ??
-      {};
-    const runtimeEnableTools = isHostRecord(runtimeConfig)
-      ? runtimeConfig.enableTools
-      : undefined;
-    if (runtimeEnableTools === true) {
-      return {
-        enabled: true,
-        source: "runtime",
-        runtimeEnableTools,
-        fileEnableTools: undefined,
-      };
-    }
-
-    const fileEnableTools = this.readEnableToolsFromOpenClawConfig();
-    if (fileEnableTools === true) {
-      return {
-        enabled: true,
-        source: "openclaw_json",
-        runtimeEnableTools,
-        fileEnableTools,
-      };
-    }
-
-    return {
-      enabled: false,
-      source: "disabled",
-      runtimeEnableTools,
-      fileEnableTools,
-    };
+    return this.toolConfigResolver.resolveToolConfig();
   }
 
   inspectOpenClawCompatibility(): OpenClawCompatibilityReport {
@@ -195,831 +198,14 @@ export class OpenClawPayloadAdapter {
     preset: ConfigPreset;
     warnings: string[];
   } {
-    const warnings: string[] = [];
-    if (config.emergencyBrake) {
-      warnings.push("Emergency brake is enabled; runtime capture, MemoryItem writes, auto recall, and knowledge promotion are forced off.");
-    }
-    if (!config.strictCompaction && config.knowledgePromotionEnabled) {
-      warnings.push("Knowledge promotion is enabled while strict compaction is off; weaker summaries may reduce promotion quality.");
-    }
-    if (!config.runtimeCaptureEnabled && config.semanticCandidateExpansionEnabled) {
-      warnings.push("Semantic candidate expansion is enabled without runtime capture; only stored assets can contribute candidates.");
-    }
-    if (config.semanticCandidateExpansionEnabled && config.semanticCandidateLimit <= 0) {
-      warnings.push("Semantic candidate expansion is enabled but semanticCandidateLimit is non-positive.");
-    }
-    if (config.knowledgePromotionEnabled && !config.memoryItemEnabled) {
-      warnings.push("Knowledge promotion is enabled while MemoryItem extraction is disabled; promotion inputs will be thinner than expected.");
-    }
-    if (config.knowledgePromotionEnabled && !config.knowledgePromotionManualReviewEnabled) {
-      warnings.push("Knowledge promotion is automatic. Set knowledgePromotionManualReviewEnabled=true if you want a scored manual approval queue before Markdown writes.");
-    }
-    if ((config.retrievalStrength === "high" || config.retrievalStrength === "xhigh") && !config.autoRecallEnabled) {
-      warnings.push(`${config.retrievalStrength} retrieval requires source recall, but autoRecallEnabled=false; exact evidence recall will be limited.`);
-    }
-    if (config.kbWriteEnabled && !config.kbExportEnabled) {
-      warnings.push("kbWriteEnabled=true but kbExportEnabled=false; knowledge candidates can be written only after export is enabled.");
-    }
-    if (config.kbPromotionMode === "aggressive_auto") {
-      warnings.push("kbPromotionMode=aggressive_auto is research-only; manual, assisted, or conservative_auto is safer for production knowledge-vault writes.");
-    }
-    if (config.openClawNativeMode !== "disabled") {
-      warnings.push(`openClawNativeMode=${config.openClawNativeMode}; native OpenClaw outputs are non-authoritative unless they pass OMS validation/promotion.`);
-    }
-    if (config.graphEnabled && config.graphProvider === "none") {
-      warnings.push("graphEnabled=true but graphProvider=none; graph enhancement will stay inactive.");
-    }
-    if (config.ragEnabled && config.ragProvider === "none") {
-      warnings.push("ragEnabled=true but ragProvider=none; RAG enhancement will stay inactive.");
-    }
-    if (config.ragEnabled && config.ragProvider === "sqlite_vec" && !config.ragFallbackToBruteForce && !config.vectorExtensionPath) {
-      warnings.push("ragProvider=sqlite_vec has no vectorExtensionPath and ragFallbackToBruteForce=false; vector search will be unavailable on hosts without a bundled extension.");
-    }
-    if (config.ragEnabled && !config.embeddingEnabled) {
-      warnings.push("ragEnabled=true while embeddingEnabled=false; vector/RAG search will stay inactive because query embeddings are unavailable.");
-    }
-    if (config.graphEnabled && !config.graphBuilderEnabled) {
-      warnings.push("graphEnabled=true while graphBuilderEnabled=false; existing graph edges can be read, but new associative edges will not be built.");
-    }
-    if (config.rerankEnabled && config.rerankProvider === "none") {
-      warnings.push("rerankEnabled=true but rerankProvider=none; rerank enhancement will stay inactive.");
-    }
-    if (config.rerankEnabled && ["llm", "specialist", "model", "external"].includes(config.rerankProvider)) {
-      warnings.push("rerankProvider is model/external; rerank will stay inactive unless a concrete runtime provider is wired. Deterministic fallback is never implicit.");
-    }
-    if (config.evidenceAnswerResolverEnabled && config.evidenceAnswerResolverProvider === "none") {
-      warnings.push("evidenceAnswerResolverEnabled=true but evidenceAnswerResolverProvider=none; final evidence-to-answer resolution will stay inactive.");
-    }
-    if (config.evidenceAnswerResolverEnabled && ["llm", "external"].includes(config.evidenceAnswerResolverProvider) && !config.evidenceAnswerResolverModel) {
-      warnings.push("EvidenceAnswerResolver uses an LLM/external provider without evidenceAnswerResolverModel; it will fail closed because model configuration is required.");
-    }
-    if (config.dagExpansionMode === "planner_decides" && config.dagExpansionAgentProvider === "none") {
-      warnings.push("dagExpansionMode=planner_decides but dagExpansionAgentProvider=none; LLMPlanner can only choose deterministic DAG expansion.");
-    }
-    if (config.dagExpansionMode === "delegated_agent" && config.dagExpansionAgentProvider === "llm" && !config.dagExpansionAgentModel) {
-      warnings.push("delegated DAG expansion uses llm provider without dagExpansionAgentModel; it will fail closed unless the host supplies a default model.");
-    }
-    return {
-      preset: config.configPreset,
-      warnings,
-    };
+    return this.configGuidanceAdvisor.describe(config);
   }
 
   private resolveConfig(
     payload: OpenClawPayloadLike,
     currentConfig: BridgeConfig,
   ): BridgeConfig {
-    const pluginConfig = this.firstRecordCandidate(
-      payload.config,
-      this.getApi()?.pluginConfig ??
-        this.getApi()?.context?.pluginConfig ??
-        this.getApi()?.runtime?.pluginConfig ??
-        this.getApi()?.config?.plugins?.entries?.oms?.config ??
-        this.getApi()?.context?.config?.plugins?.entries?.oms?.config ??
-        this.getApi()?.runtime?.config?.plugins?.entries?.oms?.config ??
-        this.getApi()?.config,
-    ) ?? {};
-    const baseConfig = currentConfig ?? DEFAULT_BRIDGE_CONFIG;
-    const identityBaseConfig: BridgeConfig = {
-      ...baseConfig,
-      sessionId: this.resolveStringValue(pluginConfig.sessionId, baseConfig.sessionId),
-      agentId: this.resolveStringValue(pluginConfig.agentId, baseConfig.agentId),
-    };
-    const configPreset = this.resolveStringEnum(
-      [
-        pluginConfig.configPreset,
-        pluginConfig.preset,
-      ],
-      ["safe", "balanced", "enhanced_recall"],
-      baseConfig.configPreset,
-    ) as ConfigPreset;
-    const presetDefaults = this.resolvePresetDefaults(configPreset, baseConfig);
-    const sharedDataDir = this.resolveDirectoryValue(
-      pluginConfig.sharedDataDir,
-      baseConfig.sharedDataDir,
-    );
-    const workspaceDir = this.resolveDirectoryValue(
-      pluginConfig.workspaceDir,
-      baseConfig.workspaceDir,
-    );
-    const hasExplicitSharedDataDir = this.hasDirectoryValue(
-      pluginConfig.sharedDataDir,
-    );
-    const dataDir = this.resolveDirectoryValue(
-      pluginConfig.dataDir,
-      hasExplicitSharedDataDir
-        ? this.buildDataDir(sharedDataDir)
-        : baseConfig.dataDir,
-    );
-    const knowledgeBaseDir = this.resolveDirectoryValue(
-      pluginConfig.knowledgeBaseDir,
-      pluginConfig.knowledgeDir,
-      hasExplicitSharedDataDir
-        ? this.buildKnowledgeBaseDir(sharedDataDir)
-        : baseConfig.knowledgeBaseDir,
-    );
-    const memoryVaultDir = this.resolveDirectoryValue(
-      pluginConfig.memoryVaultDir,
-      hasExplicitSharedDataDir
-        ? this.buildMemoryVaultDir(sharedDataDir)
-        : baseConfig.memoryVaultDir,
-    );
-
-    const emergencyBrake = this.resolveBooleanFlag(
-      [
-        pluginConfig.emergencyBrake,
-        pluginConfig.memoryEmergencyBrake,
-        pluginConfig.memoryEmergencyStop,
-        pluginConfig.isolationMode,
-      ],
-      baseConfig.emergencyBrake,
-    );
-
-    const runtimeCaptureEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.runtimeCaptureEnabled,
-            this.inverseBoolean(pluginConfig.pauseRuntimeCapture),
-            this.inverseBoolean(pluginConfig.stopRuntimeCapture),
-          ],
-          baseConfig.runtimeCaptureEnabled,
-        );
-
-    const memoryItemEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.memoryItemEnabled,
-            this.inverseBoolean(pluginConfig.stopMemoryItemWrites),
-            this.inverseBoolean(pluginConfig.pauseMemoryItems),
-          ],
-          baseConfig.memoryItemEnabled,
-        );
-
-    const autoRecallEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.autoRecallEnabled,
-            this.inverseBoolean(pluginConfig.disableAutoRecall),
-            this.inverseBoolean(pluginConfig.stopAutoRecall),
-          ],
-          presetDefaults.autoRecallEnabled,
-        );
-
-    const knowledgePromotionEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.knowledgePromotionEnabled,
-            this.inverseBoolean(pluginConfig.disableKnowledgePromotion),
-            this.inverseBoolean(pluginConfig.stopKnowledgePromotion),
-          ],
-          baseConfig.knowledgePromotionEnabled,
-        );
-
-    const knowledgePromotionManualReviewEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.knowledgePromotionManualReviewEnabled,
-        pluginConfig.knowledgeManualReviewEnabled,
-        pluginConfig.manualKnowledgeReview,
-      ],
-      baseConfig.knowledgePromotionManualReviewEnabled,
-    );
-
-    const knowledgeIntakeMode = this.resolveStringEnum(
-      [
-        pluginConfig.knowledgeIntakeMode,
-        pluginConfig.knowledgeIntakePolicy,
-      ],
-      ["conservative", "balanced", "aggressive"],
-      baseConfig.knowledgeIntakeMode,
-    ) as BridgeConfig["knowledgeIntakeMode"];
-
-    const knowledgeIntakeAllowProjectState = this.resolveBooleanFlag(
-      [
-        pluginConfig.knowledgeIntakeAllowProjectState,
-        pluginConfig.allowProjectStateKnowledge,
-      ],
-      baseConfig.knowledgeIntakeAllowProjectState,
-    );
-
-    const knowledgeIntakeAllowBranchSummaries = this.resolveBooleanFlag(
-      [
-        pluginConfig.knowledgeIntakeAllowBranchSummaries,
-        pluginConfig.allowBranchSummaryKnowledge,
-      ],
-      baseConfig.knowledgeIntakeAllowBranchSummaries,
-    );
-
-    const knowledgeIntakeUserOverrideEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.knowledgeIntakeUserOverrideEnabled,
-        pluginConfig.knowledgeUserOverrideEnabled,
-      ],
-      baseConfig.knowledgeIntakeUserOverrideEnabled,
-    );
-
-    const knowledgeIntakeUserOverridePatterns = this.resolveStringList(
-      pluginConfig.knowledgeIntakeUserOverridePatterns,
-      baseConfig.knowledgeIntakeUserOverridePatterns,
-    );
-
-    const agentVaultMirrorEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.agentVaultMirrorEnabled,
-        pluginConfig.enableAgentVaultMirror,
-        this.inverseBoolean(pluginConfig.disableAgentVaultMirror),
-      ],
-      baseConfig.agentVaultMirrorEnabled,
-    );
-
-    const summaryMarkdownMirrorEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.summaryMarkdownMirrorEnabled,
-        pluginConfig.enableSummaryMarkdownMirror,
-        this.inverseBoolean(pluginConfig.disableSummaryMarkdownMirror),
-      ],
-      baseConfig.summaryMarkdownMirrorEnabled,
-    );
-
-    const memoryItemMarkdownMirrorEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.memoryItemMarkdownMirrorEnabled,
-        pluginConfig.enableMemoryItemMarkdownMirror,
-        this.inverseBoolean(pluginConfig.disableMemoryItemMarkdownMirror),
-      ],
-      baseConfig.memoryItemMarkdownMirrorEnabled,
-    );
-
-    const transcriptMirrorEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.transcriptMirrorEnabled,
-        pluginConfig.enableTranscriptMirror,
-        this.inverseBoolean(pluginConfig.disableTranscriptMirror),
-      ],
-      baseConfig.transcriptMirrorEnabled,
-    );
-
-    const knowledgeMarkdownEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.knowledgeMarkdownEnabled,
-        pluginConfig.enableKnowledgeMarkdown,
-        this.inverseBoolean(pluginConfig.disableKnowledgeMarkdown),
-      ],
-      baseConfig.knowledgeMarkdownEnabled,
-    );
-
-    const retrievalStrength = this.resolveRetrievalStrengthValue(
-      [
-        pluginConfig.retrievalStrength,
-        pluginConfig.retrievalMode,
-        pluginConfig.recallStrength,
-      ],
-      baseConfig.retrievalStrength,
-    );
-
-    const llmPlannerMode = this.resolveStringEnum(
-      [
-        pluginConfig.llmPlannerMode,
-        pluginConfig.plannerMode,
-        pluginConfig.retrievalPlannerMode,
-      ],
-      ["off", "shadow", "auto"],
-      baseConfig.llmPlannerMode,
-    ) as BridgeConfig["llmPlannerMode"];
-
-    const plannerDebugEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.plannerDebugEnabled,
-        pluginConfig.llmPlannerDebugEnabled,
-        pluginConfig.enablePlannerDebug,
-      ],
-      baseConfig.plannerDebugEnabled,
-    );
-
-    const kbPromotionMode = this.resolveStringEnum(
-      [
-        pluginConfig.kbPromotionMode,
-        pluginConfig.knowledgePromotionMode,
-      ],
-      ["manual", "assisted", "conservative_auto", "balanced_auto", "aggressive_auto"],
-      baseConfig.kbPromotionMode,
-    ) as BridgeConfig["kbPromotionMode"];
-
-    const kbPromotionStrictness = this.resolveStringEnum(
-      [
-        pluginConfig.kbPromotionStrictness,
-        pluginConfig.knowledgePromotionStrictness,
-      ],
-      ["low", "medium", "high"],
-      baseConfig.kbPromotionStrictness,
-    ) as BridgeConfig["kbPromotionStrictness"];
-
-    const sqliteJournalMode = this.resolveStringEnum(
-      [
-        pluginConfig.sqliteJournalMode,
-        pluginConfig.runtimeSqliteJournalMode,
-      ],
-      ["delete", "wal"],
-      baseConfig.sqliteJournalMode,
-    ) as BridgeConfig["sqliteJournalMode"];
-    const openClawRuntimeProfile = this.resolveStringEnum(
-      [
-        pluginConfig.openClawRuntimeProfile,
-        pluginConfig.runtimeProfile,
-      ],
-      ["standard", "lightweight"],
-      baseConfig.openClawRuntimeProfile,
-    ) as BridgeConfig["openClawRuntimeProfile"];
-
-    const usageFeedbackEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.usageFeedbackEnabled,
-            pluginConfig.recallUsageFeedbackEnabled,
-            this.inverseBoolean(pluginConfig.disableUsageFeedback),
-          ],
-          baseConfig.usageFeedbackEnabled,
-        );
-
-    const brainPackEnabled = this.resolveBooleanFlag(
-      [
-        pluginConfig.brainPackEnabled,
-        pluginConfig.agentBrainPackEnabled,
-        this.inverseBoolean(pluginConfig.disableBrainPack),
-      ],
-      baseConfig.brainPackEnabled,
-    );
-    const brainPackMode = this.resolveStringEnum(
-      [pluginConfig.brainPackMode, pluginConfig.agentBrainPackMode],
-      ["manual", "scheduled"],
-      baseConfig.brainPackMode,
-    ) as BridgeConfig["brainPackMode"];
-    const brainPackOutputDir = this.resolveDirectoryValue(
-      pluginConfig.brainPackOutputDir,
-      pluginConfig.agentBrainPackDir,
-      pluginConfig.brainpackOutputDir,
-      baseConfig.brainPackOutputDir || path.join(workspaceDir, "agent-brainpack"),
-    );
-    const brainPackRedactionMode = this.resolveStringEnum(
-      [pluginConfig.brainPackRedactionMode, pluginConfig.redactionMode],
-      ["strict", "redact", "report_only"],
-      baseConfig.brainPackRedactionMode,
-    ) as BridgeConfig["brainPackRedactionMode"];
-    const brainPackIncludeRawTranscript = this.resolveStringEnum(
-      [pluginConfig.brainPackIncludeRawTranscript, pluginConfig.includeRawTranscript],
-      ["never", "redacted_excerpt", "private_archive_only"],
-      baseConfig.brainPackIncludeRawTranscript,
-    ) as BridgeConfig["brainPackIncludeRawTranscript"];
-    const brainPackIncludeToolOutputs = this.resolveStringEnum(
-      [pluginConfig.brainPackIncludeToolOutputs, pluginConfig.includeToolOutputs],
-      ["never", "redacted_excerpt", "private_archive_only"],
-      baseConfig.brainPackIncludeToolOutputs,
-    ) as BridgeConfig["brainPackIncludeToolOutputs"];
-
-    const openClawNativeMode = this.resolveStringEnum(
-      [pluginConfig.openClawNativeMode, pluginConfig.nativeMemoryMode, pluginConfig.openclawNativeMode],
-      ["disabled", "coexist", "absorbed"],
-      baseConfig.openClawNativeMode,
-    ) as BridgeConfig["openClawNativeMode"];
-    const graphEnabled = this.resolveBooleanFlag(
-      [pluginConfig.graphEnabled, pluginConfig.retrievalGraphEnabled, this.inverseBoolean(pluginConfig.disableGraph)],
-      baseConfig.graphEnabled,
-    );
-    const ragEnabled = this.resolveBooleanFlag(
-      [pluginConfig.ragEnabled, pluginConfig.retrievalRagEnabled, this.inverseBoolean(pluginConfig.disableRag)],
-      baseConfig.ragEnabled,
-    );
-    const rerankEnabled = this.resolveBooleanFlag(
-      [pluginConfig.rerankEnabled, pluginConfig.retrievalRerankEnabled, this.inverseBoolean(pluginConfig.disableRerank)],
-      baseConfig.rerankEnabled,
-    );
-    const heavyRetrievalPolicy = this.resolveStringEnum(
-      [pluginConfig.heavyRetrievalPolicy],
-      ["disabled", "planner_only"],
-      baseConfig.heavyRetrievalPolicy,
-    ) as BridgeConfig["heavyRetrievalPolicy"];
-    const ragPlannerPolicy = this.resolveStringEnum(
-      [pluginConfig.ragPlannerPolicy, pluginConfig.ragRetrievalPolicy],
-      ["disabled", "planner_only"],
-      baseConfig.ragPlannerPolicy,
-    ) as BridgeConfig["ragPlannerPolicy"];
-    const graphPlannerPolicy = this.resolveStringEnum(
-      [pluginConfig.graphPlannerPolicy, pluginConfig.graphRetrievalPolicy],
-      ["disabled", "planner_only"],
-      baseConfig.graphPlannerPolicy,
-    ) as BridgeConfig["graphPlannerPolicy"];
-    const rerankPlannerPolicy = this.resolveStringEnum(
-      [pluginConfig.rerankPlannerPolicy, pluginConfig.rerankRetrievalPolicy],
-      ["disabled", "planner_only", "candidate_overload_required"],
-      baseConfig.rerankPlannerPolicy,
-    ) as BridgeConfig["rerankPlannerPolicy"];
-    const embeddingEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.embeddingEnabled,
-            pluginConfig.retrievalEmbeddingEnabled,
-            this.inverseBoolean(pluginConfig.disableEmbedding),
-          ],
-          baseConfig.embeddingEnabled,
-        );
-    const graphBuilderEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.graphBuilderEnabled,
-            pluginConfig.retrievalGraphBuilderEnabled,
-            this.inverseBoolean(pluginConfig.disableGraphBuilder),
-          ],
-          baseConfig.graphBuilderEnabled,
-        );
-    const evidenceAnswerResolverEnabled = emergencyBrake
-      ? false
-      : this.resolveBooleanFlag(
-          [
-            pluginConfig.evidenceAnswerResolverEnabled,
-            pluginConfig.answerResolverEnabled,
-            this.inverseBoolean(pluginConfig.disableEvidenceAnswerResolver),
-          ],
-          baseConfig.evidenceAnswerResolverEnabled,
-        );
-    const dagExpansionMode = emergencyBrake
-      ? "deterministic"
-      : this.resolveStringEnum(
-          [pluginConfig.dagExpansionMode, pluginConfig.sourceExpansionMode, pluginConfig.summaryExpansionMode],
-          ["deterministic", "planner_decides", "delegated_agent"],
-          baseConfig.dagExpansionMode,
-        ) as BridgeConfig["dagExpansionMode"];
-    const dagExpansionAgentProvider = emergencyBrake
-      ? "none"
-      : this.resolveStringEnum(
-          [pluginConfig.dagExpansionAgentProvider, pluginConfig.sourceExpansionAgentProvider],
-          ["none", "host_subagent", "llm"],
-          baseConfig.dagExpansionAgentProvider,
-        ) as BridgeConfig["dagExpansionAgentProvider"];
-
-    return this.validateConfig(this.applyRetrievalStrengthPreset({
-      dataDir,
-      sessionId: this.resolveSessionId(payload, identityBaseConfig),
-      agentId: this.resolveAgentId(payload, identityBaseConfig),
-      configPreset,
-      workspaceDir,
-      sharedDataDir,
-      memoryVaultDir,
-      knowledgeBaseDir,
-      contextWindow: this.resolveConfiguredContextWindow(
-        pluginConfig,
-        payload,
-        baseConfig,
-      ),
-      contextThreshold: this.resolveNumberConfig(
-        [
-          pluginConfig.contextThreshold,
-          pluginConfig.compactionTriggerRatio,
-        ],
-        baseConfig.contextThreshold,
-      ),
-      freshTailTokens: this.resolveNumberConfig(
-        [
-          pluginConfig.freshTailTokens,
-          pluginConfig.recentTailTurns,
-        ],
-        baseConfig.freshTailTokens,
-      ),
-      maxFreshTailTurns: this.resolveNumberConfig(
-        [pluginConfig.maxFreshTailTurns],
-        baseConfig.maxFreshTailTurns,
-      ),
-      compactionBatchTurns: this.resolveNumberConfig(
-        [pluginConfig.compactionBatchTurns],
-        baseConfig.compactionBatchTurns,
-      ),
-      summaryModel:
-        typeof pluginConfig.summaryModel === "string" &&
-        pluginConfig.summaryModel.trim().length > 0
-          ? pluginConfig.summaryModel
-          : undefined,
-      knowledgePromotionModel:
-        typeof pluginConfig.knowledgePromotionModel === "string" &&
-        pluginConfig.knowledgePromotionModel.trim().length > 0
-          ? pluginConfig.knowledgePromotionModel
-          : typeof pluginConfig.knowledgeModel === "string" &&
-              pluginConfig.knowledgeModel.trim().length > 0
-            ? pluginConfig.knowledgeModel
-            : undefined,
-      summaryMaxOutputTokens: this.resolveNumberConfig(
-        [pluginConfig.summaryMaxOutputTokens],
-        baseConfig.summaryMaxOutputTokens,
-      ),
-      strictCompaction: this.resolveBooleanFlag(
-        [
-          pluginConfig.strictCompaction,
-          pluginConfig.requireLlmSummary,
-          this.inverseBoolean(pluginConfig.allowFallbackSummary),
-          this.inverseBoolean(pluginConfig.enableFallbackSummary),
-        ],
-        baseConfig.strictCompaction,
-      ),
-      compactionBarrierEnabled: this.resolveBooleanFlag(
-        [
-          pluginConfig.compactionBarrierEnabled,
-          pluginConfig.compressBeforeAssemble,
-          this.inverseBoolean(pluginConfig.disableCompactionBarrier),
-        ],
-        baseConfig.compactionBarrierEnabled,
-      ),
-      runtimeCaptureEnabled,
-      memoryItemEnabled,
-      autoRecallEnabled,
-      forceDagOnlyRecall: this.resolveBooleanFlag(
-        [pluginConfig.forceDagOnlyRecall, pluginConfig.disableDirectRawRecall],
-        baseConfig.forceDagOnlyRecall,
-      ),
-      agentVaultMirrorEnabled,
-      summaryMarkdownMirrorEnabled,
-      memoryItemMarkdownMirrorEnabled,
-      transcriptMirrorEnabled,
-      knowledgeMarkdownEnabled,
-      retrievalStrength,
-      llmPlannerMode,
-      plannerDebugEnabled,
-      llmPlannerModel:
-        typeof pluginConfig.llmPlannerModel === "string" &&
-        pluginConfig.llmPlannerModel.trim().length > 0
-          ? pluginConfig.llmPlannerModel
-          : typeof pluginConfig.plannerModel === "string" &&
-              pluginConfig.plannerModel.trim().length > 0
-            ? pluginConfig.plannerModel
-            : baseConfig.llmPlannerModel,
-      knowledgePromotionEnabled,
-      knowledgePromotionManualReviewEnabled,
-      knowledgeIntakeMode,
-      kbCandidateEnabled: this.resolveBooleanFlag(
-        [
-          pluginConfig.kbCandidateEnabled,
-          pluginConfig.knowledgeCandidateEnabled,
-          this.inverseBoolean(pluginConfig.disableKbCandidates),
-        ],
-        baseConfig.kbCandidateEnabled,
-      ),
-      kbWriteEnabled: this.resolveBooleanFlag(
-        [
-          pluginConfig.kbWriteEnabled,
-          pluginConfig.knowledgeWriteEnabled,
-          pluginConfig.knowledgePromotionEnabled,
-          this.inverseBoolean(pluginConfig.disableKbWrites),
-        ],
-        baseConfig.kbWriteEnabled,
-      ),
-      kbPromotionMode,
-      kbPromotionStrictness,
-      kbExportEnabled: this.resolveBooleanFlag(
-        [
-          pluginConfig.kbExportEnabled,
-          pluginConfig.knowledgeExportEnabled,
-          this.inverseBoolean(pluginConfig.disableKbExport),
-        ],
-        baseConfig.kbExportEnabled,
-      ),
-      knowledgeIntakeAllowProjectState,
-      knowledgeIntakeAllowBranchSummaries,
-      knowledgeIntakeUserOverrideEnabled,
-      knowledgeIntakeUserOverridePatterns,
-      semanticCandidateExpansionEnabled: emergencyBrake
-        ? false
-        : this.resolveBooleanFlag(
-            [
-              pluginConfig.semanticCandidateExpansionEnabled,
-              pluginConfig.enableSemanticCandidateExpansion,
-              pluginConfig.semanticCandidatesEnabled,
-            ],
-            presetDefaults.semanticCandidateExpansionEnabled,
-          ),
-      semanticCandidateLimit: this.resolveNumberConfig(
-        [
-          pluginConfig.semanticCandidateLimit,
-          pluginConfig.maxSemanticCandidates,
-        ],
-        presetDefaults.semanticCandidateLimit,
-      ),
-      usageFeedbackEnabled,
-      brainPackEnabled,
-      brainPackMode,
-      brainPackTurnInterval: this.resolveNumberConfig(
-        [pluginConfig.brainPackTurnInterval, pluginConfig.brainPackConversationTurnInterval],
-        baseConfig.brainPackTurnInterval,
-      ),
-      brainPackIntervalHours: this.resolveNumberConfig(
-        [pluginConfig.brainPackIntervalHours, pluginConfig.brainPackSnapshotIntervalHours],
-        baseConfig.brainPackIntervalHours,
-      ),
-      brainPackOutputDir,
-      brainPackGitEnabled: this.resolveBooleanFlag(
-        [pluginConfig.brainPackGitEnabled, pluginConfig.brainPackAutoGitEnabled],
-        baseConfig.brainPackGitEnabled,
-      ),
-      brainPackGitRemote: this.resolveOptionalString(pluginConfig.brainPackGitRemote, baseConfig.brainPackGitRemote),
-      brainPackGitBranch: this.resolveOptionalString(pluginConfig.brainPackGitBranch, baseConfig.brainPackGitBranch),
-      brainPackCommitMessageTemplate: this.resolveOptionalString(
-        pluginConfig.brainPackCommitMessageTemplate,
-        baseConfig.brainPackCommitMessageTemplate,
-      ),
-      brainPackRedactionMode,
-      brainPackIncludeRawTranscript,
-      brainPackIncludeToolOutputs,
-      brainPackDeterministicOrdering: this.resolveBooleanFlag(
-        [pluginConfig.brainPackDeterministicOrdering, pluginConfig.deterministicBrainPackOrdering],
-        baseConfig.brainPackDeterministicOrdering,
-      ),
-      openClawNativeMode,
-      openClawNativeMemoryCoreMode: this.resolveOptionalStringEnum(
-        [pluginConfig.openClawNativeMemoryCoreMode, pluginConfig.memoryCoreNativeMode],
-        ["disabled", "coexist", "absorbed"],
-        baseConfig.openClawNativeMemoryCoreMode,
-      ) as BridgeConfig["openClawNativeMemoryCoreMode"],
-      openClawNativeActiveMemoryMode: this.resolveOptionalStringEnum(
-        [pluginConfig.openClawNativeActiveMemoryMode, pluginConfig.activeMemoryNativeMode],
-        ["disabled", "coexist", "absorbed"],
-        baseConfig.openClawNativeActiveMemoryMode,
-      ) as BridgeConfig["openClawNativeActiveMemoryMode"],
-      openClawNativeMemoryWikiMode: this.resolveOptionalStringEnum(
-        [pluginConfig.openClawNativeMemoryWikiMode, pluginConfig.memoryWikiNativeMode],
-        ["disabled", "coexist", "absorbed"],
-        baseConfig.openClawNativeMemoryWikiMode,
-      ) as BridgeConfig["openClawNativeMemoryWikiMode"],
-      openClawNativeDreamingMode: this.resolveOptionalStringEnum(
-        [pluginConfig.openClawNativeDreamingMode, pluginConfig.dreamingNativeMode],
-        ["disabled", "coexist", "absorbed"],
-        baseConfig.openClawNativeDreamingMode,
-      ) as BridgeConfig["openClawNativeDreamingMode"],
-      graphEnabled,
-      ragEnabled,
-      rerankEnabled,
-      graphProvider: this.resolveStringEnum(
-        [pluginConfig.graphProvider, pluginConfig.retrievalGraphProvider],
-        ["none", "sqlite_graph", "sqlite_edges", "external"],
-        baseConfig.graphProvider,
-      ) as BridgeConfig["graphProvider"],
-      ragProvider: this.resolveStringEnum(
-        [pluginConfig.ragProvider, pluginConfig.retrievalRagProvider],
-        ["none", "sqlite_vec", "brute_force", "embedding", "external"],
-        baseConfig.ragProvider,
-      ) as BridgeConfig["ragProvider"],
-      rerankProvider: this.resolveStringEnum(
-        [pluginConfig.rerankProvider, pluginConfig.retrievalRerankProvider],
-        ["none", "deterministic", "llm", "specialist", "model", "external"],
-        baseConfig.rerankProvider,
-      ) as BridgeConfig["rerankProvider"],
-      embeddingEnabled,
-      embeddingProvider: this.resolveStringEnum(
-        [pluginConfig.embeddingProvider, pluginConfig.retrievalEmbeddingProvider],
-        ["none", "local_hash", "external"],
-        baseConfig.embeddingProvider,
-      ) as BridgeConfig["embeddingProvider"],
-      embeddingModel: this.resolveOptionalString(
-        pluginConfig.embeddingModel,
-        baseConfig.embeddingModel,
-      ) ?? baseConfig.embeddingModel,
-      embeddingDimensions: this.resolveNumberConfig(
-        [pluginConfig.embeddingDimensions, pluginConfig.vectorDimensions],
-        baseConfig.embeddingDimensions,
-      ),
-      embeddingAsync: this.resolveBooleanFlag(
-        [pluginConfig.embeddingAsync, pluginConfig.embeddingJobsAsync],
-        baseConfig.embeddingAsync,
-      ),
-      embeddingJobMaxBatch: this.resolveNumberConfig(
-        [pluginConfig.embeddingJobMaxBatch, pluginConfig.embeddingBatchSize],
-        baseConfig.embeddingJobMaxBatch,
-      ),
-      embeddingJobMaxRetries: this.resolveNumberConfig(
-        [pluginConfig.embeddingJobMaxRetries, pluginConfig.embeddingMaxRetries],
-        baseConfig.embeddingJobMaxRetries,
-      ),
-      vectorExtensionPath: this.resolveOptionalString(
-        pluginConfig.vectorExtensionPath,
-        baseConfig.vectorExtensionPath,
-      ),
-      vectorExtensionEntryPoint: this.resolveOptionalString(
-        pluginConfig.vectorExtensionEntryPoint,
-        baseConfig.vectorExtensionEntryPoint,
-      ),
-      vectorSearchMaxCandidates: this.resolveNumberConfig(
-        [pluginConfig.vectorSearchMaxCandidates, pluginConfig.ragVectorCandidateLimit],
-        baseConfig.vectorSearchMaxCandidates,
-      ),
-      bruteForceVectorMaxRows: this.resolveNumberConfig(
-        [pluginConfig.bruteForceVectorMaxRows, pluginConfig.ragBruteForceMaxRows],
-        baseConfig.bruteForceVectorMaxRows,
-      ),
-      ragFallbackToBruteForce: this.resolveBooleanFlag(
-        [pluginConfig.ragFallbackToBruteForce, pluginConfig.vectorFallbackToBruteForce],
-        baseConfig.ragFallbackToBruteForce,
-      ),
-      graphBuilderEnabled,
-      graphBuilderProvider: this.resolveStringEnum(
-        [pluginConfig.graphBuilderProvider, pluginConfig.retrievalGraphBuilderProvider],
-        ["none", "deterministic", "llm", "external"],
-        baseConfig.graphBuilderProvider,
-      ) as BridgeConfig["graphBuilderProvider"],
-      graphMaxDepth: this.resolveNumberConfig(
-        [pluginConfig.graphMaxDepth],
-        baseConfig.graphMaxDepth,
-      ),
-      graphMaxFanout: this.resolveNumberConfig(
-        [pluginConfig.graphMaxFanout],
-        baseConfig.graphMaxFanout,
-      ),
-      graphMinConfidence: this.resolveNumberConfig(
-        [pluginConfig.graphMinConfidence],
-        baseConfig.graphMinConfidence,
-      ),
-      graphAllowedRelations: this.resolveStringList(
-        pluginConfig.graphAllowedRelations,
-        baseConfig.graphAllowedRelations,
-      ),
-      graphCandidateLimit: this.resolveNumberConfig(
-        [pluginConfig.graphCandidateLimit, pluginConfig.graphMaxCandidates],
-        baseConfig.graphCandidateLimit,
-      ),
-      rerankModel: this.resolveOptionalString(pluginConfig.rerankModel, baseConfig.rerankModel),
-      rerankTimeoutMs: this.resolveNumberConfig(
-        [pluginConfig.rerankTimeoutMs, pluginConfig.rerankMaxLatencyMs],
-        baseConfig.rerankTimeoutMs,
-      ),
-      rerankFallbackToDeterministic: this.resolveBooleanFlag(
-        [pluginConfig.rerankFallbackToDeterministic],
-        baseConfig.rerankFallbackToDeterministic,
-      ),
-      evidenceAnswerResolverEnabled,
-      evidenceAnswerResolverProvider: this.resolveStringEnum(
-        [pluginConfig.evidenceAnswerResolverProvider, pluginConfig.answerResolverProvider],
-        ["none", "deterministic", "llm", "external"],
-        baseConfig.evidenceAnswerResolverProvider,
-      ) as BridgeConfig["evidenceAnswerResolverProvider"],
-      evidenceAnswerResolverModel: this.resolveOptionalString(
-        pluginConfig.evidenceAnswerResolverModel,
-        baseConfig.evidenceAnswerResolverModel,
-      ),
-      evidenceAnswerResolverTimeoutMs: this.resolveNumberConfig(
-        [pluginConfig.evidenceAnswerResolverTimeoutMs, pluginConfig.answerResolverTimeoutMs],
-        baseConfig.evidenceAnswerResolverTimeoutMs,
-      ),
-      evidenceAnswerResolverFallbackToDeterministic: this.resolveBooleanFlag(
-        [pluginConfig.evidenceAnswerResolverFallbackToDeterministic],
-        baseConfig.evidenceAnswerResolverFallbackToDeterministic,
-      ),
-      dagExpansionMode,
-      dagExpansionAgentProvider,
-      dagExpansionAgentModel: this.resolveOptionalString(
-        pluginConfig.dagExpansionAgentModel,
-        baseConfig.dagExpansionAgentModel,
-      ),
-      dagExpansionAgentTimeoutMs: this.resolveNumberConfig(
-        [pluginConfig.dagExpansionAgentTimeoutMs, pluginConfig.sourceExpansionAgentTimeoutMs],
-        baseConfig.dagExpansionAgentTimeoutMs,
-      ),
-      featureIsolationMode: this.resolveStringEnum(
-        [pluginConfig.featureIsolationMode, pluginConfig.optionalFeatureIsolationMode],
-        ["fail_closed", "isolate_optional"],
-        baseConfig.featureIsolationMode,
-      ) as BridgeConfig["featureIsolationMode"],
-      heavyRetrievalPolicy,
-      ragPlannerPolicy,
-      graphPlannerPolicy,
-      rerankPlannerPolicy,
-      candidateRerankThreshold: this.resolveNumberConfig(
-        [pluginConfig.candidateRerankThreshold, pluginConfig.rerankCandidateThreshold],
-        baseConfig.candidateRerankThreshold,
-      ),
-      laneCandidateRerankThreshold: this.resolveNumberConfig(
-        [pluginConfig.laneCandidateRerankThreshold, pluginConfig.rerankLaneCandidateThreshold],
-        baseConfig.laneCandidateRerankThreshold,
-      ),
-      candidateAmbiguityMargin: this.resolveNumberConfig(
-        [pluginConfig.candidateAmbiguityMargin, pluginConfig.rerankAmbiguityMargin],
-        baseConfig.candidateAmbiguityMargin,
-      ),
-      strictModeRequiresRerankOnConflict: this.resolveBooleanFlag(
-        [pluginConfig.strictModeRequiresRerankOnConflict, pluginConfig.strictRerankOnConflict],
-        baseConfig.strictModeRequiresRerankOnConflict,
-      ),
-      maxEnhancementLatencyMs: this.resolveNumberConfig(
-        [pluginConfig.maxEnhancementLatencyMs, pluginConfig.retrievalEnhancementMaxLatencyMs],
-        baseConfig.maxEnhancementLatencyMs,
-      ),
-      maxRerankCandidates: this.resolveNumberConfig(
-        [pluginConfig.maxRerankCandidates, pluginConfig.rerankCandidateLimit],
-        baseConfig.maxRerankCandidates,
-      ),
-      openClawRuntimeProfile,
-      emergencyBrake,
-      sqliteJournalMode,
-    }));
+    return this.configResolver.resolve(payload, currentConfig);
   }
 
   private resolvePresetDefaults(
@@ -1426,43 +612,7 @@ export class OpenClawPayloadAdapter {
   }
 
   private resolveHostModelContextWindow(payload: OpenClawPayloadLike): number | null {
-    const api = this.getApi();
-    const configCandidates = [
-      api?.config,
-      api?.context?.config,
-      api?.runtime?.config,
-    ].filter((config): config is NonNullable<typeof config> => isHostRecord(config));
-    const modelRefs = [
-      this.resolveModelRefCandidate(payload?.model),
-      this.resolveModelRefCandidate(api?.context?.model),
-      this.resolveModelRefCandidate(api?.runtime?.model),
-      ...configCandidates.map((config) => {
-        const primary = config?.agents?.defaults?.model?.primary;
-        return typeof primary === "string" && primary.trim().length > 0
-          ? primary.trim()
-          : undefined;
-      }),
-    ].filter((value, index, list): value is string =>
-      typeof value === "string" &&
-      value.trim().length > 0 &&
-      list.indexOf(value) === index,
-    );
-
-    for (const modelRef of modelRefs) {
-      for (const config of configCandidates) {
-        const fromDeclaredModel = this.resolveDeclaredModelContextWindow(config, modelRef);
-        if (fromDeclaredModel !== null) {
-          return fromDeclaredModel;
-        }
-
-        const fromProviderModel = this.resolveProviderModelContextWindow(config, modelRef);
-        if (fromProviderModel !== null) {
-          return fromProviderModel;
-        }
-      }
-    }
-
-    return null;
+    return this.modelResolver.resolveHostModelContextWindow(payload?.model);
   }
 
   private resolveDeclaredModelContextWindow(
@@ -1561,33 +711,7 @@ export class OpenClawPayloadAdapter {
     payload: OpenClawPayloadLike,
     config: BridgeConfig,
   ): string | undefined {
-    const payloadModel = this.resolveModelRefCandidate(payload?.model);
-    if (payloadModel) {
-      return payloadModel;
-    }
-
-    const contextModel = this.getApi()?.context?.model;
-    const contextModelRef = this.resolveModelRefCandidate(contextModel);
-    if (contextModelRef) {
-      return contextModelRef;
-    }
-
-    const runtimeModel = this.getApi()?.runtime?.model;
-    const runtimeModelRef = this.resolveModelRefCandidate(runtimeModel);
-    if (runtimeModelRef) {
-      return runtimeModelRef;
-    }
-
-    const configuredPrimaryModel = this.resolveConfiguredPrimaryModelRef();
-    if (configuredPrimaryModel) {
-      return configuredPrimaryModel;
-    }
-
-    if (typeof config.summaryModel === "string" && config.summaryModel.trim()) {
-      return config.summaryModel;
-    }
-
-    return undefined;
+    return this.modelResolver.resolveSummaryModel(payload?.model, config);
   }
 
   private resolveConfiguredPrimaryModelRef(): string | undefined {
@@ -1656,145 +780,13 @@ export class OpenClawPayloadAdapter {
   }
 
   private extractRuntimeMessages(payload: OpenClawPayloadLike): RuntimeMessageSnapshot[] {
-    const candidates = [
+    return this.runtimeMessageExtractor.extract([
       payload?.messages,
       payload?.conversation?.messages,
       payload?.turn?.messages,
       payload?.context?.messages,
       payload?.input?.messages,
-    ];
-    const messages = candidates.find((value) => Array.isArray(value));
-    if (!Array.isArray(messages)) {
-      return [];
-    }
-
-    const allowedRoles = new Set(["system", "user", "assistant", "tool"]);
-    const occurrenceCounts = new Map<string, number>();
-    return messages
-      .filter(
-        (message): message is Record<string, unknown> =>
-          Boolean(message) &&
-          typeof message === "object" &&
-          typeof message.role === "string" &&
-          allowedRoles.has(String(message.role)) &&
-          "content" in message,
-      )
-      .map((message) => {
-        const role = message.role as RawMessage["role"];
-        const text = this.normalizeRuntimeMessageText(
-          this.extractTextFromContent(message.content),
-        );
-        const occurrenceKey = `${role}:${this.normalizeWhitespace(text)}`;
-        const occurrenceIndex = (occurrenceCounts.get(occurrenceKey) ?? 0) + 1;
-        occurrenceCounts.set(occurrenceKey, occurrenceIndex);
-
-        const mergedMetadata = this.mergeRuntimeMetadata(message);
-        return {
-          sourceKey: this.resolveRuntimeMessageSourceKey(
-            message,
-            role,
-            text,
-            occurrenceIndex,
-          ),
-          id:
-            typeof message.id === "string" && message.id.trim().length > 0
-              ? message.id
-              : undefined,
-          role,
-          content: message.content,
-          text,
-          ...(Object.keys(mergedMetadata).length > 0
-            ? { metadata: mergedMetadata }
-            : {}),
-          ...(typeof message.timestamp === "number"
-            ? { timestamp: message.timestamp }
-            : typeof message.createdAt === "string"
-              ? { timestamp: message.createdAt }
-              : {}),
-        };
-      });
-  }
-
-  private mergeRuntimeMetadata(
-    message: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const metadata: Record<string, unknown> =
-      typeof message.metadata === "object" && message.metadata && !Array.isArray(message.metadata)
-        ? { ...(message.metadata as Record<string, unknown>) }
-        : {};
-
-    const envelopeKeys = [
-      "type",
-      "kind",
-      "origin",
-      "source",
-      "channel",
-      "visibility",
-      "name",
-      "subtype",
-      "internal",
-      "hidden",
-      "ephemeral",
-      "controlPlane",
-      "hostGenerated",
-      "persist",
-      "status",
-    ] as const;
-
-    for (const key of envelopeKeys) {
-      const value = message[key];
-      if (value !== undefined && metadata[key] === undefined) {
-        metadata[key] = value;
-      }
-    }
-
-    return metadata;
-  }
-
-  private resolveRuntimeMessageSourceKey(
-    message: Record<string, unknown>,
-    role: RawMessage["role"],
-    text: string,
-    occurrenceIndex: number,
-  ): string {
-    const explicitId =
-      typeof message.id === "string" && message.id.trim().length > 0
-        ? message.id.trim()
-        : null;
-    if (explicitId) {
-      return `id:${explicitId}`;
-    }
-
-    return `derived:${role}:${occurrenceIndex}:${this.buildStableDigest(this.normalizeWhitespace(text))}`;
-  }
-
-  private buildStableDigest(text: string): string {
-    let hash = 2166136261;
-    for (let index = 0; index < text.length; index += 1) {
-      hash ^= text.charCodeAt(index);
-      hash = Math.imul(hash, 16777619);
-    }
-    return (hash >>> 0).toString(16);
-  }
-
-  private normalizeRuntimeMessageText(text: string): string {
-    let normalized = text.trim();
-    const metadataPrefix =
-      /^(?:conversation|message)\s+info\s*\(untrusted metadata\):\s*```(?:json)?\s*[\s\S]*?```\s*/i;
-
-    while (normalized.length > 0) {
-      const stripped = normalized.replace(metadataPrefix, "").trim();
-      if (stripped === normalized) {
-        break;
-      }
-      normalized = stripped;
-    }
-
-    return normalized;
-  }
-
-  private normalizeWhitespace(text: string): string {
-    return text.replace(/\s+/g, " ").trim();
+    ], this.extractTextFromContent.bind(this));
   }
 
   private estimateTokens(text: string): number {
@@ -2149,17 +1141,17 @@ export class OpenClawPayloadAdapter {
     return undefined;
   }
 
-  private readEnableToolsFromOpenClawConfig(): unknown {
-    try {
-      const configPath = getOpenClawConfigPath();
-      const parsed = JSON.parse(readFileSync(configPath, "utf8"));
-      return parsed?.plugins?.entries?.oms?.config?.enableTools;
-    } catch (error) {
-      this.getLogger().warn("tool_config_file_read_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return undefined;
-    }
+  private resolvePluginConfig(payload: OpenClawPayloadLike): Record<string, unknown> {
+    return this.firstRecordCandidate(
+      payload.config,
+      this.getApi()?.pluginConfig ??
+        this.getApi()?.context?.pluginConfig ??
+        this.getApi()?.runtime?.pluginConfig ??
+        this.getApi()?.config?.plugins?.entries?.oms?.config ??
+        this.getApi()?.context?.config?.plugins?.entries?.oms?.config ??
+        this.getApi()?.runtime?.config?.plugins?.entries?.oms?.config ??
+        this.getApi()?.config,
+    ) ?? {};
   }
 
   private toPayloadRecord(payload: unknown): OpenClawPayloadLike {

@@ -67,10 +67,52 @@ function resolveDataDir(config) {
   return dataDir;
 }
 
-function resolveRuntimeDbTarget(config, agent, sessionId, agentExplicit) {
+function loadSessionRegistry(agentId) {
+  const registryPath = path.join(
+    process.env.USERPROFILE || "",
+    ".openclaw",
+    "agents",
+    agentId,
+    "sessions",
+    "sessions.json",
+  );
+  if (!fs.existsSync(registryPath)) {
+    return {};
+  }
+  try {
+    return JSON.parse(stripBom(fs.readFileSync(registryPath, "utf8")));
+  } catch {
+    return {};
+  }
+}
+
+function findRegistryEntryBySelector(registry, selector) {
+  if (!selector) {
+    return null;
+  }
+  if (registry && typeof registry === "object" && registry[selector]) {
+    return {
+      sessionKey: selector,
+      entry: registry[selector],
+      resolutionSource: "session_key",
+    };
+  }
+  for (const [sessionKey, entry] of Object.entries(registry || {})) {
+    if (entry && typeof entry === "object" && entry.sessionId === selector) {
+      return {
+        sessionKey,
+        entry,
+        resolutionSource: "session_id_registry",
+      };
+    }
+  }
+  return null;
+}
+
+function resolveRuntimeDbTarget(config, agent, sessionSelector, agentExplicit) {
   const dataDir = resolveDataDir(config);
-  if (sessionId && !agentExplicit) {
-    const inferred = findRuntimeDbTargetForSession(dataDir, agent, sessionId);
+  if (sessionSelector && !agentExplicit) {
+    const inferred = findRuntimeDbTargetForSession(dataDir, agent, sessionSelector);
     if (inferred) {
       return inferred;
     }
@@ -78,10 +120,14 @@ function resolveRuntimeDbTarget(config, agent, sessionId, agentExplicit) {
   return {
     agent,
     dbPath: path.join(dataDir, "agents", agent, "chaunyoms-runtime.sqlite"),
+    requestedSessionSelector: sessionSelector ?? null,
+    resolvedSessionId: null,
+    resolvedSessionKey: null,
+    resolutionSource: sessionSelector ? "unresolved_selector" : "latest_agent_activity",
   };
 }
 
-function findRuntimeDbTargetForSession(dataDir, preferredAgent, sessionId) {
+function findRuntimeDbTargetForSession(dataDir, preferredAgent, sessionSelector) {
   const agentsRoot = path.join(dataDir, "agents");
   const agentNames = fs.existsSync(agentsRoot)
     ? fs.readdirSync(agentsRoot, { withFileTypes: true })
@@ -98,17 +144,31 @@ function findRuntimeDbTargetForSession(dataDir, preferredAgent, sessionId) {
     if (!fs.existsSync(dbPath)) {
       continue;
     }
+    const registry = loadSessionRegistry(agent);
+    const registryHit = findRegistryEntryBySelector(registry, sessionSelector);
+    const resolvedSessionId =
+      typeof registryHit?.entry?.sessionId === "string" && registryHit.entry.sessionId.trim()
+        ? registryHit.entry.sessionId.trim()
+        : null;
     let db;
     try {
       db = new DatabaseSync(dbPath, { readOnly: true });
-      const hit = db.prepare(`
+      const selectorToCheck = resolvedSessionId ?? sessionSelector;
+      const hit = selectorToCheck ? db.prepare(`
         select 1 as found from context_runs where session_id = ?
         union all
         select 1 as found from messages where session_id = ?
         limit 1
-      `).get(sessionId, sessionId);
+      `).get(selectorToCheck, selectorToCheck) : null;
       if (hit) {
-        return { agent, dbPath };
+        return {
+          agent,
+          dbPath,
+          requestedSessionSelector: sessionSelector ?? null,
+          resolvedSessionId: selectorToCheck,
+          resolvedSessionKey: registryHit?.sessionKey ?? null,
+          resolutionSource: registryHit?.resolutionSource ?? "db_session_id",
+        };
       }
     } catch {
       // Keep scanning other agent stores.
@@ -116,6 +176,36 @@ function findRuntimeDbTargetForSession(dataDir, preferredAgent, sessionId) {
       db?.close();
     }
   }
+  return null;
+}
+
+function resolveLatestSessionId(db) {
+  const latestContextRun = db.prepare(`
+    select session_id
+    from context_runs
+    order by created_at desc
+    limit 1
+  `).get();
+  if (latestContextRun?.session_id) {
+    return {
+      sessionId: latestContextRun.session_id,
+      source: "latest_context_run",
+    };
+  }
+
+  const latestMessage = db.prepare(`
+    select session_id
+    from messages
+    order by created_at desc
+    limit 1
+  `).get();
+  if (latestMessage?.session_id) {
+    return {
+      sessionId: latestMessage.session_id,
+      source: "latest_message",
+    };
+  }
+
   return null;
 }
 
@@ -186,14 +276,20 @@ function main() {
     `).all();
     const leakedMessages = leakRows.filter((row) => detectLeak(row.preview));
 
-    const latestRun = options.sessionId
+    const latestSessionResolution = resolveLatestSessionId(db);
+    const selectedSessionId =
+      target.resolvedSessionId ??
+      latestSessionResolution?.sessionId ??
+      null;
+
+    const latestRun = selectedSessionId
       ? db.prepare(`
           select id, session_id, created_at, intent, total_budget, selected_tokens, selected_count, rejected_count
           from context_runs
           where session_id = ?
           order by created_at desc
           limit 1
-        `).get(options.sessionId)
+        `).get(selectedSessionId)
       : db.prepare(`
           select id, session_id, created_at, intent, total_budget, selected_tokens, selected_count, rejected_count
           from context_runs
@@ -230,7 +326,7 @@ function main() {
       }));
     }
 
-    const sessionId = options.sessionId ?? latestRun?.session_id;
+    const sessionId = selectedSessionId ?? latestRun?.session_id ?? null;
     const sessionSummary = sessionId
       ? db.prepare(`
           select
@@ -248,7 +344,10 @@ function main() {
       dbPath,
       agent: target.agent,
       requestedAgent: options.agent,
-      requestedSessionId: options.sessionId ?? null,
+      requestedSessionSelector: options.sessionId ?? null,
+      resolvedSessionId: target.resolvedSessionId ?? sessionId,
+      resolvedSessionKey: target.resolvedSessionKey ?? null,
+      sessionResolutionSource: target.resolutionSource ?? latestSessionResolution?.source ?? null,
       counts: {
         messages: Number(counts.messages ?? 0),
         summaries: Number(counts.summaries ?? 0),

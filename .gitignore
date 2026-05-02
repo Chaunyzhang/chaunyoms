@@ -11,6 +11,9 @@ Thumbs.db
 .omx/
 docs/*
 !docs/knowledge-intent-ingress-plan.md
+!docs/oms-decoupling-refactor-plan.md
+!docs/step2-retrieval-cleanup-plan.md
+!docs/oms-decoupling-current-structure.md
 !docs/oms-foundation-substrate-plan.md
 !docs/openclaw-real-environment-test-protocol.md
 !docs/productization-roadmap.md

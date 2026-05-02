@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { Readable, Transform, Writable } from "node:stream";
@@ -188,10 +189,32 @@ async function readRealSessionMessages(agentId, sessionId) {
         role: record.message.role,
         text: extractTextFromContent(record.message.content),
       }))
-      .filter((message) => message.role === "user" || message.role === "assistant");
+      .filter((message) =>
+        message.role === "user" ||
+        message.role === "assistant" ||
+        message.role === "toolResult"
+      );
   } catch {
     return [];
   }
+}
+
+function summarizePersistedTurn(messages, baselineCount) {
+  const appended = messages.slice(baselineCount);
+  const firstNewUserIndex = appended.findIndex((message) => message.role === "user");
+  if (firstNewUserIndex < 0) {
+    return null;
+  }
+  const turnMessages = appended.slice(firstNewUserIndex);
+  const assistantMessages = turnMessages.filter((message) => message.role === "assistant");
+  const nonEmptyAssistantMessages = assistantMessages.filter((message) => message.text.trim().length > 0);
+  const latestAssistantReply = nonEmptyAssistantMessages.at(-1)?.text ?? "";
+  const latestMessage = turnMessages.at(-1) ?? null;
+  return {
+    turnMessages,
+    latestAssistantReply,
+    latestMessageRole: latestMessage?.role ?? null,
+  };
 }
 
 async function waitForTurnPersistence({
@@ -199,26 +222,37 @@ async function waitForTurnPersistence({
   sessionKey,
   baselineCount,
   timeoutMs = 180000,
+  idleMs = 3000,
 }) {
   const startedAt = Date.now();
   let resolvedSessionId = null;
+  let lastStateKey = null;
+  let lastStateChangeAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (!resolvedSessionId) {
       resolvedSessionId = await resolveRealSessionId(agentId, sessionKey);
     }
     if (resolvedSessionId) {
       const messages = await readRealSessionMessages(agentId, resolvedSessionId);
-      if (messages.length >= baselineCount + 2) {
-        const appended = messages.slice(baselineCount);
-        const firstNewUserIndex = appended.findIndex((message) => message.role === "user");
-        const assistantAfterUser = firstNewUserIndex >= 0
-          ? appended.slice(firstNewUserIndex + 1).find((message) => message.role === "assistant")
-          : null;
-        if (assistantAfterUser) {
+      const turnState = summarizePersistedTurn(messages, baselineCount);
+      if (turnState) {
+        const stateKey = JSON.stringify({
+          messageCount: messages.length,
+          latestMessageRole: turnState.latestMessageRole,
+          latestAssistantReply: turnState.latestAssistantReply,
+        });
+        if (stateKey !== lastStateKey) {
+          lastStateKey = stateKey;
+          lastStateChangeAt = Date.now();
+        }
+        if (
+          turnState.latestAssistantReply &&
+          Date.now() - lastStateChangeAt >= idleMs
+        ) {
           return {
             sessionId: resolvedSessionId,
             messageCount: messages.length,
-            assistantReply: assistantAfterUser.text,
+            assistantReply: turnState.latestAssistantReply,
           };
         }
       }
@@ -226,12 +260,12 @@ async function waitForTurnPersistence({
     await delay(1000);
   }
 
-  throw new Error(`Timed out waiting for persisted turn completion for session key ${sessionKey}`);
+  throw new Error(`Timed out waiting for a stable persisted assistant reply for session key ${sessionKey}`);
 }
 
 async function runHarness() {
   const token = await loadGatewayToken();
-  const tokenFile = path.join(process.cwd(), `.openclaw-acp-token-${randomUUID().slice(0, 8)}.txt`);
+  const tokenFile = path.join(os.tmpdir(), `openclaw-acp-token-${randomUUID().slice(0, 8)}.txt`);
   await fs.writeFile(tokenFile, token, "utf8");
   const turns = parseTurns(await fs.readFile(options.caseFile, "utf8"));
   const agent = spawn(process.execPath, [
