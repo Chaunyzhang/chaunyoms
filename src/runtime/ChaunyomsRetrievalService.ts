@@ -3153,6 +3153,9 @@ export class ChaunyomsRetrievalService {
     if (!this.isLosslessStyleFactRecallQuery(query) && !this.isDagOnlyKeywordRecallQuery(query)) {
       return decision;
     }
+    if (decision.route === "memory_item") {
+      return decision;
+    }
     if (decision.route === "summary_tree" && decision.requiresSourceRecall) {
       return decision;
     }

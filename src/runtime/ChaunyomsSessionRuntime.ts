@@ -819,6 +819,15 @@ export class ChaunyomsSessionRuntime {
     await this.writeStatsLog(context.sessionId, stats);
 
     if (this.config.openClawRuntimeProfile === "lightweight") {
+      const compactionTriggeredThisStep = lightweightCompaction?.status === "compacted" ||
+        lightweightCompaction?.status === "deduped";
+      await this.writeNavigationArtifactsIfPending(
+        context,
+        rawStore,
+        summaryStore,
+        memoryItemDraftStore,
+        compactionTriggeredThisStep,
+      );
       return {
         stats,
         importedMessages: synced.importedMessages,

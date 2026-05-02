@@ -163,6 +163,7 @@ async function main(): Promise<void> {
     summaryMaxOutputTokens: 160,
     strictCompaction: true,
     compactionBarrierEnabled: true,
+    openClawRuntimeProfile: "standard" as const,
     knowledgePromotionEnabled: false,
     knowledgePromotionManualReviewEnabled: true,
     kbCandidateEnabled: true,

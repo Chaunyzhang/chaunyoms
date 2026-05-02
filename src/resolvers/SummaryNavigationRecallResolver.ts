@@ -548,11 +548,18 @@ export class SummaryNavigationRecallResolver {
       ));
     }
     if (Number.isFinite(sequenceMin) && Number.isFinite(sequenceMax)) {
-      addMessages(rawStore.getBySequenceRange(
+      const sequenceNeighbors = rawStore.getBySequenceRange(
         Math.max(1, (sequenceMin as number) - sequencePadding),
         (sequenceMax as number) + sequencePadding,
         scopedQuery,
-      ));
+      ).filter((message) => {
+        if (!Number.isFinite(message.turnNumber) || !Number.isFinite(turnMin) || !Number.isFinite(turnMax)) {
+          return true;
+        }
+        return message.turnNumber >= (turnMin as number) - turnPadding &&
+          message.turnNumber <= (turnMax as number) + turnPadding;
+      });
+      addMessages(sequenceNeighbors);
     }
 
     return [...byId.values()].sort((left, right) => {
