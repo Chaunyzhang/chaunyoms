@@ -12,11 +12,14 @@ Thumbs.db
 docs/*
 !docs/knowledge-intent-ingress-plan.md
 !docs/oms-foundation-substrate-plan.md
+!docs/openclaw-real-environment-test-protocol.md
 !docs/productization-roadmap.md
 !docs/standard-benchmark-status.md
 scripts/*
 !scripts/run-compiled-tests.cjs
 !scripts/openclaw-real-test-worker.cjs
+!scripts/run-openclaw-real-smoke.cjs
+!scripts/run-openclaw-acp-harness.mjs
 !scripts/openclaw-runtime-report.cjs
 !scripts/openclaw-session-smoke.cjs
 !scripts/check-environment.cjs

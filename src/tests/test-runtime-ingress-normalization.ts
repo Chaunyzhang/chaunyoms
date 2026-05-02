@@ -35,6 +35,35 @@ function main(): void {
     "expected ingress normalization to strip host metadata envelope",
   );
 
+  const nestedWrapper = ingress.inspect({
+    sourceKey: "user-wrapper-2",
+    role: "user",
+    content: [
+      "Sender (untrusted metadata):",
+      "```json",
+      '{ "label": "openclaw-control-ui", "id": "openclaw-control-ui" }',
+      "```",
+      "[Thu 2026-04-23 13:25 GMT+8]",
+      "[Working directory: D:\\chaunyoms]",
+      "Remember the gateway port is 4319.",
+    ].join("\n"),
+    text: [
+      "Sender (untrusted metadata):",
+      "```json",
+      '{ "label": "openclaw-control-ui", "id": "openclaw-control-ui" }',
+      "```",
+      "[Thu 2026-04-23 13:25 GMT+8]",
+      "[Working directory: D:\\chaunyoms]",
+      "Remember the gateway port is 4319.",
+    ].join("\n"),
+  });
+
+  assert(nestedWrapper.persist, "expected nested wrapper user content to survive");
+  assert(
+    nestedWrapper.normalizedText === "Remember the gateway port is 4319.",
+    "expected ingress normalization to strip repeated bracketed wrappers like timestamps and working-directory prefixes",
+  );
+
   const replayedMemory = ingress.inspect({
     sourceKey: "chaunyoms-memory-1",
     role: "user",
@@ -91,6 +120,28 @@ function main(): void {
   assert(toolOutput.classification === "tool_output", "expected dropped tool payload to keep tool_output classification");
   assert(toolOutput.storageTarget === "observation", "expected tool payload to persist only as observation/runtime event");
   assert(toolOutput.reason === "tool_output_runtime_event_not_source", "expected explicit runtime-event source-boundary reason");
+
+  const assistantNoReply = ingress.inspect({
+    sourceKey: "assistant-no-reply-1",
+    role: "assistant",
+    content: "Got it — mock frontend on 8732, gateway on 4319. Noted. Nothing else to do here, so: NO_REPLY",
+    text: "Got it — mock frontend on 8732, gateway on 4319. Noted. Nothing else to do here, so: NO_REPLY",
+  });
+
+  assert(assistantNoReply.persist, "expected substantive assistant recall text to survive even when the host appends NO_REPLY");
+  assert(
+    assistantNoReply.normalizedText === "Got it — mock frontend on 8732, gateway on 4319. Noted.",
+    "expected trailing NO_REPLY markers to be stripped before persistence",
+  );
+
+  const assistantOnlyNoReply = ingress.inspect({
+    sourceKey: "assistant-no-reply-2",
+    role: "assistant",
+    content: "Otherwise: NO_REPLY",
+    text: "Otherwise: NO_REPLY",
+  });
+
+  assert(!assistantOnlyNoReply.persist, "expected empty no-reply assistant markers to be dropped entirely");
 
   console.log("test-runtime-ingress-normalization passed");
 }

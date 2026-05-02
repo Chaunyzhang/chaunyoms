@@ -71,6 +71,13 @@ const CHAUNYOMS_CONTEXT_PREFIX_PATTERNS = [
 ];
 
 const CHAUNYOMS_MEMORY_PREFIX_PATTERN = /^\[memory_item:[^\]]+\]/i;
+const LEADING_BRACKET_PREFIX_PATTERN = /^\[[^\]\r\n]{0,120}\]\s*/i;
+const TRAILING_NO_REPLY_PATTERNS = [
+  /\s*Nothing else to do here,\s*so:\s*NO_REPLY\s*$/i,
+  /\s*Otherwise:\s*NO_REPLY\s*$/i,
+  /\s*NO_REPLY\s+otherwise\.?\s*$/i,
+  /\s*NO_REPLY\s*$/i,
+];
 
 const CHAUNYOMS_METADATA_MARKERS = new Set([
   "chaunyoms",
@@ -86,7 +93,7 @@ const CHAUNYOMS_METADATA_MARKERS = new Set([
 
 export class RuntimeMessageIngress {
   inspect(message: RuntimeMessageSnapshot): RuntimeMessageIngressDecision {
-    const normalizedText = this.normalize(message.text);
+    const normalizedText = this.normalize(message.text, message.role);
     if (!normalizedText) {
       return this.skip("empty", normalizedText, "empty_message");
     }
@@ -143,26 +150,53 @@ export class RuntimeMessageIngress {
     return this.keep("user_message", normalizedText, "user_content", "raw_message");
   }
 
-  private normalize(text: string): string {
-    return this.stripHostMetadataEnvelope(text)
+  private normalize(text: string, role: RuntimeMessageSnapshot["role"]): string {
+    const withoutEnvelope = this.stripHostMetadataEnvelope(text);
+    const withoutNoReply = role === "assistant" || role === "tool"
+      ? this.stripNoReplySentinel(withoutEnvelope)
+      : withoutEnvelope;
+    return withoutNoReply
       .replace(/\s+/g, " ")
       .trim();
   }
 
   private stripHostMetadataEnvelope(text: string): string {
     let normalized = text;
-    normalized = normalized.replace(
-      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*```json[\s\S]*?```\s*/i,
-      "",
-    );
-    normalized = normalized.replace(
-      /^\[[^\]\r\n]{0,80}\]\s*/i,
-      "",
-    );
-    normalized = normalized.replace(
-      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*/i,
-      "",
-    );
+    const metadataEnvelopePattern =
+      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*```json[\s\S]*?```\s*/i;
+    const plainEnvelopePattern =
+      /^(?:Sender|Conversation info|Message info)\s*\(untrusted metadata\)\s*:\s*/i;
+
+    while (normalized.length > 0) {
+      const next = normalized
+        .replace(metadataEnvelopePattern, "")
+        .replace(LEADING_BRACKET_PREFIX_PATTERN, "")
+        .replace(plainEnvelopePattern, "")
+        .trimStart();
+      if (next === normalized) {
+        break;
+      }
+      normalized = next;
+    }
+    return normalized;
+  }
+
+  private stripNoReplySentinel(text: string): string {
+    let normalized = text.trim();
+    while (normalized.length > 0) {
+      let changed = false;
+      for (const pattern of TRAILING_NO_REPLY_PATTERNS) {
+        const next = normalized.replace(pattern, "").trim();
+        if (next !== normalized) {
+          normalized = next;
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) {
+        break;
+      }
+    }
     return normalized;
   }
 
