@@ -614,7 +614,18 @@ export class SummaryNavigationRecallResolver {
         }
         return left.index - right.index;
       })
-      .filter((item) => item.score > 0 || anchorIds.has(item.message.id))
+      .filter((item) => {
+        if (anchorIds.has(item.message.id)) {
+          return true;
+        }
+        if (item.score <= 0) {
+          return false;
+        }
+        if (exactAnchors.length > 0 && !exactAnchors.some((anchor) => item.message.content.includes(anchor))) {
+          return false;
+        }
+        return true;
+      })
       .slice(0, Math.max(4, anchorMessages.length + 2))
       .map((item) => item.message);
 

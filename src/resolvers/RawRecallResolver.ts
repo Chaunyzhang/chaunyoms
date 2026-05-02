@@ -47,7 +47,13 @@ export class RawRecallResolver {
       expanded = this.mergeForcedAnchors(expanded, parsedMessages, understanding);
       answerCandidates = this.extractAnswerCandidates(understanding, expanded.map((item) => item.parsed));
     }
-    const selectedMessages = this.selectMessagesForOutput(expanded, answerCandidates, recallBudget);
+    const selectedMessages = this.selectMessagesForOutput(
+      expanded,
+      answerCandidates,
+      recallBudget,
+      query,
+      understanding,
+    );
     const items = selectedMessages.map((message) => ({
       kind: "message" as const,
       tokenCount: message.tokenCount,
@@ -683,6 +689,8 @@ export class RawRecallResolver {
     expanded: ScoredMessage[],
     answerCandidates: AnswerCandidate[],
     recallBudget: number,
+    query: string,
+    understanding: QueryUnderstanding,
   ): RawMessage[] {
     const answerEvidenceRank = new Map<string, number>();
     answerCandidates.forEach((candidate, index) => {
@@ -694,11 +702,19 @@ export class RawRecallResolver {
         }
       }
     });
+    const focusedEvidenceIds = this.preferredEvidenceMessageIds(query, understanding, answerCandidates);
     const prioritized = [...expanded].sort((left, right) => {
       const leftForced = left.reasons.includes("forced_answer_anchor") ? 1 : 0;
       const rightForced = right.reasons.includes("forced_answer_anchor") ? 1 : 0;
       if (leftForced !== rightForced) {
         return rightForced - leftForced;
+      }
+      if (focusedEvidenceIds.size > 0) {
+        const leftFocused = focusedEvidenceIds.has(left.parsed.message.id) ? 1 : 0;
+        const rightFocused = focusedEvidenceIds.has(right.parsed.message.id) ? 1 : 0;
+        if (leftFocused !== rightFocused) {
+          return rightFocused - leftFocused;
+        }
       }
       const leftRank = answerEvidenceRank.get(left.parsed.message.id);
       const rightRank = answerEvidenceRank.get(right.parsed.message.id);
@@ -725,6 +741,9 @@ export class RawRecallResolver {
       if (seen.has(message.id)) {
         continue;
       }
+      if (focusedEvidenceIds.size > 0 && !focusedEvidenceIds.has(message.id)) {
+        continue;
+      }
       if (consumed + message.tokenCount > recallBudget && selected.length > 0) {
         continue;
       }
@@ -739,6 +758,24 @@ export class RawRecallResolver {
       (left.sequence ?? 0) - (right.sequence ?? 0) ||
       left.turnNumber - right.turnNumber,
     );
+  }
+
+  private preferredEvidenceMessageIds(
+    query: string,
+    understanding: QueryUnderstanding,
+    answerCandidates: AnswerCandidate[],
+  ): Set<string> {
+    if (answerCandidates.length === 0) {
+      return new Set();
+    }
+    const exactAnchors = query.match(/\b[A-Z][A-Z0-9_]{2,}\b|\b\d{2,}\b/g) ?? [];
+    const prefersSingleCurrentFact =
+      /\b(current|latest|now|currently|updated|correction|after correction)\b/i.test(understanding.normalized);
+    if (exactAnchors.length === 0 && !prefersSingleCurrentFact) {
+      return new Set();
+    }
+    const preferred = answerCandidates[0];
+    return new Set(preferred.evidenceMessageIds);
   }
 
   private parseDateHint(value?: string): DateHint | undefined {
