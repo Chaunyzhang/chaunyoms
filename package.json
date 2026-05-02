@@ -1,6 +1,6 @@
 {
   "name": "chaunyoms",
-  "version": "1.0.0-beta",
+  "version": "1.0.1-beta",
   "description": "Authoritative OMS memory and contextEngine substrate plugin for OpenClaw.",
   "private": true,
   "main": "dist/index.js",
