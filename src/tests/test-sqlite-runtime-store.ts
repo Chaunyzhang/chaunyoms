@@ -117,7 +117,7 @@ async function main(): Promise<void> {
     assert(initialStatus.counts.memories === 0, "SQLite runtime must not persist a parallel memories table");
     assert(initialStatus.counts.evidenceAtoms === 0, "SQLite runtime must not persist a parallel evidence_atoms table");
     assert(initialStatus.counts.memoryItems === 2, "SQLite runtime should materialize memoryItem/evidence inputs as MemoryItems");
-    assert(initialStatus.ftsStatus === "lazy_not_initialized", "FTS should be reported as lazy before first FTS-backed query");
+    assert(initialStatus.ftsReady === true && initialStatus.ftsStatus === "ready", "FTS should be ready immediately after mirror because the runtime keeps the raw substrate write-through indexed");
     assert(store.grepMessages("15432", { sessionId: "s-1" }).length === 1, "grep should find raw source message");
     const ftsStatus = store.getStatus();
     assert(ftsStatus.ftsReady === true && ftsStatus.ftsStatus === "ready", "FTS should report ready after grep initializes it");
