@@ -33,6 +33,7 @@ async function main(): Promise<void> {
     summaryMaxOutputTokens: 120,
     strictCompaction: true,
     compactionBarrierEnabled: true,
+    openClawRuntimeProfile: "standard" as const,
   };
   await mkdir(path.join(config.workspaceDir, "memory"), { recursive: true });
 
