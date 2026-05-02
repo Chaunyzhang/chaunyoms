@@ -62,6 +62,12 @@ import { OmsAdminService } from "./OmsAdminService";
 import { KnowledgeMaintenanceService } from "./KnowledgeMaintenanceService";
 import { RuntimeIngressService } from "./RuntimeIngressService";
 import { CompactionCoordinator } from "./CompactionCoordinator";
+import { OpenClawProfilePolicy } from "./OpenClawProfilePolicy";
+import { RecallQueryAnalyzer } from "../resolvers/RecallQueryAnalyzer";
+import { NavigationArtifactService } from "./NavigationArtifactService";
+import { ProjectRegistryUpdater } from "./ProjectRegistryUpdater";
+import { SessionAfterTurnService } from "./SessionAfterTurnService";
+import { SessionIngestService } from "./SessionIngestService";
 
 export interface CompactionDiagnostics {
   sessionId: string;
@@ -335,6 +341,16 @@ export class ChaunyomsSessionRuntime {
   private knowledgeMaintenance!: KnowledgeMaintenanceService;
   private runtimeIngressService!: RuntimeIngressService;
   private compactionCoordinator!: CompactionCoordinator;
+  private navigationArtifacts!: NavigationArtifactService;
+  private projectRegistryUpdater!: ProjectRegistryUpdater;
+  private sessionAfterTurn!: SessionAfterTurnService;
+  private sessionIngest!: SessionIngestService;
+  private readonly profilePolicy = new OpenClawProfilePolicy({
+    buildRecallSystemItem: () => this.assembler.buildOpenClawRecallSystemItem(),
+    recallQueryAnalyzer: new RecallQueryAnalyzer(),
+    referencesCurrentWork: (query: string) =>
+      /(this project|current task|current work|our work|what we are doing|where we left off|这个项目|当前任务|当前工作|这件事|我们现在|当前主线)/i.test(query),
+  });
 
   constructor(
     logger: LoggerLike,
@@ -431,6 +447,51 @@ export class ChaunyomsSessionRuntime {
         await this.rollUpSummaryTree(summaryStore, context);
       },
     });
+    this.navigationArtifacts = new NavigationArtifactService({
+      extractionEngine: this.extractionEngine,
+      logger: this.logger,
+      navigationRepository: this.navigationRepository,
+      persistMemoryItemDrafts: this.persistMemoryItemDrafts.bind(this),
+      writeMemoryItemArtifacts: this.sessionData.writeMemoryItemArtifacts.bind(this.sessionData),
+      writeNavigationSnapshot: this.sessionData.writeNavigationSnapshot.bind(this.sessionData),
+    });
+    this.projectRegistryUpdater = new ProjectRegistryUpdater({
+      getConfig: () => this.config,
+      sessionData: this.sessionData,
+    });
+    this.sessionIngest = new SessionIngestService({
+      appendObservation: this.sessionData.appendObservation.bind(this.sessionData),
+      appendRawMessage: this.sessionData.appendRawMessage.bind(this.sessionData),
+      profilePolicy: this.profilePolicy,
+      knowledgeIntentClassifier: this.knowledgeIntentClassifier,
+      extractionEngine: this.extractionEngine,
+      persistMemoryItemDrafts: this.persistMemoryItemDrafts.bind(this),
+      resolveNextTurnNumber: this.resolveNextTurnNumber.bind(this),
+      runtimeIngress: this.runtimeIngress,
+      secretIngressGate: this.secretIngressGate,
+      writeMemoryItemArtifacts: this.sessionData.writeMemoryItemArtifacts.bind(this.sessionData),
+    });
+    this.sessionAfterTurn = new SessionAfterTurnService({
+      getConfig: () => this.config,
+      logger: this.logger,
+      getKnowledgeBaseDir: () => this.config.knowledgePromotionEnabled ? this.getActiveStores().knowledgeStore.getBaseDir() : null,
+      getContextItemCount: () => this.contextViewStore.getItems().length,
+      getLastCompactionDiagnostics: () => this.lastCompactionDiagnostics,
+      getRuntimeMemoryItemCount: () => this.sessionData.getRuntimeStore().getStatus().counts.memoryItems,
+      profilePolicy: this.profilePolicy,
+      runLightweightAfterTurnCompaction: this.runLightweightAfterTurnCompaction.bind(this),
+      runBackgroundOrganizer: async (memoryItemDraftStore, summaryStore) => {
+        await this.backgroundOrganizerEngine.run(
+          memoryItemDraftStore,
+          summaryStore,
+          this.getActiveStores().projectStore,
+          this.config.agentId,
+        );
+      },
+      updateProjectRegistry: this.updateProjectRegistry.bind(this),
+      writeNavigationArtifactsIfPending: this.writeNavigationArtifactsIfPending.bind(this),
+      writeStatsLog: this.writeStatsLog.bind(this),
+    });
   }
 
   async bootstrap(context: LifecycleContext): Promise<{
@@ -461,76 +522,7 @@ export class ChaunyomsSessionRuntime {
 
   async ingest(payload: IngestPayload): Promise<{ ingested: boolean }> {
     const { rawStore, memoryItemDraftStore } = await this.ensureSession(payload.sessionId, payload.config);
-    const ingressDecision = this.runtimeIngress.inspect({
-      id: payload.id,
-      sourceKey: payload.id,
-      role: payload.role,
-      content: payload.content,
-      text: payload.content,
-      metadata: payload.metadata,
-    });
-    if (ingressDecision.storageTarget === "observation") {
-      const sanitizedObservation = this.secretIngressGate.sanitize(
-        `observation:${payload.sessionId}:${payload.id}`,
-        ingressDecision.normalizedText,
-        payload.metadata ?? {},
-      );
-      await this.sessionData.appendObservation({
-        id: `observation-${payload.id}`,
-        sessionId: payload.sessionId,
-        agentId: payload.config.agentId,
-        role: payload.role,
-        classification: ingressDecision.classification,
-        content: sanitizedObservation.text,
-        sourceKey: payload.id,
-        createdAt: new Date().toISOString(),
-        tokenCount: estimateTokens(sanitizedObservation.text),
-        metadata: {
-          ...sanitizedObservation.metadata,
-          reason: ingressDecision.reason,
-          sourceBoundary: "runtime_event_not_source",
-        },
-      });
-      return { ingested: false };
-    }
-
-    if (!ingressDecision.persist || ingressDecision.storageTarget !== "raw_message") {
-      return { ingested: false };
-    }
-
-    const sanitized = this.secretIngressGate.sanitize(
-      `ingest:${payload.sessionId}:${payload.id}`,
-      ingressDecision.normalizedText,
-      payload.metadata ?? {},
-    );
-    const turnNumber = payload.turnNumber ?? this.resolveNextTurnNumber(rawStore, payload.role);
-    const knowledgeIntent = payload.role === "user" && payload.config.openClawRuntimeProfile !== "lightweight"
-      ? await this.knowledgeIntentClassifier.classifyUserMessage(sanitized.text, payload.config)
-      : null;
-    const message: RawMessage = {
-      id: payload.id,
-      sessionId: payload.sessionId,
-      agentId: payload.config.agentId,
-      role: payload.role,
-      content: sanitized.text,
-      turnNumber,
-      createdAt: new Date().toISOString(),
-      tokenCount: estimateTokens(sanitized.text),
-      compacted: false,
-      metadata: {
-        ...sanitized.metadata,
-        ingressClassification: ingressDecision.classification,
-        ingressReason: ingressDecision.reason,
-        ...(knowledgeIntent ? { knowledgeIntent } : {}),
-      },
-    };
-    await this.sessionData.appendRawMessage(message);
-    await this.persistMemoryItemDrafts(
-      memoryItemDraftStore,
-      this.extractionEngine.extractFromRawMessage(message),
-    );
-    await this.sessionData.writeMemoryItemArtifacts();
-    return { ingested: true };
+    return await this.sessionIngest.ingest(payload, rawStore, memoryItemDraftStore);
   }
 
   async assemble(context: LifecycleContext): Promise<AssembleResult> {
@@ -561,7 +553,7 @@ export class ChaunyomsSessionRuntime {
     const assembleOptions = {
       includeStablePrefix: !this.config.emergencyBrake,
       includeSummaries: !this.config.emergencyBrake,
-      includeMemoryItems: !this.config.emergencyBrake && this.config.openClawRuntimeProfile !== "lightweight",
+      includeMemoryItems: this.profilePolicy.shouldIncludeMemoryItemsInAssembly(this.config),
       activeQuery,
       sessionId: context.sessionId,
     };
@@ -776,83 +768,14 @@ export class ChaunyomsSessionRuntime {
       context.config,
       context.runtimeMessages,
     );
-    const lightweightCompaction = this.config.openClawRuntimeProfile === "lightweight"
-      ? await this.runLightweightAfterTurnCompaction(
-        context,
-        rawStore,
-        summaryStore,
-      )
-      : null;
-
-    const { knowledgeStore } = await this.ensureSession(
-      context.sessionId,
-      context.config,
-    );
-    const stats = {
-      timestamp: new Date().toISOString(),
-      sessionId: context.sessionId,
-      contextWindow: context.totalBudget,
-      compactionTriggerThreshold: this.config.contextThreshold,
-      uncompactedTokens: rawStore.totalUncompactedTokens({ sessionId: context.sessionId }),
-      summaryCount: summaryStore.getAllSummaries().length,
-      summaryTokens: summaryStore.getTotalTokens(),
-      observationCount: observationStore.count(),
-      memoryItemCount: this.sessionData.getRuntimeStore().getStatus().counts.memoryItems,
-      unifiedKnowledgeDir: this.config.knowledgePromotionEnabled ? knowledgeStore.getBaseDir() : null,
-      contextItems: this.contextViewStore.getItems().length,
-      importedMessages: synced.importedMessages,
-      strictCompaction: this.config.strictCompaction,
-      compactionBarrierEnabled: this.config.compactionBarrierEnabled,
-      runtimeCaptureEnabled: this.config.runtimeCaptureEnabled,
-      memoryItemEnabled: this.config.memoryItemEnabled,
-      autoRecallEnabled: this.config.autoRecallEnabled,
-      knowledgePromotionEnabled: this.config.knowledgePromotionEnabled,
-      configPreset: this.config.configPreset,
-      semanticCandidateExpansionEnabled: this.config.semanticCandidateExpansionEnabled,
-      semanticCandidateLimit: this.config.semanticCandidateLimit,
-      lastCompactionDiagnostics: this.lastCompactionDiagnostics,
-      emergencyBrake: this.config.emergencyBrake,
-      openClawRuntimeProfile: this.config.openClawRuntimeProfile,
-      lightweightCompaction,
-    };
-    this.logger.info("after_turn_stats", stats);
-    await this.writeStatsLog(context.sessionId, stats);
-
-    if (this.config.openClawRuntimeProfile === "lightweight") {
-      const compactionTriggeredThisStep = lightweightCompaction?.status === "compacted" ||
-        lightweightCompaction?.status === "deduped";
-      await this.writeNavigationArtifactsIfPending(
-        context,
-        rawStore,
-        summaryStore,
-        memoryItemDraftStore,
-        compactionTriggeredThisStep,
-      );
-      return {
-        stats,
-        importedMessages: synced.importedMessages,
-      };
-    }
-
-    await this.writeNavigationArtifactsIfPending(
+    return await this.sessionAfterTurn.run({
       context,
       rawStore,
       summaryStore,
+      observationStore,
       memoryItemDraftStore,
-      false,
-    );
-    await this.updateProjectRegistry(context, rawStore, summaryStore);
-    await this.backgroundOrganizerEngine.run(
-      memoryItemDraftStore,
-      summaryStore,
-      this.getActiveStores().projectStore,
-      this.config.agentId,
-    );
-
-    return {
-      stats,
       importedMessages: synced.importedMessages,
-    };
+    });
   }
 
   async getSessionStores(context: Pick<LifecycleContext, "sessionId" | "config">): Promise<SessionDataStores> {
@@ -1196,43 +1119,13 @@ export class ChaunyomsSessionRuntime {
     summaryStore: SummaryRepository,
     context: LifecycleContext,
   ): ContextItem[] {
-    if (this.config.openClawRuntimeProfile !== "lightweight") {
-      return items;
-    }
-    const alreadyHasGuidance = items.some((item) => item.metadata?.layer === "oms_recall_guidance");
-    const alreadyHasSystemPolicy = items.some((item) => item.metadata?.layer === "oms_recall_policy");
-    if (alreadyHasGuidance && alreadyHasSystemPolicy) {
-      return items;
-    }
-    const prefixed: ContextItem[] = [
-      ...(alreadyHasSystemPolicy ? [] : [this.assembler.buildOpenClawRecallSystemItem()]),
-      ...items,
-    ];
-    const summaryCount = summaryStore.getAllSummaries({ sessionId: context.sessionId }).length;
-    const rawCount = rawStore.getAll({ sessionId: context.sessionId }).length;
-    if (summaryCount > 0 || rawCount < Math.max(this.config.maxFreshTailTurns * 2, 6)) {
-      return prefixed;
-    }
-    const guidanceText = [
-      "[oms_recall_guidance]",
-      "Earlier turns may be outside the visible recent tail.",
-      this.config.forceDagOnlyRecall
-        ? "For exact prior facts, use memory_retrieve and follow the summary/DAG recall path; direct raw-message grep is disabled in this environment."
-        : "For exact prior facts, use memory_retrieve first and oms_grep for direct raw-message lookup.",
-      "Do not answer 'not found' until recall has been tried.",
-    ].join("\n");
-    const guidance: ContextItem = {
-      kind: "summary",
-      tokenCount: estimateTokens(guidanceText),
-      content: guidanceText,
-      metadata: {
-        layer: "oms_recall_guidance",
-        profile: "lightweight",
-        rawMessageCount: rawCount,
-        summaryCount,
-      },
-    };
-    return [guidance, ...prefixed];
+    return this.profilePolicy.injectRecallGuidanceIfNeeded(
+      items,
+      rawStore,
+      summaryStore,
+      context,
+      this.config,
+    );
   }
   private inspectSummaryIntegrity(): SummaryIntegrityInspection {
     return this.sessionData.inspectSummaryIntegrity();
@@ -1252,15 +1145,6 @@ export class ChaunyomsSessionRuntime {
       mismatched: inspection.mismatched,
       unchecked: inspection.unchecked,
     };
-  }
-
-  private buildNavigationSnapshot(
-    rawStore: RawMessageRepository,
-    summaryStore: SummaryRepository,
-  ): string {
-    return formatProjectStateSnapshot(
-      buildProjectStateSnapshot(rawStore, summaryStore),
-    );
   }
 
   private async writeStatsLog(
@@ -1283,36 +1167,16 @@ export class ChaunyomsSessionRuntime {
     memoryItemDraftStore: MemoryItemDraftRepository,
     compactionTriggeredThisStep: boolean,
   ): Promise<void> {
-    if (this.config.emergencyBrake) {
-      this.navigationSnapshotPending = false;
-      return;
-    }
-
-    if (!this.navigationSnapshotPending && !compactionTriggeredThisStep) {
-      return;
-    }
-
-    const navigationSnapshot = this.buildNavigationSnapshot(rawStore, summaryStore);
-    const navigationWrite = await this.navigationRepository.writeNavigationSnapshot(
-      this.config.workspaceDir,
-      navigationSnapshot,
-    );
-    if (navigationWrite.written) {
-      this.logger.info("navigation_snapshot_written", {
-        filePath: navigationWrite.filePath,
-      });
-    }
-    if (this.config.memoryItemEnabled) {
-      const projectStateMemory = this.extractionEngine.buildProjectStateMemory(
-        context.sessionId,
-        new Date().toISOString(),
-        navigationSnapshot,
-      );
-      await this.persistMemoryItemDrafts(memoryItemDraftStore, [projectStateMemory]);
-      await this.sessionData.writeMemoryItemArtifacts();
-    }
-    await this.sessionData.writeNavigationSnapshot(navigationSnapshot);
-    this.navigationSnapshotPending = false;
+    const result = await this.navigationArtifacts.writeIfPending({
+      config: this.config,
+      context,
+      rawStore,
+      summaryStore,
+      memoryItemDraftStore,
+      compactionTriggeredThisStep,
+      navigationSnapshotPending: this.navigationSnapshotPending,
+    });
+    this.navigationSnapshotPending = result.navigationSnapshotPending;
   }
 
   private async runLightweightAfterTurnCompaction(
@@ -1412,67 +1276,7 @@ export class ChaunyomsSessionRuntime {
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
   ): Promise<void> {
-    const snapshot = buildProjectStateSnapshot(rawStore, summaryStore);
-    let identity = deriveProjectIdentityFromSnapshot(
-      snapshot,
-      `${this.config.agentId}-${context.sessionId}`,
-    );
-    const activeSummaries = summaryStore
-      .getActiveSummaries()
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    let projectSummaries = activeSummaries
-      .filter((entry) => entry.projectId === identity.projectId)
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    if (projectSummaries.length === 0 && activeSummaries.length > 0) {
-      identity = deriveProjectIdentityFromSummary(
-        activeSummaries[0],
-        `${this.config.agentId}-${context.sessionId}`,
-      );
-      snapshot.projectId = identity.projectId;
-      snapshot.projectTitle = identity.title;
-      projectSummaries = activeSummaries.filter((entry) => entry.projectId === identity.projectId);
-    }
-
-    const memoryItems = this.sessionData.getRuntimeStore().listMemoryItems({ agentId: this.config.agentId });
-    let projectMemories = memoryItems
-      .filter((entry) => entry.status === "active" && entry.projectId === identity.projectId)
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    if (projectMemories.length === 0) {
-      projectMemories = memoryItems
-        .filter((entry) => entry.status === "active")
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    }
-
-    await this.sessionData.upsertProjectRecord({
-      id: identity.projectId,
-      agentId: this.config.agentId,
-      canonicalKey: identity.canonicalKey,
-      title: snapshot.projectTitle || identity.title,
-      status: deriveProjectStatusFromSnapshot(snapshot),
-      summary: projectSummaries[0]?.summary ?? snapshot.active,
-      activeFocus: snapshot.active,
-      currentDecision: snapshot.decision,
-      nextStep: snapshot.next,
-      todo: snapshot.todo,
-      blocker: snapshot.blocker,
-      risk: snapshot.risk,
-      tags: [
-        identity.canonicalKey,
-        ...projectSummaries.flatMap((entry) => entry.keywords).slice(0, 12),
-        ...projectMemories.flatMap((entry) => entry.tags).slice(0, 12),
-      ],
-      sourceSessionIds: [context.sessionId],
-      summaryIds: projectSummaries.map((entry) => entry.id),
-      memoryIds: projectMemories.map((entry) => entry.id),
-      topicIds: [
-        identity.topicId,
-        ...projectSummaries.map((entry) => entry.topicId).filter((value): value is string => Boolean(value)),
-        ...projectMemories.map((entry) => entry.topicId).filter((value): value is string => Boolean(value)),
-      ],
-      latestSummaryId: projectSummaries[0]?.id,
-      updatedAt: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-    });
+    await this.projectRegistryUpdater.update(context, rawStore, summaryStore);
   }
 
   private getActiveStores(): SessionDataStores {

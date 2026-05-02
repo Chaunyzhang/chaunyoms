@@ -4,6 +4,7 @@ import { RetrievalRuntime } from "../retrieval/RetrievalRuntime";
 import { MemoryRetrievalRouter } from "../routing/MemoryRetrievalRouter";
 import { RecallQueryAnalyzer } from "../resolvers/RecallQueryAnalyzer";
 import { LifecycleContext } from "../host/OpenClawPayloadAdapter";
+import { OpenClawProfilePolicy } from "./OpenClawProfilePolicy";
 import {
   MemoryItemEntry,
   ProjectRecord,
@@ -28,6 +29,16 @@ export class RetrievalDecisionService {
   private readonly planValidator = new PlanValidator();
   private readonly retrievalRuntime = new RetrievalRuntime();
   private readonly recallQueryAnalyzer = new RecallQueryAnalyzer();
+  private readonly profilePolicy = new OpenClawProfilePolicy({
+    buildRecallSystemItem: () => ({
+      kind: "summary",
+      tokenCount: 0,
+      content: "",
+      metadata: {},
+    }),
+    recallQueryAnalyzer: this.recallQueryAnalyzer,
+    referencesCurrentWork: this.referencesCurrentWork.bind(this),
+  });
 
   constructor(
     private readonly runtime: ChaunyomsSessionRuntime,
@@ -111,7 +122,7 @@ export class RetrievalDecisionService {
       context.config.llmPlannerMode === "auto" &&
       plannerResult.plan.activation.mode === "llm_planner" &&
       validation.accepted;
-    const decision = this.applyOpenClawRecallOverride(
+    const decision = this.profilePolicy.applyRecallDecisionOverride(
       query,
       context,
       this.retrievalRuntime.decisionFromPlan({
@@ -207,73 +218,11 @@ export class RetrievalDecisionService {
     summaryStore: SummaryRepository,
     context: LifecycleContext,
   ): boolean {
-    if (context.config.forceDagOnlyRecall) {
-      return true;
-    }
-    if (context.config.openClawRuntimeProfile !== "lightweight") {
-      return false;
-    }
-    if (summaryStore.getAllSummaries().length === 0) {
-      return false;
-    }
-    return this.isLosslessStyleFactRecallQuery(query) || this.isDagOnlyKeywordRecallQuery(query);
+    return this.profilePolicy.shouldPreferDagOnlyRecall(query, summaryStore, context);
   }
 
   private shouldProbeMemoryItems(query: string): boolean {
     return /(current|latest|now|currently|updated|correction|after correction|exact|parameter|constraint|decision|rule|setting|config|remember|must|当前|最新|修正后|参数|约束|决策|规则|配置|记住)/i.test(query);
-  }
-
-  private applyOpenClawRecallOverride(
-    query: string,
-    context: LifecycleContext,
-    decision: RetrievalDecision,
-    hasHistoricalStore: boolean,
-  ): RetrievalDecision {
-    if (context.config.openClawRuntimeProfile !== "lightweight") {
-      return decision;
-    }
-    if (!hasHistoricalStore) {
-      return decision;
-    }
-    if (!this.isLosslessStyleFactRecallQuery(query) && !this.isDagOnlyKeywordRecallQuery(query)) {
-      return decision;
-    }
-    if (decision.route === "memory_item") {
-      return decision;
-    }
-    if (decision.route === "summary_tree" && decision.requiresSourceRecall) {
-      return decision;
-    }
-    return {
-      ...decision,
-      route: "summary_tree",
-      reason: "lightweight_fact_qa_forces_summary_tree",
-      requiresSourceRecall: true,
-      canAnswerDirectly: false,
-      routePlan: ["summary_tree", "recent_tail"],
-      explanation: "This is a historical fact lookup under the lightweight OpenClaw profile, so OMS should follow the summary/DAG-to-source recall chain instead of answering from volatile context or substrate memory.",
-    };
-  }
-
-  private isLosslessStyleFactRecallQuery(query: string): boolean {
-    return /^(who|what|where|when|which)\b|how\s+(?:long|much|many)\b|(?:什么|哪里|哪儿|何时|什么时候|多久|多长|多少)/i.test(query.trim());
-  }
-
-  private isDagOnlyKeywordRecallQuery(query: string): boolean {
-    const understanding = this.recallQueryAnalyzer.analyze(query);
-    if (understanding.historyQa) {
-      return true;
-    }
-    if (understanding.terms.length === 0 || understanding.terms.length > 8) {
-      return false;
-    }
-    if (this.referencesCurrentWork(query)) {
-      return false;
-    }
-    if (/(status|state|progress|next step|next action|todo|pending|blocker|decision|knowledge|doc|docs|architecture|project|repo|branch|build|test)/i.test(query)) {
-      return false;
-    }
-    return understanding.answerType !== "unknown" || understanding.transcriptLike;
   }
 
   private classifyQueryComplexity(query: string): "low" | "medium" | "high" {

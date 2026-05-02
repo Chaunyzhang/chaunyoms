@@ -13,6 +13,8 @@ docs/*
 !docs/knowledge-intent-ingress-plan.md
 !docs/oms-decoupling-refactor-plan.md
 !docs/step2-retrieval-cleanup-plan.md
+!docs/step3-profile-policy-plan.md
+!docs/step4-session-runtime-plan.md
 !docs/oms-decoupling-current-structure.md
 !docs/oms-foundation-substrate-plan.md
 !docs/openclaw-real-environment-test-protocol.md
