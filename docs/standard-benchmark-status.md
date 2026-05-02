@@ -33,8 +33,16 @@ D:\chaunyoms\artifacts\evals\formal-2026-04-29\standard-full-sf-active
 
 Default judge/reader route:
 
-- Base URL: `https://api.siliconflow.cn/v1`
-- Model: `deepseek-ai/DeepSeek-V4-Flash`
+- The driver now runs an explicit API preflight before the first benchmark.
+- Base URL/model resolution is dynamic:
+  - OpenClaw real-environment config is the default source of truth:
+    `~/.openclaw/openclaw.json -> agents.defaults.model.primary -> models.providers`
+  - `CHAUNYOMS_EVAL_BASE_URL` or explicit `-BaseUrl` wins
+  - otherwise MiniMax is preferred when `MINIMAX_API_KEY` is present
+  - otherwise the fallback is `https://api.siliconflow.cn/v1`
+- Model resolution is dynamic:
+  - `CHAUNYOMS_EVAL_MODEL` or explicit `-Model` wins
+  - otherwise OMS follows the real OpenClaw primary model and provider API shape
 - API key resolution: `CHAUNYOMS_EVAL_API_KEY` first, then provider-specific keys.
 
 External model calls are blocked unless `-AllowPaidApi`, `--allow-paid-api`, or `CHAUNYOMS_EVAL_ALLOW_PAID=1` is set. This prevents accidental paid benchmark runs.
@@ -46,6 +54,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-standard-benchma
   -RunRoot artifacts/evals/formal-2026-04-29/standard-full-custom `
   -BaseUrl https://api.siliconflow.cn/v1 `
   -Model deepseek-ai/DeepSeek-V4-Flash `
+  -AllowPaidApi
+```
+
+Fast smoke example:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-standard-benchmarks.ps1 `
+  -RunRoot artifacts/evals/verify-standard/driver-smoke `
+  -LocomoCases 1 `
+  -LongMemEvalCases 1 `
+  -PersonaMemSizes 32k `
+  -PersonaMemCases 1 `
+  -PrefEvalCases 1 `
   -AllowPaidApi
 ```
 

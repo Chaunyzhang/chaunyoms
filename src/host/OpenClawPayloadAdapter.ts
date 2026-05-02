@@ -1561,10 +1561,6 @@ export class OpenClawPayloadAdapter {
     payload: OpenClawPayloadLike,
     config: BridgeConfig,
   ): string | undefined {
-    if (typeof config.summaryModel === "string" && config.summaryModel.trim()) {
-      return config.summaryModel;
-    }
-
     const payloadModel = this.resolveModelRefCandidate(payload?.model);
     if (payloadModel) {
       return payloadModel;
@@ -1574,6 +1570,38 @@ export class OpenClawPayloadAdapter {
     const contextModelRef = this.resolveModelRefCandidate(contextModel);
     if (contextModelRef) {
       return contextModelRef;
+    }
+
+    const runtimeModel = this.getApi()?.runtime?.model;
+    const runtimeModelRef = this.resolveModelRefCandidate(runtimeModel);
+    if (runtimeModelRef) {
+      return runtimeModelRef;
+    }
+
+    const configuredPrimaryModel = this.resolveConfiguredPrimaryModelRef();
+    if (configuredPrimaryModel) {
+      return configuredPrimaryModel;
+    }
+
+    if (typeof config.summaryModel === "string" && config.summaryModel.trim()) {
+      return config.summaryModel;
+    }
+
+    return undefined;
+  }
+
+  private resolveConfiguredPrimaryModelRef(): string | undefined {
+    const configCandidates = [
+      this.getApi()?.config,
+      this.getApi()?.context?.config,
+      this.getApi()?.runtime?.config,
+    ].filter((candidate): candidate is NonNullable<typeof candidate> => isHostRecord(candidate));
+
+    for (const candidate of configCandidates) {
+      const primary = candidate?.agents?.defaults?.model?.primary;
+      if (typeof primary === "string" && primary.trim().length > 0) {
+        return primary.trim();
+      }
     }
 
     return undefined;

@@ -9,6 +9,15 @@ const {
   finalizeReplay,
   replayMessages,
 } = require('../dist/src/evals/runtimeHarness.js');
+const {
+  resolveDefaultEvalBaseUrl,
+  resolveDefaultEvalModel,
+  resolveDefaultEvalApi,
+  resolveEvalApiKey,
+  paidApiAllowed,
+  chatJson,
+  preflightEvalModel,
+} = require('./eval-model-client.cjs');
 
 const CATEGORY_NAMES = {
   1: 'multi-hop',
@@ -32,19 +41,8 @@ function numberArg(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function resolveApiKey(baseUrl) {
-  if (process.env.CHAUNYOMS_EVAL_API_KEY) return process.env.CHAUNYOMS_EVAL_API_KEY;
-  const lower = String(baseUrl ?? '').toLowerCase();
-  if (lower.includes('siliconflow')) return process.env.SILICONFLOW_API_KEY || process.env.MINIMAX_API_KEY || '';
-  if (lower.includes('minimaxi') || lower.includes('minimax')) return process.env.MINIMAX_API_KEY || process.env.SILICONFLOW_API_KEY || '';
-  return process.env.OPENAI_API_KEY || process.env.SILICONFLOW_API_KEY || process.env.MINIMAX_API_KEY || '';
-}
-
-function paidApiAllowed() {
-  return process.env.CHAUNYOMS_EVAL_ALLOW_PAID === '1' || process.argv.includes('--allow-paid-api');
-}
-
-const baseUrl = argValue('--base-url', process.env.CHAUNYOMS_EVAL_BASE_URL || process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/v1');
+const baseUrl = argValue('--base-url', resolveDefaultEvalBaseUrl(process.argv.slice(2)));
+const api = argValue('--api', resolveDefaultEvalApi(baseUrl, process.argv.slice(2)));
 const options = {
   dataPath: argValue('--data', path.join('artifacts', 'datasets', 'locomo', 'locomo10.json')),
   outDir: argValue('--out-dir', path.join('artifacts', 'evals', 'locomo-standard')),
@@ -54,9 +52,10 @@ const options = {
   categories: argValue('--categories', '1,2,3,4').split(',').map((item) => Number(item.trim())).filter(Number.isFinite),
   afterTurnEvery: numberArg('--after-turn-every', 20),
   rawFtsLimit: numberArg('--raw-fts-limit', 200),
-  model: argValue('--model', process.env.CHAUNYOMS_EVAL_MODEL || 'MiniMax-M2.7'),
+  model: argValue('--model', resolveDefaultEvalModel(baseUrl, process.argv.slice(2))),
   baseUrl,
-  apiKey: resolveApiKey(baseUrl),
+  api,
+  apiKey: resolveEvalApiKey(baseUrl, api, process.argv.slice(2)),
 };
 
 function normalize(value) {
@@ -67,75 +66,6 @@ function normalize(value) {
 function truncate(text, maxChars) {
   const value = String(text ?? '');
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
-}
-
-function firstJsonObject(text) {
-  const value = String(text ?? '');
-  const start = value.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < value.length; index += 1) {
-    const ch = value[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === '\\') {
-      escaped = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (ch === '{') depth += 1;
-    if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return value.slice(start, index + 1);
-    }
-  }
-  return null;
-}
-
-async function chatJson({ system, user, maxTokens = 512 }) {
-  if (!paidApiAllowed()) {
-    throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1');
-  }
-  if (!options.apiKey) throw new Error('evaluation API key is not set');
-  const response = await fetch(`${options.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${options.apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: options.model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      temperature: 0,
-      max_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-    }),
-  });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`model call failed ${response.status}: ${raw.slice(0, 600)}`);
-  const content = JSON.parse(raw).choices?.[0]?.message?.content ?? '{}';
-  try {
-    return JSON.parse(content);
-  } catch {
-    const json = firstJsonObject(content);
-    if (json) {
-      try {
-        return JSON.parse(json);
-      } catch {}
-    }
-    return { raw: content };
-  }
 }
 
 function preprocessAnswer(category, answer) {
@@ -205,6 +135,10 @@ function buildEvidence(question, response) {
 
 async function answerFromEvidence(question, evidenceText) {
   return chatJson({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
     system: 'You answer LOCOMO long-term conversational memory questions using only retrieved evidence. Do not include reasoning. Return strict JSON {"answer":"...","confidence":0-1,"evidence":"short quote"}. If evidence is insufficient, answer "INSUFFICIENT_EVIDENCE".',
     user: `Question:\n${question}\n\nRetrieved evidence:\n${truncate(evidenceText, 14000)}`,
     maxTokens: 512,
@@ -213,6 +147,10 @@ async function answerFromEvidence(question, evidenceText) {
 
 async function judgeAnswer({ category, question, expected, hypothesis, evidenceText, goldEvidence }) {
   return chatJson({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
     system: 'You are evaluating conversational AI memory recall. Return JSON only. Be strict but fair: partial credit is acceptable for list answers if at least one correct gold item is given; evidence may support accepting a semantically equivalent answer.',
     user: [
       'Label the generated answer as CORRECT or WRONG.',
@@ -274,6 +212,16 @@ async function main() {
   }, null, 2), 'utf8');
 
   const data = JSON.parse(await fsp.readFile(options.dataPath, 'utf8'));
+  if (!paidApiAllowed(process.argv.slice(2))) {
+    throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1');
+  }
+  const preflight = await preflightEvalModel({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
+  });
+  await fsp.writeFile(path.join(options.outDir, 'api-preflight.json'), JSON.stringify(preflight, null, 2), 'utf8');
   const selected = selectQuestions(data);
   const byConv = new Map();
   for (const item of selected) {

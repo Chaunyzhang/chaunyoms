@@ -1,42 +1,310 @@
-﻿const fs = require('node:fs');
+const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { performance } = require('node:perf_hooks');
-const { buildEvalHarness, cleanupEvalHarness, finalizeReplay, replayMessages } = require('../dist/src/evals/runtimeHarness.js');
-function argValue(name, fallback){const p=`${name}=`; const a=process.argv.slice(2); const h=a.find(x=>x===name||x.startsWith(p)); if(!h)return fallback; if(h===name)return a[a.indexOf(h)+1]??fallback; return h.slice(p.length);} function numberArg(n,f){const v=Number(argValue(n,String(f))); return Number.isFinite(v)&&v>=0?v:f;}
-function resolveApiKey(baseUrl){
-  const explicit=process.env.CHAUNYOMS_EVAL_API_KEY;
-  if(explicit)return explicit;
-  const lower=String(baseUrl??'').toLowerCase();
-  if(lower.includes('siliconflow'))return process.env.SILICONFLOW_API_KEY||process.env.MINIMAX_API_KEY||'';
-  if(lower.includes('minimaxi')||lower.includes('minimax'))return process.env.MINIMAX_API_KEY||process.env.SILICONFLOW_API_KEY||'';
-  return process.env.OPENAI_API_KEY||process.env.SILICONFLOW_API_KEY||process.env.MINIMAX_API_KEY||'';
+
+const {
+  buildEvalHarness,
+  cleanupEvalHarness,
+  finalizeReplay,
+  replayMessages,
+} = require('../dist/src/evals/runtimeHarness.js');
+const {
+  resolveDefaultEvalBaseUrl,
+  resolveDefaultEvalModel,
+  resolveDefaultEvalApi,
+  resolveEvalApiKey,
+  paidApiAllowed,
+  chatJson,
+  preflightEvalModel,
+} = require('./eval-model-client.cjs');
+
+function argValue(name, fallback) {
+  const prefix = `${name}=`;
+  const args = process.argv.slice(2);
+  const hit = args.find((arg) => arg === name || arg.startsWith(prefix));
+  if (!hit) return fallback;
+  if (hit === name) return args[args.indexOf(hit) + 1] ?? fallback;
+  return hit.slice(prefix.length);
 }
-function paidApiAllowed(){return process.env.CHAUNYOMS_EVAL_ALLOW_PAID==='1'||process.argv.includes('--allow-paid-api');}
-const baseUrl=argValue('--base-url',process.env.CHAUNYOMS_EVAL_BASE_URL||process.env.MINIMAX_BASE_URL||'https://api.minimaxi.com/v1');
-const options={root:argValue('--root',path.join('artifacts','external','PrefEval')),outDir:argValue('--out-dir',path.join('artifacts','evals','prefeval-10-standard')),cases:numberArg('--cases',0),interTurns:numberArg('--inter-turns',10),forms:argValue('--forms','explicit,implicit-choice,implicit-persona').split(',').map(s=>s.trim()).filter(Boolean),model:argValue('--model',process.env.CHAUNYOMS_EVAL_MODEL||'MiniMax-M2.7'),baseUrl,apiKey:resolveApiKey(baseUrl)};
-function truncate(t,n){t=String(t??''); return t.length<=n?t:t.slice(0,n)+`\n...[truncated ${t.length-n} chars]`;} function choice(v){return String(v??'').match(/[A-Da-d]/)?.[0]?.toUpperCase()??null;} function firstJsonObject(text){const s=String(text??''); const i=s.indexOf('{'); if(i<0)return null; let d=0,q=false,e=false; for(let p=i;p<s.length;p++){const c=s[p]; if(e){e=false;continue;} if(c==='\\'){e=true;continue;} if(c==='"'){q=!q;continue;} if(q)continue; if(c==='{')d++; if(c==='}'&&--d===0)return s.slice(i,p+1);} return null;}
-async function chatJson({system,user,maxTokens=96}){if(!paidApiAllowed())throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1'); if(!options.apiKey)throw new Error('evaluation API key is not set'); const res=await fetch(`${options.baseUrl.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{Authorization:`Bearer ${options.apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model:options.model,messages:[{role:'system',content:system},{role:'user',content:user}],temperature:0,max_tokens:maxTokens,response_format:{type:'json_object'}})}); const raw=await res.text(); if(!res.ok)throw new Error(`model call failed ${res.status}: ${raw.slice(0,500)}`); const content=JSON.parse(raw).choices?.[0]?.message?.content??'{}'; try{return JSON.parse(content)}catch{const m=firstJsonObject(content); if(m)try{return JSON.parse(m)}catch{} return {raw:content};}}
-function walk(d){return fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>{const p=path.join(d,e.name); return e.isDirectory()?walk(p):[p];});}
-function topics(){
-  const datasetRoot=path.join(options.root,'benchmark_dataset');
-  return walk(path.join(datasetRoot,'mcq_options'))
-    .filter(f=>f.endsWith('.json'))
-    .map(f=>path.basename(f,'.json'))
-    .filter(topic=>!/\bcopy\b/i.test(topic))
-    .filter(topic=>
-      fs.existsSync(path.join(datasetRoot,'implicit_preference','choice-based',`${topic}.json`)) &&
-      fs.existsSync(path.join(datasetRoot,'implicit_preference','persona-driven',`${topic}.json`)))
+
+function numberArg(name, fallback) {
+  const value = Number(argValue(name, String(fallback)));
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+const baseUrl = argValue('--base-url', resolveDefaultEvalBaseUrl(process.argv.slice(2)));
+const api = argValue('--api', resolveDefaultEvalApi(baseUrl, process.argv.slice(2)));
+const options = {
+  root: argValue('--root', path.join('artifacts', 'external', 'PrefEval')),
+  outDir: argValue('--out-dir', path.join('artifacts', 'evals', 'prefeval-10-standard')),
+  cases: numberArg('--cases', 0),
+  interTurns: numberArg('--inter-turns', 10),
+  forms: argValue('--forms', 'explicit,implicit-choice,implicit-persona').split(',').map((item) => item.trim()).filter(Boolean),
+  model: argValue('--model', resolveDefaultEvalModel(baseUrl, process.argv.slice(2))),
+  baseUrl,
+  api,
+  apiKey: resolveEvalApiKey(baseUrl, api, process.argv.slice(2)),
+};
+
+function truncate(text, maxChars) {
+  const value = String(text ?? '');
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+}
+
+function choice(value) {
+  return String(value ?? '').match(/[A-Da-d]/)?.[0]?.toUpperCase() ?? null;
+}
+
+function walk(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(dir, entry.name);
+    return entry.isDirectory() ? walk(target) : [target];
+  });
+}
+
+function topics() {
+  const datasetRoot = path.join(options.root, 'benchmark_dataset');
+  return walk(path.join(datasetRoot, 'mcq_options'))
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => path.basename(file, '.json'))
+    .filter((topic) => !/\bcopy\b/i.test(topic))
+    .filter((topic) =>
+      fs.existsSync(path.join(datasetRoot, 'implicit_preference', 'choice-based', `${topic}.json`))
+      && fs.existsSync(path.join(datasetRoot, 'implicit_preference', 'persona-driven', `${topic}.json`)))
     .sort();
 }
-function seededShuffle(arr, seed){let a=[...arr], s=seed||41; function rnd(){s=(s*1664525+1013904223)>>>0; return s/4294967296;} for(let i=a.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1)); [a[i],a[j]]=[a[j],a[i]];} return a;}
-function irrelevantTurns(){const f=path.join(options.root,'benchmark_dataset','filtered_inter_turns.json'); const arr=JSON.parse(fs.readFileSync(f,'utf8')); return arr.flatMap(x=>Array.isArray(x.conversation)?x.conversation:[]);}
-function messagesFor(form, task, interTurns, interPool){const msgs=[]; if(form==='explicit'){msgs.push({role:'user',content:`User stated preference: ${task.preference}`},{role:'assistant',content:'I will remember and follow this preference.'});}
-else {const conv=task.conversation; if(form==='implicit-choice'){msgs.push({role:'user',content:String(conv.query)},{role:'assistant',content:String(conv.assistant_options)},{role:'user',content:String(conv.user_selection)},{role:'assistant',content:String(conv.assistant_acknowledgment)});} else {for(const k of Object.keys(conv).sort((a,b)=>Number(a)-Number(b))){msgs.push({role:'user',content:String(conv[k].user??'')},{role:'assistant',content:String(conv[k].assistant??'')});}}}
-for(let i=0;i<interTurns && i<interPool.length;i++){msgs.push({role:'user',content:`Irrelevant inter-turn ${i+1}: ${interPool[i].content??''}`}); if(interPool[i+1]) msgs.push({role:'assistant',content:`Irrelevant response ${i+1}: ${interPool[i+1].content??''}`});}
-return msgs;}
-function loadCases(){const inter=irrelevantTurns(); const cases=[]; for(const topic of topics()){const mcq=JSON.parse(fs.readFileSync(path.join(options.root,'benchmark_dataset','mcq_options',`${topic}.json`),'utf8')); for(const form of options.forms){let data=mcq; if(form==='implicit-choice')data=JSON.parse(fs.readFileSync(path.join(options.root,'benchmark_dataset','implicit_preference','choice-based',`${topic}.json`),'utf8')); if(form==='implicit-persona')data=JSON.parse(fs.readFileSync(path.join(options.root,'benchmark_dataset','implicit_preference','persona-driven',`${topic}.json`),'utf8')); for(let i=0;i<data.length;i++){const source=data[i]; const opts=seededShuffle(mcq[i].classification_task_options, 41000+i); const correct=String.fromCharCode(65+opts.indexOf(mcq[i].classification_task_options[0])); cases.push({topic,form,index:i,question:source.question||mcq[i].question,preference:source.preference||mcq[i].preference,options:opts,correct,messages:messagesFor(form,source,options.interTurns,inter)});}}} return options.cases>0?cases.slice(0,options.cases):cases;}
-async function appendJsonl(file,rec){await fsp.appendFile(file,JSON.stringify(rec)+'\n','utf8');}
-async function runCase(c,i,jsonl){const optionsText=c.options.map((o,idx)=>`${String.fromCharCode(65+idx)}. ${o}`).join('\n'); const caseDef={id:`prefeval10-${c.form}-${c.topic}-${c.index}`,title:`PrefEval-10 ${c.form} ${c.topic}`,description:'Official PrefEval MCQ classification sample with 10 inter-turns using OMS memory retrieval.',tags:['prefeval-10',c.form,c.topic],mode:'retrieve',query:`Preference-following choice: ${c.question}\nOptions:\n${optionsText}`,messages:c.messages,afterTurnEvery:6,configOverrides:{contextWindow:760,contextThreshold:0.34,freshTailTokens:64,maxFreshTailTurns:1,compactionBatchTurns:8,summaryMaxOutputTokens:420,strictCompaction:true,compactionBarrierEnabled:true,configPreset:'balanced'},expected:{}}; const started=performance.now(); const {dir,config,runtime,retrieval}=await buildEvalHarness(caseDef); try{await replayMessages(runtime,config,c.messages,6); await finalizeReplay(runtime,config); const rs=performance.now(); const resp=await retrieval.executeMemoryRetrieve({sessionId:config.sessionId,config,query:caseDef.query,rawFts:true,deepRecall:true,rawFtsLimit:8,retrievalStrength:'strict'}); const retrieveMs=performance.now()-rs; const picked=await chatJson({system:'You are doing the official PrefEval multiple-choice preference-following task. Use retrieved memory evidence and choose the option that best follows the user preference. Return strict JSON {"choice":"A|B|C|D"}.',user:`Question:\n${c.question}\n\nOptions:\n${optionsText}\n\nRetrieved memory evidence:\n${truncate(String(resp.content?.[0]?.text??''),9000)}`}); const ch=choice(picked.choice??picked.raw); const rec={i,topic:c.topic,form:c.form,caseIndex:c.index,expected:c.correct,choice:ch,correct:ch===c.correct,retrieveMs:Number(retrieveMs.toFixed(2)),totalMs:Number((performance.now()-started).toFixed(2)),messages:c.messages.length,details:{route:resp.details?.route,retrievalHitType:resp.details?.retrievalHitType,hitCount:resp.details?.hitCount},picked}; await appendJsonl(jsonl,rec); return rec;}catch(e){const rec={i,topic:c.topic,form:c.form,caseIndex:c.index,error:e.message||String(e),correct:false,totalMs:Number((performance.now()-started).toFixed(2))}; await appendJsonl(jsonl,rec); return rec;}finally{await cleanupEvalHarness(dir).catch(()=>{});}}
-async function main(){await fsp.mkdir(options.outDir,{recursive:true}); const jsonl=path.join(options.outDir,'results.jsonl'), summaryPath=path.join(options.outDir,'summary.json'); await fsp.writeFile(path.join(options.outDir,'run-meta.json'),JSON.stringify({...options,apiKey:options.apiKey?'set':'missing',startedAt:new Date().toISOString(),standardSource:'amazon-science/PrefEval benchmark_dataset',note:'PrefEval-10 means official MCQ classification with inter_turns=10.'},null,2)); const cases=loadCases(); const results=[]; for(let i=0;i<cases.length;i++){console.log(`[prefeval10] case ${i+1}/${cases.length} ${cases[i].form}/${cases[i].topic}`); const r=await runCase(cases[i],i,jsonl); results.push(r); const correct=results.filter(x=>x.correct).length; const summary={completed:results.length,requested:cases.length,correct,accuracy:Number((correct/results.length).toFixed(4)),byForm:Object.fromEntries(options.forms.map(f=>{const xs=results.filter(x=>x.form===f); return [f,{completed:xs.length,correct:xs.filter(x=>x.correct).length,accuracy:xs.length?Number((xs.filter(x=>x.correct).length/xs.length).toFixed(4)):0}]})),updatedAt:new Date().toISOString()}; await fsp.writeFile(summaryPath,JSON.stringify(summary,null,2)); console.log(JSON.stringify(summary));}}
-main().catch(e=>{console.error(e);process.exit(1);});
+
+function seededShuffle(values, seed) {
+  let state = seed || 41;
+  const shuffled = [...values];
+  function random() {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  }
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1));
+    [shuffled[index], shuffled[other]] = [shuffled[other], shuffled[index]];
+  }
+  return shuffled;
+}
+
+function irrelevantTurns() {
+  const file = path.join(options.root, 'benchmark_dataset', 'filtered_inter_turns.json');
+  const items = JSON.parse(fs.readFileSync(file, 'utf8'));
+  return items.flatMap((item) => Array.isArray(item.conversation) ? item.conversation : []);
+}
+
+function messagesFor(form, task, interTurns, interPool) {
+  const messages = [];
+  if (form === 'explicit') {
+    messages.push(
+      { role: 'user', content: `User stated preference: ${task.preference}` },
+      { role: 'assistant', content: 'I will remember and follow this preference.' },
+    );
+  } else {
+    const conversation = task.conversation;
+    if (form === 'implicit-choice') {
+      messages.push(
+        { role: 'user', content: String(conversation.query) },
+        { role: 'assistant', content: String(conversation.assistant_options) },
+        { role: 'user', content: String(conversation.user_selection) },
+        { role: 'assistant', content: String(conversation.assistant_acknowledgment) },
+      );
+    } else {
+      for (const key of Object.keys(conversation).sort((left, right) => Number(left) - Number(right))) {
+        messages.push(
+          { role: 'user', content: String(conversation[key].user ?? '') },
+          { role: 'assistant', content: String(conversation[key].assistant ?? '') },
+        );
+      }
+    }
+  }
+  for (let index = 0; index < interTurns && index < interPool.length; index += 1) {
+    messages.push({ role: 'user', content: `Irrelevant inter-turn ${index + 1}: ${interPool[index].content ?? ''}` });
+    if (interPool[index + 1]) {
+      messages.push({ role: 'assistant', content: `Irrelevant response ${index + 1}: ${interPool[index + 1].content ?? ''}` });
+    }
+  }
+  return messages;
+}
+
+function loadCases() {
+  const inter = irrelevantTurns();
+  const cases = [];
+  for (const topic of topics()) {
+    const mcq = JSON.parse(fs.readFileSync(path.join(options.root, 'benchmark_dataset', 'mcq_options', `${topic}.json`), 'utf8'));
+    for (const form of options.forms) {
+      let dataset = mcq;
+      if (form === 'implicit-choice') {
+        dataset = JSON.parse(fs.readFileSync(path.join(options.root, 'benchmark_dataset', 'implicit_preference', 'choice-based', `${topic}.json`), 'utf8'));
+      }
+      if (form === 'implicit-persona') {
+        dataset = JSON.parse(fs.readFileSync(path.join(options.root, 'benchmark_dataset', 'implicit_preference', 'persona-driven', `${topic}.json`), 'utf8'));
+      }
+      for (let index = 0; index < dataset.length; index += 1) {
+        const source = dataset[index];
+        const shuffledOptions = seededShuffle(mcq[index].classification_task_options, 41000 + index);
+        const correct = String.fromCharCode(65 + shuffledOptions.indexOf(mcq[index].classification_task_options[0]));
+        cases.push({
+          topic,
+          form,
+          index,
+          question: source.question || mcq[index].question,
+          preference: source.preference || mcq[index].preference,
+          options: shuffledOptions,
+          correct,
+          messages: messagesFor(form, source, options.interTurns, inter),
+        });
+      }
+    }
+  }
+  return options.cases > 0 ? cases.slice(0, options.cases) : cases;
+}
+
+async function appendJsonl(file, record) {
+  await fsp.appendFile(file, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+async function runCase(testCase, index, jsonlPath) {
+  const optionsText = testCase.options.map((option, optionIndex) => `${String.fromCharCode(65 + optionIndex)}. ${option}`).join('\n');
+  const caseDef = {
+    id: `prefeval10-${testCase.form}-${testCase.topic}-${testCase.index}`,
+    title: `PrefEval-10 ${testCase.form} ${testCase.topic}`,
+    description: 'Official PrefEval MCQ classification sample with 10 inter-turns using OMS memory retrieval.',
+    tags: ['prefeval-10', testCase.form, testCase.topic],
+    mode: 'retrieve',
+    query: `Preference-following choice: ${testCase.question}\nOptions:\n${optionsText}`,
+    messages: testCase.messages,
+    afterTurnEvery: 6,
+    configOverrides: {
+      contextWindow: 760,
+      contextThreshold: 0.34,
+      freshTailTokens: 64,
+      maxFreshTailTurns: 1,
+      compactionBatchTurns: 8,
+      summaryMaxOutputTokens: 420,
+      strictCompaction: true,
+      compactionBarrierEnabled: true,
+      configPreset: 'balanced',
+    },
+    expected: {},
+  };
+
+  const started = performance.now();
+  const { dir, config, runtime, retrieval } = await buildEvalHarness(caseDef);
+  try {
+    await replayMessages(runtime, config, testCase.messages, 6);
+    await finalizeReplay(runtime, config);
+    const retrieveStart = performance.now();
+    const response = await retrieval.executeMemoryRetrieve({
+      sessionId: config.sessionId,
+      config,
+      query: caseDef.query,
+      rawFts: true,
+      deepRecall: true,
+      rawFtsLimit: 8,
+      retrievalStrength: 'strict',
+    });
+    const retrieveMs = performance.now() - retrieveStart;
+    const picked = await chatJson({
+      baseUrl: options.baseUrl,
+      api: options.api,
+      apiKey: options.apiKey,
+      model: options.model,
+      system: 'You are doing the official PrefEval multiple-choice preference-following task. Use retrieved memory evidence and choose the option that best follows the user preference. Return strict JSON {"choice":"A|B|C|D"}.',
+      user: `Question:\n${testCase.question}\n\nOptions:\n${optionsText}\n\nRetrieved memory evidence:\n${truncate(String(response.content?.[0]?.text ?? ''), 9000)}`,
+    });
+    const pickedChoice = choice(picked.choice ?? picked.raw);
+    const record = {
+      i: index,
+      topic: testCase.topic,
+      form: testCase.form,
+      caseIndex: testCase.index,
+      expected: testCase.correct,
+      choice: pickedChoice,
+      correct: pickedChoice === testCase.correct,
+      retrieveMs: Number(retrieveMs.toFixed(2)),
+      totalMs: Number((performance.now() - started).toFixed(2)),
+      messages: testCase.messages.length,
+      details: {
+        route: response.details?.route,
+        retrievalHitType: response.details?.retrievalHitType,
+        hitCount: response.details?.hitCount,
+      },
+      picked,
+    };
+    await appendJsonl(jsonlPath, record);
+    return record;
+  } catch (error) {
+    const record = {
+      i: index,
+      topic: testCase.topic,
+      form: testCase.form,
+      caseIndex: testCase.index,
+      error: error instanceof Error ? error.message : String(error),
+      correct: false,
+      totalMs: Number((performance.now() - started).toFixed(2)),
+    };
+    await appendJsonl(jsonlPath, record);
+    return record;
+  } finally {
+    await cleanupEvalHarness(dir).catch(() => {});
+  }
+}
+
+async function main() {
+  await fsp.mkdir(options.outDir, { recursive: true });
+  const jsonlPath = path.join(options.outDir, 'results.jsonl');
+  const summaryPath = path.join(options.outDir, 'summary.json');
+  await fsp.writeFile(path.join(options.outDir, 'run-meta.json'), JSON.stringify({
+    ...options,
+    apiKey: options.apiKey ? 'set' : 'missing',
+    startedAt: new Date().toISOString(),
+    standardSource: 'amazon-science/PrefEval benchmark_dataset',
+    note: 'PrefEval-10 means official MCQ classification with inter_turns=10.',
+  }, null, 2), 'utf8');
+
+  if (!paidApiAllowed(process.argv.slice(2))) {
+    throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1');
+  }
+  const preflight = await preflightEvalModel({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
+  });
+  await fsp.writeFile(path.join(options.outDir, 'api-preflight.json'), JSON.stringify(preflight, null, 2), 'utf8');
+
+  const cases = loadCases();
+  const results = [];
+  for (let index = 0; index < cases.length; index += 1) {
+    console.log(`[prefeval10] case ${index + 1}/${cases.length} ${cases[index].form}/${cases[index].topic}`);
+    const record = await runCase(cases[index], index, jsonlPath);
+    results.push(record);
+    const correct = results.filter((item) => item.correct).length;
+    const summary = {
+      completed: results.length,
+      requested: cases.length,
+      correct,
+      accuracy: Number((correct / results.length).toFixed(4)),
+      byForm: Object.fromEntries(options.forms.map((form) => {
+        const formResults = results.filter((item) => item.form === form);
+        const formCorrect = formResults.filter((item) => item.correct).length;
+        return [form, {
+          completed: formResults.length,
+          correct: formCorrect,
+          accuracy: formResults.length ? Number((formCorrect / formResults.length).toFixed(4)) : 0,
+        }];
+      })),
+      updatedAt: new Date().toISOString(),
+    };
+    await fsp.writeFile(summaryPath, JSON.stringify(summary, null, 2), 'utf8');
+    console.log(JSON.stringify(summary));
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

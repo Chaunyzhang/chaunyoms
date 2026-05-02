@@ -82,6 +82,9 @@ async function main(): Promise<void> {
   const payloadAdapter = new OpenClawPayloadAdapter(
     () => ({
       config: apiConfig,
+      pluginConfig: {
+        summaryModel: "legacy-provider/legacy-model",
+      },
       context: {
         model: {
           provider: "openai-codex",
@@ -100,6 +103,25 @@ async function main(): Promise<void> {
   assert(
     lifecycle.summaryModel === "openai-codex/gpt-5.4",
     "expected provider/id model objects to normalize into provider-scoped refs",
+  );
+
+  const primaryOnlyPayloadAdapter = new OpenClawPayloadAdapter(
+    () => ({
+      config: apiConfig,
+      pluginConfig: {
+        summaryModel: "legacy-provider/legacy-model",
+      },
+    }),
+    () => ({
+      info(): void {},
+      warn(): void {},
+      error(): void {},
+    }),
+  );
+  const primaryOnlyLifecycle = primaryOnlyPayloadAdapter.resolveLifecycleContext({}, DEFAULT_BRIDGE_CONFIG);
+  assert(
+    primaryOnlyLifecycle.summaryModel === "openai-codex/gpt-5.4",
+    "expected OpenClaw primary model to win over legacy plugin summaryModel overrides",
   );
 
   const minimaxConfig = {

@@ -1,4 +1,3 @@
-﻿const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { performance } = require('node:perf_hooks');
@@ -9,14 +8,24 @@ const {
   finalizeReplay,
   replayMessages,
 } = require('../dist/src/evals/runtimeHarness.js');
+const {
+  resolveDefaultEvalBaseUrl,
+  resolveDefaultEvalModel,
+  resolveDefaultEvalApi,
+  resolveEvalApiKey,
+  paidApiAllowed,
+  chatJson,
+  preflightEvalModel,
+} = require('./eval-model-client.cjs');
 
 function argValue(name, fallback) {
   const prefix = `${name}=`;
-  const hit = process.argv.slice(2).find((arg) => arg === name || arg.startsWith(prefix));
+  const args = process.argv.slice(2);
+  const hit = args.find((arg) => arg === name || arg.startsWith(prefix));
   if (!hit) return fallback;
   if (hit === name) {
-    const index = process.argv.indexOf(name);
-    return process.argv[index + 1] ?? fallback;
+    const index = args.indexOf(hit);
+    return args[index + 1] ?? fallback;
   }
   return hit.slice(prefix.length);
 }
@@ -26,19 +35,8 @@ function numberArg(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function resolveApiKey(baseUrl) {
-  if (process.env.CHAUNYOMS_EVAL_API_KEY) return process.env.CHAUNYOMS_EVAL_API_KEY;
-  const lower = String(baseUrl ?? '').toLowerCase();
-  if (lower.includes('siliconflow')) return process.env.SILICONFLOW_API_KEY || process.env.MINIMAX_API_KEY || '';
-  if (lower.includes('minimaxi') || lower.includes('minimax')) return process.env.MINIMAX_API_KEY || process.env.SILICONFLOW_API_KEY || '';
-  return process.env.OPENAI_API_KEY || process.env.SILICONFLOW_API_KEY || process.env.MINIMAX_API_KEY || '';
-}
-
-function paidApiAllowed() {
-  return process.env.CHAUNYOMS_EVAL_ALLOW_PAID === '1' || process.argv.includes('--allow-paid-api');
-}
-
-const baseUrl = argValue('--base-url', process.env.CHAUNYOMS_EVAL_BASE_URL || process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/v1');
+const baseUrl = argValue('--base-url', resolveDefaultEvalBaseUrl(process.argv.slice(2)));
+const api = argValue('--api', resolveDefaultEvalApi(baseUrl, process.argv.slice(2)));
 const options = {
   dataPath: argValue('--data', path.join('artifacts', 'datasets', 'longmemeval', 'longmemeval_s_cleaned.json')),
   outDir: argValue('--out-dir', path.join('artifacts', 'evals', 'longmemeval-s-minimax')),
@@ -46,9 +44,10 @@ const options = {
   offset: numberArg('--offset', 0),
   maxSessions: numberArg('--max-sessions', 60),
   afterTurnEvery: numberArg('--after-turn-every', 20),
-  model: argValue('--model', process.env.CHAUNYOMS_EVAL_MODEL || 'MiniMax-M2.7'),
+  model: argValue('--model', resolveDefaultEvalModel(baseUrl, process.argv.slice(2))),
   baseUrl,
-  apiKey: resolveApiKey(baseUrl),
+  api,
+  apiKey: resolveEvalApiKey(baseUrl, api, process.argv.slice(2)),
 };
 
 function percentile(values, p) {
@@ -69,60 +68,6 @@ function truncate(text, maxChars) {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
 }
 
-function firstJsonObject(text) {
-  const value = String(text ?? '');
-  const start = value.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < value.length; index += 1) {
-    const ch = value[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === '\\') {
-      escaped = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (ch === '{') depth += 1;
-    if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return value.slice(start, index + 1);
-    }
-  }
-  return null;
-}
-
-function looseJsonObject(text) {
-  const value = String(text ?? '');
-  const answer = value.match(/"answer"\s*:\s*"([\s\S]*?)"\s*(?:,|})/);
-  const confidence = value.match(/"confidence"\s*:\s*(0(?:\.\d+)?|1(?:\.0+)?)/);
-  const evidence = value.match(/"evidence"\s*:\s*"([\s\S]*?)"\s*(?:,|})/);
-  if (answer) {
-    return {
-      answer: answer[1].replace(/\\"/g, '"'),
-      confidence: confidence ? Number(confidence[1]) : 0,
-      evidence: evidence ? evidence[1].replace(/\\"/g, '"') : '',
-    };
-  }
-  const correct = value.match(/"correct"\s*:\s*(true|false)/);
-  const reason = value.match(/"reason"\s*:\s*"([\s\S]*?)"\s*(?:,|})/);
-  if (correct) {
-    return {
-      correct: correct[1] === 'true',
-      reason: reason ? reason[1].replace(/\\"/g, '"') : value.slice(0, 500),
-    };
-  }
-  return null;
-}
-
 function sessionIdAt(item, index) {
   return item.haystack_session_ids?.[index] ?? `session_${index + 1}`;
 }
@@ -133,10 +78,10 @@ function sessionDateAt(item, index) {
 
 function materializeLongMemEvalMessages(item, maxSessions) {
   const sessions = Array.isArray(item.haystack_sessions) ? item.haystack_sessions : [];
-  const selected = sessions.slice(0, Math.min(maxSessions, sessions.length));
+  const selectedSessions = sessions.slice(0, Math.min(maxSessions, sessions.length));
   const messages = [];
-  for (let sessionIndex = 0; sessionIndex < selected.length; sessionIndex += 1) {
-    const turns = Array.isArray(selected[sessionIndex]) ? selected[sessionIndex] : [];
+  for (let sessionIndex = 0; sessionIndex < selectedSessions.length; sessionIndex += 1) {
+    const turns = Array.isArray(selectedSessions[sessionIndex]) ? selectedSessions[sessionIndex] : [];
     const sid = sessionIdAt(item, sessionIndex);
     const date = sessionDateAt(item, sessionIndex);
     for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
@@ -157,56 +102,12 @@ function materializeLongMemEvalMessages(item, maxSessions) {
   return messages;
 }
 
-async function chatJson({ system, user, maxTokens = 768 }) {
-  if (!paidApiAllowed()) {
-    throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1');
-  }
-  if (!options.apiKey) {
-    throw new Error('evaluation API key is not set');
-  }
-  const response = await fetch(`${options.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${options.apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: options.model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      temperature: 0,
-      max_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-    }),
-  });
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`model call failed ${response.status}: ${raw.slice(0, 600)}`);
-  }
-  const data = JSON.parse(raw);
-  const content = data.choices?.[0]?.message?.content ?? '{}';
-  try {
-    return JSON.parse(content);
-  } catch {
-    const match = firstJsonObject(content);
-    if (match) {
-      try {
-        return JSON.parse(match);
-      } catch {
-        const loose = looseJsonObject(match);
-        if (loose) return loose;
-      }
-    }
-    const loose = looseJsonObject(content);
-    if (loose) return loose;
-    return { raw: content };
-  }
-}
-
 async function answerFromEvidence(question, evidenceText) {
   return chatJson({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
     system: 'You answer long-term memory questions using only the provided retrieved evidence. If the first verified answer candidate directly answers the question, return exactly that candidate text; do not expand it with extra source-list items. Use source excerpts to confirm or break ties between candidates. Do not include reasoning. Return strict JSON: {"answer":"...","confidence":0-1,"evidence":"short quote"}. If evidence is insufficient, answer "INSUFFICIENT_EVIDENCE".',
     user: `Question:\n${question}\n\nRetrieved evidence:\n${truncate(evidenceText, 12000)}`,
     maxTokens: 768,
@@ -215,6 +116,10 @@ async function answerFromEvidence(question, evidenceText) {
 
 async function judgeAnswer(question, expected, hypothesis, evidenceText) {
   return chatJson({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
     system: 'You are a strict but fair evaluator for conversational memory QA. Do not include reasoning. Return strict JSON: {"correct":true|false,"reason":"..."}. Mark correct only if the hypothesis is semantically equivalent to the expected answer and supported by evidence. If the hypothesis is INSUFFICIENT_EVIDENCE while an expected answer is provided, mark correct false.',
     user: `Question:\n${question}\n\nExpected answer:\n${expected}\n\nHypothesis:\n${hypothesis}\n\nRetrieved evidence:\n${truncate(evidenceText, 9000)}`,
     maxTokens: 512,
@@ -276,7 +181,6 @@ function buildLosslessEvidence(question, response) {
     .filter((line) => /^\[turn /.test(line))
     .slice(0, 12)
     .map((line) => normalizeText(line));
-
   const sections = [`Question: ${question}`];
 
   if (rankedCandidates.length > 0) {
@@ -290,11 +194,7 @@ function buildLosslessEvidence(question, response) {
   }
 
   if (turnLines.length > 0) {
-    sections.push(
-      '',
-      'Retrieved source excerpts:',
-      ...turnLines,
-    );
+    sections.push('', 'Retrieved source excerpts:', ...turnLines);
   }
 
   if (sourceTrace.length > 0) {
@@ -319,7 +219,7 @@ async function runCase(item, index, jsonlPath) {
   const caseDef = {
     id: `longmemeval-${item.question_id || index}`,
     title: `LongMemEval ${item.question_type || 'unknown'}`,
-    description: 'LongMemEval-S async MiniMax reader/judge stress case.',
+    description: 'LongMemEval-S standard benchmark case.',
     tags: ['longmemeval', item.question_type || 'unknown', 'source_verified'],
     mode: 'retrieve',
     query: `History recall: ${item.question}`,
@@ -404,7 +304,23 @@ async function main() {
   const jsonlPath = path.join(options.outDir, 'results.jsonl');
   const summaryPath = path.join(options.outDir, 'summary.json');
   const metaPath = path.join(options.outDir, 'run-meta.json');
-  await fsp.writeFile(metaPath, JSON.stringify({ ...options, apiKey: options.apiKey ? 'set' : 'missing', startedAt: new Date().toISOString() }, null, 2), 'utf8');
+  await fsp.writeFile(metaPath, JSON.stringify({
+    ...options,
+    apiKey: options.apiKey ? 'set' : 'missing',
+    startedAt: new Date().toISOString(),
+    standardSource: 'LongMemEval-S cleaned local dataset',
+  }, null, 2), 'utf8');
+
+  if (!paidApiAllowed(process.argv.slice(2))) {
+    throw new Error('external evaluation model calls are disabled; pass --allow-paid-api or set CHAUNYOMS_EVAL_ALLOW_PAID=1');
+  }
+  const preflight = await preflightEvalModel({
+    baseUrl: options.baseUrl,
+    api: options.api,
+    apiKey: options.apiKey,
+    model: options.model,
+  });
+  await fsp.writeFile(path.join(options.outDir, 'api-preflight.json'), JSON.stringify(preflight, null, 2), 'utf8');
 
   const raw = await fsp.readFile(options.dataPath, 'utf8');
   const dataset = JSON.parse(raw);
@@ -436,7 +352,3 @@ main().catch((error) => {
   console.error(error);
   process.exit(1);
 });
-
-
-
-

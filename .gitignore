@@ -20,6 +20,8 @@ scripts/*
 !scripts/openclaw-runtime-report.cjs
 !scripts/openclaw-session-smoke.cjs
 !scripts/check-environment.cjs
+!scripts/eval-model-client.cjs
+!scripts/preflight-eval-model.cjs
 !scripts/run-locomo-standard.cjs
 !scripts/run-longmemeval-siliconflow.cjs
 !scripts/run-personamem-standard.cjs
