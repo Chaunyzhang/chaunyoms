@@ -134,6 +134,7 @@ export class OmsAdminService {
         laneCandidateRerankThreshold: context.config.laneCandidateRerankThreshold,
         candidateAmbiguityMargin: context.config.candidateAmbiguityMargin,
         strictModeRequiresRerankOnConflict: context.config.strictModeRequiresRerankOnConflict,
+        openClawRuntimeProfile: context.config.openClawRuntimeProfile,
         emergencyBrake: context.config.emergencyBrake,
         sqliteJournalMode: context.config.sqliteJournalMode,
       },

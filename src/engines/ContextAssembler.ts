@@ -263,6 +263,26 @@ export class ContextAssembler {
     ], budget);
   }
 
+  buildOpenClawRecallSystemItem(): ContextItem {
+    const content = [
+      "[ChaunyOMS recall policy]",
+      "If the answer is not directly present in visible context, do not guess and do not stop at 'not found'.",
+      "First call memory_retrieve.",
+      "If the answer is still unclear, call oms_grep using short keywords or exact phrases instead of repeating the full question.",
+      "If summary or source ids are returned, use oms_expand or oms_trace to reach raw source before answering an exact fact.",
+    ].join("\n");
+
+    return {
+      kind: "message",
+      tokenCount: Math.max(estimateTokens(content), 1),
+      role: "system",
+      content,
+      metadata: {
+        layer: "oms_recall_policy",
+      },
+    };
+  }
+
   async assemble(
     rawStore: RawMessageRepository,
     summaryStore: SummaryRepository,
