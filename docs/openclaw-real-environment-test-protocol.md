@@ -3,6 +3,9 @@
 ## One Allowed Flow
 
 This is the only supported real OpenClaw test flow for this repo.
+This document is the only source of truth for that flow. Do not restate,
+fork, or reinterpret these rules in roadmap docs, tool descriptions, dashboard
+flows, background QA tools, or benchmark harnesses.
 
 1. Send one material chunk to OpenClaw as a normal user message.
 2. Wait until OpenClaw finishes that turn and replies.
@@ -26,6 +29,15 @@ the answer has to come from OMS/OpenClaw memory behavior, not from visible
 conversation context.
 
 Do not use any other real OpenClaw test method.
+
+For QA-style questions, the allowed responsibilities are strictly split:
+
+- The sender harness sends one message and waits for the OpenClaw turn to end.
+- OpenClaw produces the formal user-visible answer.
+- Codex inspects transcript/runtime evidence outside the harness and judges
+  whether the flow and answer are correct.
+- The expected retrieval path is summary/memory/sourceRefs to nearby raw source
+  evidence, injected back into OpenClaw so the main model answers from evidence.
 
 ## Message Rule
 

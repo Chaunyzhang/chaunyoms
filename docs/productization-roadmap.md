@@ -37,20 +37,19 @@ Done so far:
 
 ### 2. Keep Real OpenClaw Testing on the Single Allowed Protocol
 
-Real OpenClaw testing must follow `docs/openclaw-real-environment-test-protocol.md`.
-Do not add or advertise alternate real-test entrypoints.
+Reference only: `docs/openclaw-real-environment-test-protocol.md`.
 
 Current direction:
 
-- Keep the thin ACP sender available.
-- Use one sender process per user message with the same `--session-key`.
-- Send all material chunks first, wait/check externally, then ask the formal
-  question in a fresh OpenClaw session with visible context cleared.
-- Keep runtime reports as external diagnostics only, not as a harness or alternate real-test flow.
+- Treat `docs/openclaw-real-environment-test-protocol.md` as the only rule
+  source.
+- Do not restate the protocol in roadmap/status docs; link to the canonical
+  protocol instead.
 
 Done so far:
 
-- The protocol document now defines the only valid real OpenClaw test flow.
+- The roadmap now links to the canonical protocol instead of restating the flow.
+- Duplicate roadmap-level flow instructions have been removed to avoid drift.
 
 ### 3. Show Retrieval Budget and Atom Storage Shape in Tool Text
 

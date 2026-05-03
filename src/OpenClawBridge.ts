@@ -1382,7 +1382,7 @@ export class OpenClawBridge {
 
     register(
       "oms_test_start",
-      "Start a background QA run. Default suite is stable_smoke_v1; real_smoke_v1 remains available for full OpenClaw live-path testing.",
+      "Start a legacy diagnostic background QA run. This is not a valid real OpenClaw answer-evaluation protocol; use docs/openclaw-real-environment-test-protocol.md for formal QA.",
       {
         type: "object",
         properties: {
@@ -1403,7 +1403,8 @@ export class OpenClawBridge {
           content: [{
             type: "text",
             text: [
-              "Background real test started.",
+              "Legacy diagnostic background run started.",
+              "Not a formal real OpenClaw QA protocol run.",
               "",
               this.formatTestRunSummary(run as unknown as Record<string, unknown>),
             ].join("\n"),
@@ -1426,7 +1427,7 @@ export class OpenClawBridge {
 
     register(
       "oms_test_cancel",
-      "Request cancellation for a running real OpenClaw background test. Cancellation is graceful-first so the isolated test agent can still be cleaned up.",
+      "Request cancellation for a legacy diagnostic background QA run.",
       {
         type: "object",
         properties: {
@@ -1465,7 +1466,7 @@ export class OpenClawBridge {
 
     register(
       "oms_test_status",
-      "Read the current status of an asynchronous real OpenClaw background test run.",
+      "Read the current status of a legacy diagnostic background QA run.",
       {
         type: "object",
         properties: {
@@ -1500,7 +1501,7 @@ export class OpenClawBridge {
 
     register(
       "oms_test_result",
-      "Read the final report, runtime report, and session smoke report for a completed real OpenClaw background test run.",
+      "Read the final report, runtime report, and session smoke report for a completed legacy diagnostic background QA run.",
       {
         type: "object",
         properties: {
@@ -1535,7 +1536,7 @@ export class OpenClawBridge {
 
     register(
       "oms_test_list",
-      "List recent real OpenClaw background test runs for monitoring and UI status panels.",
+      "List recent legacy diagnostic background QA runs for monitoring and UI status panels.",
       {
         type: "object",
         properties: {
@@ -1594,7 +1595,15 @@ export class OpenClawBridge {
           const suite = typeof record.suite === "string" ? record.suite : undefined;
           const run = await this.testService.start(context.config, { suite });
           return {
-            content: [{ type: "text", text: ["Background real test started.", "", this.formatTestRunSummary(run as unknown as Record<string, unknown>)].join("\n") }],
+            content: [{
+              type: "text",
+              text: [
+                "Legacy diagnostic background run started.",
+                "Not a formal real OpenClaw QA protocol run.",
+                "",
+                this.formatTestRunSummary(run as unknown as Record<string, unknown>),
+              ].join("\n"),
+            }],
             details: {
               ok: true,
               action,
@@ -1678,7 +1687,7 @@ export class OpenClawBridge {
 
     register(
       "qa_start",
-      "Short alias for oms_test_start.",
+      "Short alias for oms_test_start. Legacy diagnostics only; not formal real OpenClaw QA.",
       {
         type: "object",
         properties: {
@@ -1698,7 +1707,12 @@ export class OpenClawBridge {
         return {
           content: [{
             type: "text",
-            text: ["Background real test started.", "", this.formatTestRunSummary(run as unknown as Record<string, unknown>)].join("\n"),
+            text: [
+              "Legacy diagnostic background run started.",
+              "Not a formal real OpenClaw QA protocol run.",
+              "",
+              this.formatTestRunSummary(run as unknown as Record<string, unknown>),
+            ].join("\n"),
           }],
           details: {
             ok: true,
