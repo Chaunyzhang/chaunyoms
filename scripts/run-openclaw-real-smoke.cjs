@@ -38,56 +38,40 @@ async function main() {
     repoRoot,
     argValue("--out-dir", path.join("artifacts", "evals", `real-openclaw-smoke-${Date.now()}`)),
   );
+  const sessionKey = argValue("--session-key", "");
   await fsp.mkdir(outDir, { recursive: true });
 
-  runNode([
+  const harnessArgs = [
     path.join("scripts", "run-openclaw-acp-harness.mjs"),
     "--case-file",
     path.relative(repoRoot, caseFile),
     "--out-dir",
     path.relative(repoRoot, outDir),
-  ], 600000, repoRoot);
+  ];
+  if (sessionKey) {
+    harnessArgs.push("--session-key", sessionKey);
+  }
+  runNode(harnessArgs, 600000, repoRoot);
 
   const harnessPath = path.join(
     outDir,
     `${path.basename(caseFile, path.extname(caseFile))}.json`,
   );
   const harnessReport = JSON.parse(await fsp.readFile(harnessPath, "utf8"));
-  const sessionSelector = harnessReport.sessionKey;
-
-  const runtimeReportResult = runNode([
-    "--experimental-sqlite",
-    path.join("scripts", "openclaw-runtime-report.cjs"),
-    `--session=${sessionSelector}`,
-  ], 20000, repoRoot);
-  const smokeReportResult = runNode([
-    "--experimental-sqlite",
-    path.join("scripts", "openclaw-session-smoke.cjs"),
-    `--session=${sessionSelector}`,
-  ], 20000, repoRoot);
-
-  const runtimeReport = JSON.parse(String(runtimeReportResult.stdout || "{}"));
-  const smokeReport = JSON.parse(String(smokeReportResult.stdout || "{}"));
-  const finalAssistantReply = [...(harnessReport.results || [])]
-    .reverse()
-    .map((item) => item.assistantReply)
-    .find((value) => typeof value === "string" && value.trim().length > 0) ?? "";
 
   const report = {
     createdAt: new Date().toISOString(),
     caseFile: path.relative(repoRoot, caseFile),
     outDir: path.relative(repoRoot, outDir),
     sessionKey: harnessReport.sessionKey,
-    realSessionId: harnessReport.realSessionId,
-    finalAssistantReply,
+    acpSessionId: harnessReport.acpSessionId,
+    turns: harnessReport.results,
     harnessReport,
-    runtimeReport,
-    smokeReport,
   };
 
   const reportPath = path.join(outDir, "report.json");
   await fsp.writeFile(reportPath, JSON.stringify(report, null, 2), "utf8");
-  process.stdout.write(`${JSON.stringify({ reportPath, realSessionId: harnessReport.realSessionId }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ reportPath, sessionKey: harnessReport.sessionKey }, null, 2)}\n`);
 }
 
 main().catch((error) => {

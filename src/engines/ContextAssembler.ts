@@ -12,6 +12,7 @@ import {
   SummaryRepository,
 } from "../types";
 import { SQLiteRuntimeStore } from "../data/SQLiteRuntimeStore";
+import type { RuntimeQueryRecallEvidence } from "../data/SQLiteRuntimeStore";
 import { estimateTokens } from "../utils/tokenizer";
 import {
   ContextCandidateSource,
@@ -242,18 +243,24 @@ export class ContextAssembler {
         runtime.getRecentTailByTokens(effectiveTailBudget, effectiveTailTurns, options.sessionId),
         effectiveTailBudget,
       );
+      const queryRecallEvidence = this.shouldForceRawRecallForQuery(options.activeQuery)
+        ? runtime.getQueryRecallEvidence(options.activeQuery ?? "", 4, options.sessionId)
+        : { rawHits: [] };
       return {
         recallGuidance,
         memoryItems,
         summaries,
         recentTail,
+        queryRecallEvidence,
       };
     });
     if (!runtimeRead) {
       throw new Error("SQLite runtime assembly read unavailable");
     }
-    const { recallGuidance, memoryItems, summaries, recentTail } = runtimeRead;
+    const { recallGuidance, memoryItems, summaries, recentTail, queryRecallEvidence } = runtimeRead;
+    const queryRawEvidence = this.queryRecallEvidenceToItems(queryRecallEvidence, budget.recallBudget);
     return this.planAndStore([
+      ...this.tagCandidateSource(queryRawEvidence, "raw_exact_search"),
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
@@ -261,6 +268,57 @@ export class ContextAssembler {
       ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
     ], budget);
+  }
+
+  private shouldForceRawRecallForQuery(query?: string): boolean {
+    const normalized = String(query ?? "").toLowerCase();
+    if (!normalized.trim()) {
+      return false;
+    }
+    return /\b(earlier|previously|before|told you|i told|remember|recall|what is|what was)\b/.test(normalized) &&
+      /\b(codename|code name|project|answer only|exact|fact|alias|port|when|where|who|what)\b/.test(normalized);
+  }
+
+  private queryRecallEvidenceToItems(
+    evidence: RuntimeQueryRecallEvidence,
+    budget: number,
+  ): ContextItem[] {
+    if (budget <= 0 || evidence.rawHits.length === 0) {
+      return [];
+    }
+    const selected: ContextItem[] = [];
+    let consumed = 0;
+    for (const hit of evidence.rawHits) {
+      const windowMessages = [...hit.before, hit.message, ...hit.after];
+      const content = [
+        "[ChaunyOMS raw source recall]",
+        "Authoritative nearby raw evidence expanded from query-matched memory/summary/raw records.",
+        "Prefer exact facts in these raw lines over project ids, labels, prior guesses, or navigation hints.",
+        `matched_message_id: ${hit.message.id}`,
+        `source_session_id: ${hit.message.sessionId}`,
+        `source_turn: ${hit.message.turnNumber}`,
+        ...windowMessages.map((message) =>
+          `[raw ${message.role} turn ${message.turnNumber} id ${message.id}] ${message.content}`),
+      ].join("\n");
+      const tokenCount = Math.max(estimateTokens(content), 1);
+      if (selected.length > 0 && consumed + tokenCount > budget) {
+        break;
+      }
+      selected.push({
+        kind: "summary",
+        tokenCount,
+        content,
+        metadata: {
+          layer: "query_raw_recall",
+          messageId: hit.message.id,
+          sourceSessionId: hit.message.sessionId,
+          turnNumber: hit.message.turnNumber,
+          score: hit.score,
+        },
+      });
+      consumed += tokenCount;
+    }
+    return selected;
   }
 
   buildOpenClawRecallSystemItem(): ContextItem {

@@ -264,6 +264,10 @@ export interface OmsGrepHit {
   score: number;
 }
 
+export interface RuntimeQueryRecallEvidence {
+  rawHits: OmsGrepHit[];
+}
+
 export interface OmsTraceEdge {
   sourceKind: string;
   sourceId: string;
@@ -306,6 +310,7 @@ export interface RuntimeAssemblyReader {
   getCompactedMessageIds(messageIds: string[], sessionId?: string): Set<string>;
   getSummaries(budget: number, sessionId?: string): SummaryEntry[];
   getRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[];
+  getQueryRecallEvidence(query: string, limit?: number, currentSessionId?: string): RuntimeQueryRecallEvidence;
 }
 
 interface RuntimeDatabaseModule {
@@ -536,6 +541,8 @@ export class SQLiteRuntimeStore {
         getSummaries: (budget, sessionId) => this.readAssemblySummaries(budget, sessionId),
         getRecentTailByTokens: (tokenBudget, maxTurns, sessionId) =>
           this.readAssemblyRecentTailByTokens(tokenBudget, maxTurns, sessionId),
+        getQueryRecallEvidence: (query, limit, currentSessionId) =>
+          this.readAssemblyQueryRecallEvidence(query, limit, currentSessionId),
       });
     } finally {
       this.closeDatabase();
@@ -581,6 +588,186 @@ export class SQLiteRuntimeStore {
       LIMIT ?
     `).all(Math.max(Math.min(limit, 50), 1))
       .map((row) => this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry));
+  }
+
+  private readAssemblyQueryRecallEvidence(
+    query: string,
+    limit = 3,
+    currentSessionId?: string,
+  ): RuntimeQueryRecallEvidence {
+    if (!this.db) {
+      return { rawHits: [] };
+    }
+    const terms = this.queryTerms(query);
+    if (terms.length === 0) {
+      return { rawHits: [] };
+    }
+    const recallTerms = this.distinctiveRecallTerms(terms);
+    const normalizedLimit = Math.max(Math.min(limit, 12), 1);
+    const normalizedQuery = this.normalizeRecallQuestion(query);
+    const ftsScored = this.searchMessagesFts(recallTerms.join(" "), recallTerms, undefined, normalizedLimit * 4)
+      .filter((item) => this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId));
+    const scanScored = (this.db.prepare(`
+      SELECT * FROM messages
+      ORDER BY sequence ASC, turn_number ASC, created_at ASC
+    `).all() ?? [])
+      .map((row) => ({ message: this.rowToMessage(row), score: this.scoreText(String(row.content ?? ""), recallTerms) }))
+      .filter((item) => item.score > 0 && this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId));
+    const byId = new Map<string, { message: RawMessage; score: number }>();
+    const sourceExpanded = [
+      ...this.queryMemorySourceMessages(recallTerms, normalizedQuery, currentSessionId),
+      ...this.querySummarySourceMessages(recallTerms, normalizedQuery, currentSessionId),
+    ];
+    for (const item of [...sourceExpanded, ...ftsScored, ...scanScored]) {
+      const existing = byId.get(item.message.id);
+      if (!existing || item.score > existing.score) {
+        byId.set(item.message.id, item);
+      }
+    }
+    const rawHits = [...byId.values()]
+      .sort((left, right) => right.score - left.score || (left.message.sequence ?? 0) - (right.message.sequence ?? 0))
+      .slice(0, normalizedLimit)
+      .map((item) => ({
+        message: item.message,
+        score: item.score,
+        before: this.getMessagesByTurnWindow(item.message.sessionId, item.message.turnNumber - 1, item.message.turnNumber - 1),
+        after: this.getMessagesByTurnWindow(item.message.sessionId, item.message.turnNumber + 1, item.message.turnNumber + 1),
+    }));
+    return { rawHits };
+  }
+
+  private queryMemorySourceMessages(
+    terms: string[],
+    normalizedQuery: string,
+    currentSessionId?: string,
+  ): Array<{ message: RawMessage; score: number }> {
+    if (!this.db) {
+      return [];
+    }
+    const rows = this.db.prepare(`
+      SELECT payload_json FROM memory_items
+      WHERE status = 'active'
+        AND context_policy != 'never'
+      ORDER BY priority ASC, updated_at DESC, created_at DESC
+      LIMIT 250
+    `).all() ?? [];
+    const scored: Array<{ message: RawMessage; score: number }> = [];
+    for (const row of rows) {
+      const item = this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry);
+      const searchable = [
+        item.text,
+        item.content,
+        item.projectId,
+        item.topicId,
+        ...(item.tags ?? []),
+      ].filter(Boolean).join("\n");
+      const memoryScore = this.scoreText(searchable, terms);
+      if (memoryScore <= 0) {
+        continue;
+      }
+      const sourceIds = this.uniqueStrings([
+        ...(item.sourceIds ?? []),
+        ...(item.sourceRefs ?? []).map((ref) => ref.messageId),
+      ]);
+      for (const message of this.getMessagesByIds(sourceIds)) {
+        if (!this.isRecallEvidenceMessage(message, normalizedQuery, currentSessionId)) {
+          continue;
+        }
+        scored.push({
+          message,
+          score: 1000 + memoryScore + this.scoreText(message.content, terms),
+        });
+      }
+    }
+    return scored;
+  }
+
+  private querySummarySourceMessages(
+    terms: string[],
+    normalizedQuery: string,
+    currentSessionId?: string,
+  ): Array<{ message: RawMessage; score: number }> {
+    if (!this.db) {
+      return [];
+    }
+    const rows = this.db.prepare(`
+      SELECT payload_json FROM summaries
+      WHERE record_status = 'active'
+      ORDER BY end_turn DESC, start_turn DESC
+      LIMIT 250
+    `).all() ?? [];
+    const scored: Array<{ message: RawMessage; score: number }> = [];
+    for (const row of rows) {
+      const summary = this.parseObject(row.payload_json) as unknown as SummaryEntry;
+      const searchable = [
+        summary.summary,
+        ...(summary.keywords ?? []),
+        ...(summary.constraints ?? []),
+        ...(summary.decisions ?? []),
+        ...(summary.blockers ?? []),
+        ...(summary.nextSteps ?? []),
+        ...(summary.keyEntities ?? []),
+        ...(summary.exactFacts ?? []),
+      ].filter(Boolean).join("\n");
+      const summaryScore = this.scoreText(searchable, terms);
+      if (summaryScore <= 0) {
+        continue;
+      }
+      const sourceIds = this.uniqueStrings([
+        ...(summary.sourceMessageIds ?? []),
+        ...(summary.sourceRefs ?? []).map((ref) => ref.messageId),
+        summary.sourceFirstMessageId,
+        summary.sourceLastMessageId,
+      ].filter((id): id is string => Boolean(id)));
+      for (const message of this.getMessagesByIds(sourceIds)) {
+        if (!this.isRecallEvidenceMessage(message, normalizedQuery, currentSessionId)) {
+          continue;
+        }
+        scored.push({
+          message,
+          score: 800 + summaryScore + this.scoreText(message.content, terms),
+        });
+      }
+    }
+    return scored;
+  }
+
+  private isRecallEvidenceMessage(message: RawMessage, normalizedQuery: string, currentSessionId?: string): boolean {
+    if (currentSessionId && message.sessionId === currentSessionId) {
+      return false;
+    }
+    if (this.normalizeRecallQuestion(message.content) === normalizedQuery) {
+      return false;
+    }
+    return true;
+  }
+
+  private normalizeRecallQuestion(text: string): string {
+    return String(text ?? "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\p{L}\p{N} ]/gu, "")
+      .trim();
+  }
+
+  private distinctiveRecallTerms(terms: string[]): string[] {
+    const weakRecallTerms = new Set([
+      "answer",
+      "briefly",
+      "cod",
+      "conversation",
+      "earlier",
+      "exact",
+      "fact",
+      "only",
+      "previously",
+      "project",
+      "recall",
+      "remember",
+      "told",
+    ]);
+    const distinctive = terms.filter((term) => !weakRecallTerms.has(term));
+    return distinctive.length > 0 ? distinctive : terms;
   }
 
   private readAssemblyCompactedMessageIds(messageIds: string[], sessionId?: string): Set<string> {

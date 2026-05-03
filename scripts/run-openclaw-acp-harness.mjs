@@ -3,7 +3,6 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Readable, Transform, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 
 const APPDATA = process.env.APPDATA ?? "C:/Users/ye302/AppData/Roaming";
 const OPENCLAW_GLOBAL = path.join(APPDATA, "npm", "node_modules", "openclaw");
@@ -28,7 +27,6 @@ const options = {
   outDir: argValue("--out-dir", path.join("artifacts", "evals", `openclaw-acp-harness-${new Date().toISOString().slice(0, 10)}`)),
   cwd: argValue("--cwd", process.cwd()),
   sessionKey: argValue("--session-key", `agent:main:harness-${Date.now()}-${randomUUID().slice(0, 8)}`),
-  agentId: argValue("--agent-id", "main"),
 };
 
 if (!options.caseFile) {
@@ -70,24 +68,7 @@ function firstPermissionOption(options) {
   return allow ?? options[0];
 }
 
-const transcript = [];
-const toolEvents = [];
-const transportNoise = [];
-
-function handleSessionUpdate(params) {
-  const update = params.update;
-  transcript.push(update);
-  if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
-    toolEvents.push(update);
-  }
-}
-
-function getOpenClawHomeDir() {
-  return process.env.OPENCLAW_HOME?.trim()
-    || path.join(process.env.USERPROFILE ?? "", ".openclaw");
-}
-
-function createNdJsonFilter(noiseSink) {
+function createNdJsonFilter() {
   let buffer = "";
   return new Transform({
     transform(chunk, _encoding, callback) {
@@ -99,8 +80,6 @@ function createNdJsonFilter(noiseSink) {
         if (line) {
           if (line.startsWith("{")) {
             this.push(`${line}\n`);
-          } else {
-            noiseSink.push(line);
           }
         }
         newlineIndex = buffer.indexOf("\n");
@@ -112,8 +91,6 @@ function createNdJsonFilter(noiseSink) {
       if (line) {
         if (line.startsWith("{")) {
           this.push(`${line}\n`);
-        } else {
-          noiseSink.push(line);
         }
       }
       callback();
@@ -121,119 +98,17 @@ function createNdJsonFilter(noiseSink) {
   });
 }
 
-async function readJsonIfExists(filePath) {
-  try {
-    return JSON.parse(await fs.readFile(filePath, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-async function resolveRealSessionId(agentId, sessionKey) {
-  const registryPath = path.join(
-    getOpenClawHomeDir(),
-    "agents",
-    agentId,
-    "sessions",
-    "sessions.json",
-  );
-  const registry = await readJsonIfExists(registryPath);
-  const entry = registry && typeof registry === "object" ? registry[sessionKey] : null;
-  if (entry && typeof entry === "object" && typeof entry.sessionId === "string" && entry.sessionId.trim()) {
-    return entry.sessionId.trim();
-  }
-  return null;
-}
-
-function extractTextFromContent(content) {
-  if (typeof content === "string") {
-    return content.trim();
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
-  return content
-    .map((part) => {
-      if (typeof part === "string") {
-        return part;
-      }
-      if (part && typeof part === "object" && typeof part.text === "string") {
-        return part.text;
-      }
-      return "";
-    })
-    .filter((value) => value.trim().length > 0)
-    .join("\n")
-    .trim();
-}
-
-async function readRealSessionMessages(agentId, sessionId) {
-  const sessionPath = path.join(
-    getOpenClawHomeDir(),
-    "agents",
-    agentId,
-    "sessions",
-    `${sessionId}.jsonl`,
-  );
-  try {
-    const raw = await fs.readFile(sessionPath, "utf8");
-    return raw
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .filter((record) => record?.type === "message" && record?.message?.role)
-      .map((record) => ({
-        id: typeof record.id === "string" ? record.id : undefined,
-        timestamp: record.timestamp,
-        role: record.message.role,
-        text: extractTextFromContent(record.message.content),
-      }))
-      .filter((message) => message.role === "user" || message.role === "assistant");
-  } catch {
-    return [];
-  }
-}
-
-async function waitForTurnPersistence({
-  agentId,
-  sessionKey,
-  baselineCount,
-  timeoutMs = 180000,
-}) {
-  const startedAt = Date.now();
-  let resolvedSessionId = null;
-  while (Date.now() - startedAt < timeoutMs) {
-    if (!resolvedSessionId) {
-      resolvedSessionId = await resolveRealSessionId(agentId, sessionKey);
-    }
-    if (resolvedSessionId) {
-      const messages = await readRealSessionMessages(agentId, resolvedSessionId);
-      if (messages.length >= baselineCount + 2) {
-        const appended = messages.slice(baselineCount);
-        const firstNewUserIndex = appended.findIndex((message) => message.role === "user");
-        const assistantAfterUser = firstNewUserIndex >= 0
-          ? appended.slice(firstNewUserIndex + 1).find((message) => message.role === "assistant")
-          : null;
-        if (assistantAfterUser) {
-          return {
-            sessionId: resolvedSessionId,
-            messageCount: messages.length,
-            assistantReply: assistantAfterUser.text,
-          };
-        }
-      }
-    }
-    await delay(1000);
-  }
-
-  throw new Error(`Timed out waiting for persisted turn completion for session key ${sessionKey}`);
-}
-
 async function runHarness() {
+  const turns = parseTurns(await fs.readFile(options.caseFile, "utf8"));
+  if (turns.length !== 1) {
+    throw new Error(
+      `Thin OpenClaw ACP sender requires exactly one Turn per run; found ${turns.length}. ` +
+      "Run one sender process per user message and reuse --session-key for a normal multi-turn conversation.",
+    );
+  }
   const token = await loadGatewayToken();
   const tokenFile = path.join(process.cwd(), `.openclaw-acp-token-${randomUUID().slice(0, 8)}.txt`);
   await fs.writeFile(tokenFile, token, "utf8");
-  const turns = parseTurns(await fs.readFile(options.caseFile, "utf8"));
   const agent = spawn(process.execPath, [
     OPENCLAW_ENTRY,
     "acp",
@@ -246,20 +121,23 @@ async function runHarness() {
   ], {
     stdio: ["pipe", "pipe", "inherit"],
     cwd: options.cwd,
+    env: {
+      ...process.env,
+      OPENCLAW_HIDE_BANNER: "1",
+      OPENCLAW_SUPPRESS_NOTES: "1",
+    },
     windowsHide: true,
   });
 
   if (!agent.stdin || !agent.stdout) {
     throw new Error("Failed to start ACP bridge stdio");
   }
-  const filteredStdout = createNdJsonFilter(transportNoise);
+  const filteredStdout = createNdJsonFilter();
   agent.stdout.pipe(filteredStdout);
 
   const client = new ClientSideConnection(
     () => ({
-      sessionUpdate: async (params) => {
-        handleSessionUpdate(params);
-      },
+      sessionUpdate: async () => {},
       requestPermission: async (params) => {
         const option = firstPermissionOption(params.options ?? []);
         if (!option) {
@@ -297,8 +175,6 @@ async function runHarness() {
   });
 
   const results = [];
-  let persistedMessageCount = 0;
-  let realSessionId = null;
   for (const turn of turns) {
     const startedAt = Date.now();
     const response = await client.prompt({
@@ -310,19 +186,11 @@ async function runHarness() {
         },
       ],
     });
-    const persisted = await waitForTurnPersistence({
-      agentId: options.agentId,
-      sessionKey: options.sessionKey,
-      baselineCount: persistedMessageCount,
-    });
-    persistedMessageCount = persisted.messageCount;
-    realSessionId = persisted.sessionId;
     results.push({
       turn: turn.turn,
       user: turn.content,
       stopReason: response.stopReason,
       durationMs: Date.now() - startedAt,
-      assistantReply: persisted.assistantReply,
     });
   }
 
@@ -341,20 +209,15 @@ async function runHarness() {
       {
         sessionKey: options.sessionKey,
         acpSessionId: sessionId,
-        realSessionId,
-        agentId: options.agentId,
         caseFile: options.caseFile,
         results,
-        transcript,
-        toolEvents,
-        transportNoise,
       },
       null,
       2,
     ),
     "utf8",
   );
-  console.log(JSON.stringify({ outPath, sessionKey: options.sessionKey, turns: results.length, toolEvents: toolEvents.length }, null, 2));
+  console.log(JSON.stringify({ outPath, sessionKey: options.sessionKey, turns: results.length }, null, 2));
 }
 
 runHarness().catch((error) => {

@@ -35,21 +35,22 @@ Done so far:
 - Added fallback phrase matching with Unicode-safe literals.
 - Added regression coverage.
 
-### 2. Fix or Remove Broken QA Script Entrypoints
+### 2. Keep Real OpenClaw Testing on the Single Allowed Protocol
 
-Package scripts and runtime QA tools must not point to ignored or missing files.
+Real OpenClaw testing must follow `docs/openclaw-real-environment-test-protocol.md`.
+Do not add or advertise alternate real-test entrypoints.
 
 Current direction:
 
-- Keep the real OpenClaw QA worker scripts available in git.
-- Make QA scripts robust to UTF-8 BOM in `openclaw.json`.
-- Keep session smoke and runtime report able to infer the real agent from `sessionId`, instead of accidentally reading `main`.
+- Keep the thin ACP sender available.
+- Use one sender process per user message with the same `--session-key`.
+- Send all material chunks first, wait/check externally, then ask the formal
+  question in a fresh OpenClaw session with visible context cleared.
+- Keep runtime reports as external diagnostics only, not as a harness or alternate real-test flow.
 
 Done so far:
 
-- `.gitignore` exposes the QA scripts referenced by `package.json`.
-- `openclaw-runtime-report.cjs` and `openclaw-session-smoke.cjs` tolerate BOM.
-- Session-based reports can infer `memory-ctx-only` from the session.
+- The protocol document now defines the only valid real OpenClaw test flow.
 
 ### 3. Show Retrieval Budget and Atom Storage Shape in Tool Text
 
