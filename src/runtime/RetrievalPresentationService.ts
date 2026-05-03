@@ -13,9 +13,11 @@ import type {
 import type { RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
 import type {
   EvidenceGateResult,
+  RawEvidencePacketMessage,
   RecallPresentationOptions,
   RecallTextArgs,
   RecallTextDiagnostics,
+  SummaryEvidencePacketItem,
   RetrievalVerifierBlockedResponseArgs,
   SemanticExpansionResult,
   ToolResponse,
@@ -184,11 +186,21 @@ export class RetrievalPresentationService {
       },
       evidenceGate,
       diagnostics = {},
+      summaryEvidence = [],
+      rawEvidenceMessages = [],
     } = args;
 
     if (items.length === 0 && answerCandidates.length === 0) {
       return `No matching historical details found for query: ${query}`;
     }
+    const packet = this.buildEvidencePacket({
+      query,
+      items,
+      summaryEvidence,
+      rawEvidenceMessages,
+      sourceTrace,
+      evidenceGate,
+    });
     const answers = answerCandidates.length > 0
       ? [
           "Answer candidates:",
@@ -286,6 +298,8 @@ export class RetrievalPresentationService {
         ].join("\n")
       : "";
     return [
+      packet,
+      "",
       `Historical source hits for: ${query}`,
       "",
       answers,
@@ -421,6 +435,299 @@ export class RetrievalPresentationService {
       return normalized;
     }
     return `${normalized.slice(0, Math.max(0, maxChars - 20)).trimEnd()} ... [truncated]`;
+  }
+
+  private buildEvidencePacket(args: {
+    query: string;
+    items: ContextItem[];
+    summaryEvidence: SummaryEvidencePacketItem[];
+    rawEvidenceMessages: RawEvidencePacketMessage[];
+    sourceTrace: Array<{ summaryId?: string; strategy: string; verified: boolean; resolvedMessageCount: number }>;
+    evidenceGate?: EvidenceGateResult;
+  }): string {
+    const slots = this.extractRequestedSlots(args.query);
+    const effectiveSlots = slots.length > 0 ? slots : [{
+      id: "question_focus",
+      label: "question focus",
+      aliases: this.deps.queryTerms(args.query).slice(0, 6),
+      keyAliases: [],
+      valueExtractors: [],
+    }];
+    const lines: string[] = [];
+    lines.push("## Evidence Packet");
+    lines.push(`Query: ${args.query}`);
+    lines.push("");
+    lines.push("### Requested Slots");
+    for (const slot of effectiveSlots) {
+      lines.push(`- ${slot.label}`);
+    }
+    lines.push("");
+    lines.push("### Slot-Matched Evidence");
+    const allConflicts: string[] = [];
+    for (const slot of effectiveSlots) {
+      const rawMatches = this.matchRawEvidence(slot, args.rawEvidenceMessages);
+      const summaryMatches = this.matchSummaryEvidence(slot, args.summaryEvidence);
+      const conflicts = this.collectSlotConflicts(slot, rawMatches, summaryMatches);
+      allConflicts.push(...conflicts.map((conflict) => `${slot.label}: ${conflict}`));
+      lines.push(`#### ${slot.label}`);
+      if (rawMatches.length === 0 && summaryMatches.length === 0) {
+        lines.push("- no strong matched evidence");
+        lines.push("");
+        continue;
+      }
+      const bestRaw = rawMatches.slice(0, 2);
+      const bestSummaries = summaryMatches.slice(0, 2);
+      if (bestRaw.length > 0) {
+        lines.push(`- matched raw evidence count: ${rawMatches.length}`);
+        for (const match of bestRaw) {
+          lines.push(`- raw score=${match.score}${match.value ? ` value=${match.value}` : ""} source=${match.sourceLabel}`);
+          lines.push(`  [turn ${match.message.turnNumber}] ${match.message.role}: ${this.truncateText(match.message.content, 260)}`);
+        }
+      }
+      if (bestSummaries.length > 0) {
+        lines.push("- child summaries:");
+        for (const match of bestSummaries) {
+          const turnRange = typeof match.summary.startTurn === "number" && typeof match.summary.endTurn === "number"
+            ? ` turns=${match.summary.startTurn}-${match.summary.endTurn}`
+            : "";
+          lines.push(`  [summary ${match.summary.summaryId}] score=${match.score}${turnRange}: ${this.truncateText(match.summary.summary, 220)}`);
+        }
+      }
+      if (conflicts.length > 0) {
+        lines.push(`- conflicts: ${conflicts.join(" | ")}`);
+      }
+      lines.push("");
+    }
+    lines.push("### Summary Trail");
+    if (args.summaryEvidence.length > 0) {
+      for (const summary of args.summaryEvidence.slice(0, 6)) {
+        const turnRange = typeof summary.startTurn === "number" && typeof summary.endTurn === "number"
+          ? ` turns=${summary.startTurn}-${summary.endTurn}`
+          : "";
+        const level = summary.summaryLevel ? ` level=${summary.summaryLevel}` : "";
+        const kind = summary.nodeKind ? ` kind=${summary.nodeKind}` : "";
+        lines.push(`- [summary ${summary.summaryId}]${level}${kind}${turnRange}: ${this.truncateText(summary.summary, 220)}`);
+      }
+    } else {
+      lines.push("- none");
+    }
+    lines.push("");
+    lines.push("### Raw Source Messages");
+    if (args.rawEvidenceMessages.length > 0) {
+      for (const message of args.rawEvidenceMessages.slice(0, 10)) {
+        const marker = message.isCenter ? " center" : "";
+        lines.push(`- [turn ${message.turnNumber}] ${message.role}${marker}: ${this.truncateText(message.content, 320)}`);
+      }
+    } else {
+      lines.push("- none");
+    }
+    lines.push("");
+    lines.push("### Answering Guidance");
+    lines.push("- Use the slot-matched raw source messages first when they contain direct remembered facts.");
+    lines.push("- Use child summaries as navigation/supporting context, not as a replacement for raw quoted facts.");
+    lines.push("- If lower-priority environmental/config evidence conflicts with remembered session facts, surface the conflict explicitly instead of silently replacing the remembered value.");
+    if (args.evidenceGate) {
+      lines.push(`- Evidence gate status: ${args.evidenceGate.status}; recommended action: ${args.evidenceGate.recommendedAction}.`);
+    }
+    return lines.join("\n");
+  }
+
+  private extractRequestedSlots(query: string): Array<{
+    id: string;
+    label: string;
+    aliases: string[];
+    keyAliases: string[];
+    valueExtractors: Array<(text: string) => string | null>;
+  }> {
+    const normalized = query.toLowerCase();
+    const slots: Array<{
+      id: string;
+      label: string;
+      aliases: string[];
+      keyAliases: string[];
+      valueExtractors: Array<(text: string) => string | null>;
+    }> = [];
+    if (/(current blocker|project blocker|blocker|当前阻碍|项目阻碍)/i.test(query)) {
+      slots.push({
+        id: "current_blocker",
+        label: "current blocker",
+        aliases: ["current blocker", "project blocker", "blocker", "当前阻碍", "项目阻碍"],
+        keyAliases: [],
+        valueExtractors: [
+          (text) => text.match(/(?:current\s+project\s+blocker|project blocker|blocker)\s*[:：-]\s*([^\n]+)/i)?.[1]?.trim() ?? null,
+        ],
+      });
+    }
+    if (/(gateway port|gateway_port|端口|网关端口)/i.test(query)) {
+      slots.push({
+        id: "gateway_port",
+        label: "gateway port",
+        aliases: ["gateway port", "gateway_port", "网关端口", "端口"],
+        keyAliases: ["GATEWAY_PORT"],
+        valueExtractors: [
+          (text) => text.match(/\bGATEWAY_PORT\s*(?:=|:|is)\s*([A-Za-z0-9_.:-]+)/i)?.[1]?.trim() ?? null,
+          (text) => text.match(/gateway port[^0-9A-Za-z]{0,8}([0-9]{2,6})/i)?.[1]?.trim() ?? null,
+        ],
+      });
+    }
+    if (/(token alias|token_alias|别名令牌|令牌别名)/i.test(query)) {
+      slots.push({
+        id: "token_alias",
+        label: "token alias",
+        aliases: ["token alias", "token_alias", "令牌别名"],
+        keyAliases: ["TOKEN_ALIAS"],
+        valueExtractors: [
+          (text) => text.match(/\bTOKEN_ALIAS\s*(?:=|:|is)\s*([A-Za-z0-9_.:-]+)/i)?.[1]?.trim() ?? null,
+          (text) => text.match(/token alias[^A-Za-z0-9]{0,8}([A-Za-z0-9_.:-]+)/i)?.[1]?.trim() ?? null,
+        ],
+      });
+    }
+    if (/(api base|api_base)/i.test(query)) {
+      slots.push({
+        id: "api_base",
+        label: "api base",
+        aliases: ["api base", "api_base"],
+        keyAliases: ["API_BASE"],
+        valueExtractors: [
+          (text) => text.match(/\bAPI_BASE\s*(?:=|:|is)\s*([A-Za-z0-9_.:/-]+)/i)?.[1]?.trim() ?? null,
+        ],
+      });
+    }
+    return slots;
+  }
+
+  private matchRawEvidence(
+    slot: {
+      aliases: string[];
+      keyAliases: string[];
+      valueExtractors: Array<(text: string) => string | null>;
+    },
+    messages: RawEvidencePacketMessage[],
+  ): Array<{
+    message: RawEvidencePacketMessage;
+    score: number;
+    value: string | null;
+    sourceLabel: string;
+  }> {
+    return messages
+      .map((message) => {
+        const text = message.content;
+        const lower = text.toLowerCase();
+        let score = 0;
+        for (const alias of slot.aliases) {
+          if (alias && lower.includes(alias.toLowerCase())) {
+            score += alias.length >= 8 ? 8 : 4;
+          }
+        }
+        for (const key of slot.keyAliases) {
+          if (text.includes(key)) {
+            score += 18;
+          }
+        }
+        let value: string | null = null;
+        for (const extractor of slot.valueExtractors) {
+          const hit = extractor(text);
+          if (hit) {
+            value = hit;
+            score += 22;
+            break;
+          }
+        }
+        if (message.sourceVerified) {
+          score += 5;
+        }
+        if (message.role === "user") {
+          score += 3;
+        }
+        if (message.isCenter) {
+          score += 2;
+        }
+        if (score <= 0) {
+          return null;
+        }
+        return {
+          message,
+          score,
+          value,
+          sourceLabel: message.sourceVerified ? "verified_raw" : "raw",
+        };
+      })
+      .filter((item): item is {
+        message: RawEvidencePacketMessage;
+        score: number;
+        value: string | null;
+        sourceLabel: string;
+      } => Boolean(item))
+      .sort((left, right) =>
+        right.score - left.score ||
+        Number(right.message.isCenter === true) - Number(left.message.isCenter === true) ||
+        right.message.turnNumber - left.message.turnNumber,
+      );
+  }
+
+  private matchSummaryEvidence(
+    slot: {
+      aliases: string[];
+      keyAliases: string[];
+      valueExtractors: Array<(text: string) => string | null>;
+    },
+    summaries: SummaryEvidencePacketItem[],
+  ): Array<{
+    summary: SummaryEvidencePacketItem;
+    score: number;
+    value: string | null;
+  }> {
+    return summaries
+      .map((summary) => {
+        const text = summary.summary;
+        const lower = text.toLowerCase();
+        let score = 0;
+        for (const alias of slot.aliases) {
+          if (alias && lower.includes(alias.toLowerCase())) {
+            score += alias.length >= 8 ? 5 : 3;
+          }
+        }
+        for (const key of slot.keyAliases) {
+          if (text.includes(key)) {
+            score += 10;
+          }
+        }
+        let value: string | null = null;
+        for (const extractor of slot.valueExtractors) {
+          const hit = extractor(text);
+          if (hit) {
+            value = hit;
+            score += 12;
+            break;
+          }
+        }
+        if (score <= 0) {
+          return null;
+        }
+        return { summary, score, value };
+      })
+      .filter((item): item is {
+        summary: SummaryEvidencePacketItem;
+        score: number;
+        value: string | null;
+      } => Boolean(item))
+      .sort((left, right) => right.score - left.score || (right.summary.startTurn ?? 0) - (left.summary.startTurn ?? 0));
+  }
+
+  private collectSlotConflicts(
+    slot: { label: string },
+    rawMatches: Array<{ value: string | null }>,
+    summaryMatches: Array<{ value: string | null }>,
+  ): string[] {
+    const values = [
+      ...rawMatches.map((match) => match.value).filter((value): value is string => Boolean(value)),
+      ...summaryMatches.map((match) => match.value).filter((value): value is string => Boolean(value)),
+    ];
+    const distinct = [...new Set(values.map((value) => value.trim()))];
+    if (distinct.length <= 1) {
+      return [];
+    }
+    return distinct.map((value) => `${slot.label}=${value}`);
   }
 
   private scoreRecallDisplayItem(item: ContextItem, query: string): number {

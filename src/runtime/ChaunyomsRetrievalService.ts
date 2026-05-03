@@ -18,6 +18,8 @@ import {
   MemoryItemEntry,
   ProgressiveRetrievalStepRecord,
   ProjectRecord,
+  RawMessage,
+  RawMessageRepository,
   RecallResult,
   RetrievalDecision,
   RetrievalStrength,
@@ -42,10 +44,12 @@ import {
   AtomEvidenceHealth,
   EvidenceGateResult,
   PlannerAuditContext,
+  RawEvidencePacketMessage,
   RecallLayer,
   RecallPresentationOptions,
   RecallTextDiagnostics,
   RetrievalBudgetPlan,
+  SummaryEvidencePacketItem,
   SemanticExpansionResult,
   ToolResponse,
 } from "./RetrievalServiceContracts";
@@ -407,6 +411,18 @@ export class ChaunyomsRetrievalService {
         (item.metadata?.evidenceAtom === true || typeof item.metadata?.atomId === "string") &&
         item.metadata?.persistentEvidenceAtom !== true,
       ).length;
+      const summaryEvidence = this.collectSummaryEvidencePacketItems(
+        summaryStore,
+        planned.items,
+        enhancedResult.sourceTrace,
+        scopedSessionId,
+      );
+      const rawEvidenceMessages = this.collectRawEvidencePacketMessages(
+        rawStore,
+        planned.items,
+        enhancedResult.sourceTrace,
+        scopedSessionId,
+      );
       const progressiveRetrievalSteps = this.retrievalAuditService.buildProgressiveRetrievalSteps({
         query,
         decision,
@@ -479,6 +495,8 @@ export class ChaunyomsRetrievalService {
             retrievalVerification,
             evidenceAnswer,
           },
+          summaryEvidence,
+          rawEvidenceMessages,
         }) }],
         details: {
           ok: true,
@@ -1896,6 +1914,102 @@ export class ChaunyomsRetrievalService {
     return grams;
   }
 
+  private collectSummaryEvidencePacketItems(
+    summaryStore: SummaryRepository,
+    items: ContextItem[],
+    sourceTrace: SourceTrace[],
+    sessionId?: string,
+  ): SummaryEvidencePacketItem[] {
+    const summaryIds = new Set<string>();
+    for (const item of items) {
+      if (typeof item.summaryId === "string" && item.summaryId.trim()) {
+        summaryIds.add(item.summaryId.trim());
+      }
+      if (typeof item.metadata?.sourceSummaryId === "string" && item.metadata.sourceSummaryId.trim()) {
+        summaryIds.add(item.metadata.sourceSummaryId.trim());
+      }
+    }
+    for (const trace of sourceTrace) {
+      if (typeof trace.summaryId === "string" && trace.summaryId.trim()) {
+        summaryIds.add(trace.summaryId.trim());
+      }
+    }
+    if (summaryIds.size === 0) {
+      return [];
+    }
+    const summaries = summaryStore.getActiveSummaries(sessionId ? { sessionId } : {});
+    return summaries
+      .filter((summary) => summaryIds.has(summary.id))
+      .sort((left, right) =>
+        (right.summaryLevel ?? 1) - (left.summaryLevel ?? 1) ||
+        right.createdAt.localeCompare(left.createdAt),
+      )
+      .map((summary) => ({
+        summaryId: summary.id,
+        summary: summary.summary,
+        summaryLevel: summary.summaryLevel,
+        nodeKind: summary.nodeKind,
+        startTurn: summary.startTurn,
+        endTurn: summary.endTurn,
+        sourceSummaryIds: summary.sourceSummaryIds,
+      }));
+  }
+
+  private collectRawEvidencePacketMessages(
+    rawStore: RawMessageRepository,
+    items: ContextItem[],
+    sourceTrace: SourceTrace[],
+    scopedSessionId?: string,
+  ): RawEvidencePacketMessage[] {
+    const centerIds = new Set<string>();
+    for (const item of items) {
+      if (typeof item.metadata?.messageId === "string" && item.metadata.messageId.trim()) {
+        centerIds.add(item.metadata.messageId.trim());
+      }
+    }
+    for (const trace of sourceTrace) {
+      for (const messageId of trace.messageIds ?? []) {
+        if (messageId.trim()) {
+          centerIds.add(messageId.trim());
+        }
+      }
+    }
+    if (centerIds.size === 0) {
+      return [];
+    }
+    const directMessages = rawStore.getByIds([...centerIds], scopedSessionId ? { sessionId: scopedSessionId } : {});
+    const byId = new Map<string, RawMessage>();
+    for (const message of directMessages) {
+      byId.set(message.id, message);
+    }
+    for (const message of directMessages) {
+      const startTurn = Math.max(1, message.turnNumber - 1);
+      const endTurn = message.turnNumber + 1;
+      for (const neighbor of rawStore.getByRange(startTurn, endTurn, { sessionId: message.sessionId })) {
+        if (!byId.has(neighbor.id)) {
+          byId.set(neighbor.id, neighbor);
+        }
+      }
+    }
+    return [...byId.values()]
+      .sort((left, right) =>
+        left.sessionId.localeCompare(right.sessionId) ||
+        left.turnNumber - right.turnNumber ||
+        (left.sequence ?? 0) - (right.sequence ?? 0),
+      )
+      .map((message) => ({
+        id: message.id,
+        sessionId: message.sessionId,
+        turnNumber: message.turnNumber,
+        role: message.role,
+        content: message.content,
+        sequence: message.sequence,
+        sourceSummaryId: typeof message.metadata?.sourceSummaryId === "string" ? message.metadata.sourceSummaryId : undefined,
+        sourceVerified: message.metadata?.sourceVerified === true,
+        isCenter: centerIds.has(message.id),
+      }));
+  }
+
   private buildBudgetAwareRecallItem(
     query: string,
     item: ContextItem,
@@ -1941,6 +2055,8 @@ export class ChaunyomsRetrievalService {
     },
     evidenceGate?: EvidenceGateResult,
     diagnostics: RecallTextDiagnostics = {},
+    summaryEvidence: SummaryEvidencePacketItem[] = [],
+    rawEvidenceMessages: RawEvidencePacketMessage[] = [],
   ): string {
     return this.getPresentationCompatService().formatRecallText({
       query,
@@ -1950,6 +2066,8 @@ export class ChaunyomsRetrievalService {
       presentation,
       evidenceGate,
       diagnostics,
+      summaryEvidence,
+      rawEvidenceMessages,
     });
   }
 

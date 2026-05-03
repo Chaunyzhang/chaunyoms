@@ -263,11 +263,12 @@ async function waitForTurnPersistence({
   throw new Error(`Timed out waiting for a stable persisted assistant reply for session key ${sessionKey}`);
 }
 
-async function runHarness() {
-  const token = await loadGatewayToken();
-  const tokenFile = path.join(os.tmpdir(), `openclaw-acp-token-${randomUUID().slice(0, 8)}.txt`);
-  await fs.writeFile(tokenFile, token, "utf8");
-  const turns = parseTurns(await fs.readFile(options.caseFile, "utf8"));
+function isRetryableAcpError(error) {
+  const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return /ACP connection closed|gateway closed before ready|gateway connect failed|tick timeout|Internal error/i.test(text);
+}
+
+async function startAcpBridge(tokenFile) {
   const agent = spawn(process.execPath, [
     OPENCLAW_ENTRY,
     "acp",
@@ -286,9 +287,9 @@ async function runHarness() {
   if (!agent.stdin || !agent.stdout) {
     throw new Error("Failed to start ACP bridge stdio");
   }
+
   const filteredStdout = createNdJsonFilter(transportNoise);
   agent.stdout.pipe(filteredStdout);
-
   const client = new ClientSideConnection(
     () => ({
       sessionUpdate: async (params) => {
@@ -310,6 +311,9 @@ async function runHarness() {
     ndJsonStream(Writable.toWeb(agent.stdin), Readable.toWeb(filteredStdout)),
   );
 
+  // Give the bridge a brief moment to finish gateway handshake before the
+  // first RPC. This reduces spurious "closed before ready" failures.
+  await delay(1200);
   await client.initialize({
     protocolVersion: PROTOCOL_VERSION,
     clientCapabilities: {
@@ -329,6 +333,45 @@ async function runHarness() {
     cwd: options.cwd,
     mcpServers: [],
   });
+
+  return { agent, client, sessionId };
+}
+
+async function runHarness() {
+  const token = await loadGatewayToken();
+  const tokenFile = path.join(os.tmpdir(), `openclaw-acp-token-${randomUUID().slice(0, 8)}.txt`);
+  await fs.writeFile(tokenFile, token, "utf8");
+  const turns = parseTurns(await fs.readFile(options.caseFile, "utf8"));
+  let agent = null;
+  let client = null;
+  let sessionId = null;
+  let startupError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const started = await startAcpBridge(tokenFile);
+      agent = started.agent;
+      client = started.client;
+      sessionId = started.sessionId;
+      startupError = null;
+      break;
+    } catch (error) {
+      startupError = error;
+      try {
+        agent?.kill();
+      } catch {}
+      agent = null;
+      client = null;
+      sessionId = null;
+      if (attempt >= 3 || !isRetryableAcpError(error)) {
+        throw error;
+      }
+      transportNoise.push(`acp_bridge_retry_attempt_${attempt}`);
+      await delay(2000 * attempt);
+    }
+  }
+  if (!agent || !client || !sessionId) {
+    throw startupError ?? new Error("Failed to start ACP bridge");
+  }
 
   const results = [];
   let persistedMessageCount = 0;

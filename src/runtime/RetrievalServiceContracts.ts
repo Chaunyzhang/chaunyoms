@@ -76,6 +76,28 @@ export interface RecallTextDiagnostics {
   evidenceAnswer?: EvidenceAnswerResolution;
 }
 
+export interface SummaryEvidencePacketItem {
+  summaryId: string;
+  summary: string;
+  summaryLevel?: number;
+  nodeKind?: string;
+  startTurn?: number;
+  endTurn?: number;
+  sourceSummaryIds?: string[];
+}
+
+export interface RawEvidencePacketMessage {
+  id: string;
+  sessionId: string;
+  turnNumber: number;
+  role: string;
+  content: string;
+  sequence?: number;
+  sourceSummaryId?: string;
+  sourceVerified?: boolean;
+  isCenter?: boolean;
+}
+
 export interface PlannerAuditContext {
   query: string;
   decision: RetrievalDecision;
@@ -119,6 +141,8 @@ export interface RecallTextArgs {
   presentation?: RecallPresentationOptions;
   evidenceGate?: EvidenceGateResult;
   diagnostics?: RecallTextDiagnostics;
+  summaryEvidence?: SummaryEvidencePacketItem[];
+  rawEvidenceMessages?: RawEvidencePacketMessage[];
 }
 
 export interface PersistentEvidenceMergeResultArgs {

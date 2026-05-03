@@ -175,6 +175,9 @@ async function main(): Promise<void> {
   assert(text.includes("Next action hint:"), "expected formatted recall text to expose next action hint");
   assert(text.includes("Retrieval budget:"), "expected formatted recall text to expose retrieval budget");
   assert(text.includes("persistent atoms=1, transient atoms=0"), "expected formatted recall text to expose atom storage shape");
+  assert(text.includes("## Evidence Packet"), "expected final-shape evidence packet header");
+  assert(text.includes("### Raw Source Messages"), "expected final-shape packet to expose raw source messages section");
+  assert(text.includes("### Summary Trail"), "expected final-shape packet to expose summary trail section");
 
   console.log("test-retrieval-evidence-gate-budget passed");
 }
