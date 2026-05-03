@@ -53,10 +53,6 @@ export class SummaryNavigationRecallResolver {
         items.push(atom);
       }
 
-      if (atomItems.length > 0) {
-        continue;
-      }
-
       const messages = this.expandAndPrioritizeMessages(
         rawStore,
         resolution,

@@ -92,10 +92,13 @@ function main(): void {
     { sessionId: "s-1" },
   );
 
-  assert(result.items.length === 1, `expected only the matching evidence atom, got ${result.items.length}`);
+  assert(result.items.length === 2, `expected the matching evidence atom plus raw source, got ${result.items.length}`);
   assert(result.items[0].metadata?.evidenceAtom === true, "expected evidence atom recall item");
   assert(result.items[0].metadata?.evidenceType === "constraint", "expected constraint atom");
   assert(String(result.items[0].content).includes("工具结果默认不作为长期记忆保存"), "expected constraint text");
+  assert(result.items[1].kind === "message", "expected summary-derived raw source message after evidence atom");
+  assert(result.items[1].metadata?.sourceSummaryId === summary.id, "expected raw source to retain summary provenance");
+  assert(String(result.items[1].content).includes("工具结果不需要任何保存"), "expected raw source text");
   assert(result.sourceTrace.length === 1 && result.sourceTrace[0].verified, "expected source trace to remain available");
 
   console.log("test-evidence-atom-summary-recall passed");

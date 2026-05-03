@@ -3407,6 +3407,12 @@ export class ChaunyomsRetrievalService {
           ...summaryItems.slice(0, summaryBudget),
         ].slice(0, presentation.maxItems)
       : summaryItems.slice(0, presentation.maxItems);
+    const evidenceHeading = messageItems.length > 0
+      ? [
+          "Selected evidence and nearby raw source windows:",
+          "",
+        ].join("\n")
+      : "";
     const localMatchText = localMatches.length > 0
       ? [
           "Top local source matches (prefer these over broad multi-dossier summaries):",
@@ -3423,7 +3429,7 @@ export class ChaunyomsRetrievalService {
             ? item.metadata?.persistentEvidenceAtom === true
               ? `[evidence atom ${item.metadata.atomId ?? "?"}]`
               : `[summary ${item.summaryId ?? "?"}]`
-            : `[turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}`;
+            : `[raw source${typeof item.metadata?.sourceSummaryId === "string" ? ` from summary ${item.metadata.sourceSummaryId}` : ""} turn ${(item.turnNumber as number | undefined) ?? "?"}] ${(item.role as string | undefined) ?? "user"}`;
           return `${label}: ${this.truncateText(String(item.content ?? ""), presentation.maxCharsPerItem)}`;
         },
       )
@@ -3451,6 +3457,7 @@ export class ChaunyomsRetrievalService {
       verifier,
       evidenceAnswer,
       localMatchText,
+      evidenceHeading,
       messages,
       omitted,
       traces,
