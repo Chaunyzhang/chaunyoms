@@ -122,10 +122,12 @@ async function main(): Promise<void> {
   );
 
   const summaryCount = result.items.filter((item) => typeof item.summaryId === "string").length;
+  const guidanceCount = result.items.filter((item) => item.metadata?.layer === "oms_recall_guidance").length;
   const recentCount = result.items.filter((item) => item.kind === "message").length;
 
-  assert(summaryCount >= 3, `expected soft budget borrowing to include more than the fixed summary slice, got ${summaryCount}`);
-  assert(recentCount === 1, "expected protected recent tail to remain selected while summaries borrow slack");
+  assert(summaryCount === 0, `expected summaries to stay out of default context, got ${summaryCount}`);
+  assert(guidanceCount === 1, "expected recall guidance to remain as the summary-map hint");
+  assert(recentCount === 1, "expected protected recent tail to remain selected while summaries stay as recall substrate");
   console.log("test-context-budget-borrowing passed");
 }
 

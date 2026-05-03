@@ -148,7 +148,7 @@ async function main(): Promise<void> {
 
     assert(counts?.rawMessages === 1, "only the natural user message should be a raw Source message");
 
-    assert(counts?.observations === 1, "tool output should be retained as an observation/runtime event");
+    assert(counts?.observations === 0, "tool output should not be retained in the runtime database");
 
     assert(statusConfig?.retrievalStrength === "high", "status should expose retrievalStrength as the single retrieval knob");
 

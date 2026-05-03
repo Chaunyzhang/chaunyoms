@@ -33,44 +33,69 @@ Do not use any other real OpenClaw test method.
 For QA-style questions, the allowed responsibilities are strictly split:
 
 - The sender harness sends one message and waits for the OpenClaw turn to end.
-- OpenClaw LLM is the driver. It decides to call OMS tools from the fresh
-  question conversation, reads the tool result, and produces the formal
-  user-visible answer.
-- OMS is only a tool/service provider. It may ingest, summarize, compact,
-  index, retrieve, expand, and return evidence, but it must not be treated as
-  the answerer or as a harness-side judge.
+- OpenClaw LLM is the final answerer. It reads the evidence placed in its
+  context or returned by an OMS tool, then produces the formal user-visible
+  answer.
+- OMS is the memory/context service before the LLM and the tool service during
+  the LLM turn. It may ingest, summarize, compact, index, retrieve, expand,
+  and return evidence, but it must not be treated as the answerer or as a
+  harness-side judge.
 - Codex inspects transcript/runtime evidence outside the harness and judges
   whether the flow and answer are correct.
-- The required retrieval path is:
-  `OpenClaw LLM calls OMS tool -> OMS follows summary/sourceRefs/source_edges
-  back to nearby raw source -> OMS returns raw evidence -> OpenClaw LLM answers`.
+- The required evidence path is:
+  `current question -> OMS activeQuery -> summary/sourceRefs/source_edges ->
+  nearby raw source -> OpenClaw LLM answers from raw evidence`.
 
-Automatic context assembly can still exist as an OpenClaw integration detail,
-but it is not the primary acceptance path for real summary-subsystem QA. A run
-passes only when the OpenClaw transcript shows the LLM itself used the OMS tool
-surface and then answered from the returned evidence.
+Automatic context assembly is a first-class OpenClaw integration path in this
+build. The host may call OMS before the LLM, OMS may use the current user
+question as `activeQuery`, and the LLM may answer from the resulting raw
+evidence without an explicit tool call. A tool call is still valid, but it is
+not required when runtime/context diagnostics show summary-derived raw evidence
+was injected before the model answered.
 
 For tests whose purpose is to validate the summary subsystem, this expectation
 is a hard acceptance criterion, not a preference:
 
 - The formal question must run with direct raw recall disabled
   (`forceDagOnlyRecall=true` / `disableDirectRawRecall=true`).
-- The OpenClaw transcript must show an OpenClaw LLM-initiated `memory_search`,
+- The OpenClaw transcript may show an OpenClaw LLM-initiated `memory_search`,
   `memory_retrieve`, `memory_get`, `oms_expand`, or equivalent OMS memory tool
-  call for the formal question.
-- The OMS tool result must show a summary route such as `summary_tree` /
-  `summary_tree_recall`, or an equivalent summary-derived source trace.
+  call, but this is optional when contextEngine evidence was injected.
+- Runtime/context diagnostics must show a summary route such as
+  `summary_raw_expand`, `summary_tree`, `summary_tree_recall`, or an equivalent
+  summary-derived source trace.
 - The evidence must trace from summary/sourceRefs/source_edges to raw source
-  messages near the answer-bearing turn.
+  messages near the answer-bearing turn, and the answer-bearing material must
+  be raw evidence rather than summary text.
 - `raw_exact_search`, message FTS, raw table scan hits, filesystem reads, or
   exec/search tools are not acceptable substitutes for summary-derived evidence
   in a summary-subsystem test.
-- If no summary path expands to nearby raw evidence returned by an OMS tool, the
-  test result is a retrieval-chain failure even when OpenClaw's final text
-  happens to match the expected answer.
-- Do not report answer accuracy for a summary-subsystem test unless transcript
-  and runtime evidence both show the OpenClaw LLM tool call chain and the OMS
-  summary-to-raw evidence path.
+- If no summary path expands to nearby raw evidence in either contextEngine
+  diagnostics or an OMS tool result, the test result is a retrieval-chain
+  failure even when OpenClaw's final text happens to match the expected answer.
+- Do not report answer accuracy for a summary-subsystem test unless runtime
+  evidence shows the OMS summary-to-raw evidence path.
+
+## Runtime Semantics
+
+Tool messages are not runtime facts. They must not enter the raw-message
+ledger, observation store, summaries, or long-term memory.
+
+Summaries are recall maps, not default answer context. Their purpose is to keep
+context bounded and to make source recovery more precise. When a summary is
+useful for a question, OMS must follow the summary/source trace back to nearby
+raw source and give the LLM raw evidence.
+
+Compaction does not mean re-processing already summarized text over and over.
+The hot context keeps recent turns and fixed system/navigation material. The
+middle of the conversation can be removed from visible context once raw has
+been stored and a source-bound summary exists. The original raw remains in
+SQLite, and the summary remains a map back to that raw.
+
+`activeQuery` is only the current-question trigger for context assembly. OMS
+uses it to decide whether the current turn needs source recall and which summary
+path to follow. `activeQuery` is not a memory fact, not an answer, and not a
+replacement for raw evidence.
 
 ## Message Rule
 

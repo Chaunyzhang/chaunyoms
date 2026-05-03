@@ -127,15 +127,7 @@ export class RuntimeMessageIngress {
     }
 
     if (message.role === "tool") {
-      if (this.isLowValueToolReceipt(normalizedText)) {
-        return this.skip("tool_receipt", normalizedText, "low_value_tool_receipt");
-      }
-      return this.keep(
-        "tool_output",
-        normalizedText,
-        "tool_output_runtime_event_not_source",
-        "observation",
-      );
+      return this.skip("tool_output", normalizedText, "tool_role_not_persisted");
     }
 
     if (message.role === "assistant") {

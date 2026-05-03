@@ -71,7 +71,7 @@ export class RuntimeIngressService {
 
     const existingMessages = rawStore
       .getAll()
-      .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "tool");
+      .filter((message) => message.role === "user" || message.role === "assistant");
     const existingSourceKeys = new Set(
       existingMessages
         .map((message) => {

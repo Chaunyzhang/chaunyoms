@@ -116,10 +116,10 @@ function main(): void {
     text: "stdout: config.json contains enableTools=false",
   });
 
-  assert(toolOutput.persist, "expected substantive tool output to be retained as a runtime event");
+  assert(!toolOutput.persist, "expected tool output to be dropped before database persistence");
   assert(toolOutput.classification === "tool_output", "expected dropped tool payload to keep tool_output classification");
-  assert(toolOutput.storageTarget === "observation", "expected tool payload to persist only as observation/runtime event");
-  assert(toolOutput.reason === "tool_output_runtime_event_not_source", "expected explicit runtime-event source-boundary reason");
+  assert(toolOutput.storageTarget === "drop", "expected tool payload not to enter raw or observation stores");
+  assert(toolOutput.reason === "tool_role_not_persisted", "expected explicit tool-drop reason");
 
   const assistantNoReply = ingress.inspect({
     sourceKey: "assistant-no-reply-1",

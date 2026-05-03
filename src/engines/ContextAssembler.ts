@@ -168,8 +168,8 @@ export class ContextAssembler {
       "[oms_recall_guidance]",
       "Compacted source messages and summaries exist in chaunyoms.",
       "OpenClaw LLM is the driver; ChaunyOMS is only the memory tool/service provider.",
-      "Default context only carries higher-level summaries; level-1 base summaries are retained out of context as recall substrate.",
-      "Use `memory_retrieve` as the primary recall entrypoint when the current higher-level summary is insufficient or old details appear missing.",
+      "Summaries are recall maps, not answer evidence and not default context.",
+      "Use `memory_retrieve` as the primary recall entrypoint when old details appear missing.",
       "Use `oms_expand`/`oms_trace` to descend from summary hits to level-1 base summaries and then source messages.",
       "Treat navigation/index hits as hints, not final facts.",
       "For exact constraints/parameters/quotes, continue recall to source messages.",
@@ -225,18 +225,10 @@ export class ContextAssembler {
         (recallGuidance?.tokenCount ?? 0) +
         this.sumTokens(memoryItems);
       const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
-      const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
-      const dynamicSummaryBudget = Math.max(
-        budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
-        0,
-      );
-      const summaries = options.includeSummaries === false
-        ? []
-        : this.summaryEntriesToItems(runtime.getSummaries(dynamicSummaryBudget, options.sessionId));
       const effectiveTailBudget = Math.min(
         configuredTailBudget,
         Math.max(
-          budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
+          budget.availableBudget - fixedPluginTokens - budget.reserveBudget,
           0,
         ),
       );
@@ -253,7 +245,6 @@ export class ContextAssembler {
       return {
         recallGuidance,
         memoryItems,
-        summaries,
         recentTail,
         queryRecallEvidence,
       };
@@ -261,7 +252,7 @@ export class ContextAssembler {
     if (!runtimeRead) {
       throw new Error("SQLite runtime assembly read unavailable");
     }
-    const { recallGuidance, memoryItems, summaries, recentTail, queryRecallEvidence } = runtimeRead;
+    const { recallGuidance, memoryItems, recentTail, queryRecallEvidence } = runtimeRead;
     const queryRawEvidence = this.queryRecallEvidenceToItems(queryRecallEvidence, budget.recallBudget);
     const queryRecallSource: ContextCandidateSource = options.forceDagOnlyRecall === true
       ? "summary_raw_expand"
@@ -272,7 +263,6 @@ export class ContextAssembler {
       ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
       ...this.tagCandidateSource(memoryItems, "active_memory"),
-      ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
     ], budget);
   }
@@ -390,18 +380,10 @@ export class ContextAssembler {
       (recallGuidance?.tokenCount ?? 0) +
       this.sumTokens(memoryItems);
     const configuredTailBudget = this.resolveRecentTailBudget(budget.availableBudget, freshTailTokens);
-    const protectedTailBudget = Math.min(budget.recentTailBudget, configuredTailBudget);
-    const dynamicSummaryBudget = Math.max(
-      budget.availableBudget - fixedPluginTokens - protectedTailBudget - budget.reserveBudget,
-      0,
-    );
-    const summaries = options.includeSummaries === false
-      ? []
-      : this.assembleSummaries(summaryStore, dynamicSummaryBudget, options.sessionId);
     const effectiveTailBudget = Math.min(
       configuredTailBudget,
       Math.max(
-        budget.availableBudget - fixedPluginTokens - this.sumTokens(summaries) - budget.reserveBudget,
+        budget.availableBudget - fixedPluginTokens - budget.reserveBudget,
         0,
       ),
     );
@@ -417,7 +399,6 @@ export class ContextAssembler {
       ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
       ...this.tagCandidateSource(memoryItems, "active_memory"),
-      ...this.tagCandidateSource(summaries, "summary_context"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
     ], budget);
   }
