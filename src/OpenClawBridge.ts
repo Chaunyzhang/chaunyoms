@@ -142,7 +142,7 @@ export class OpenClawBridge {
           info: {
             id,
             name: id === "oms" ? "OMS" : "Chaunyoms",
-            version: "1.0.1-beta",
+            version: "1.0.2-beta",
             ownsCompaction: true,
           },
           bootstrap: this.bootstrap.bind(this),
@@ -593,7 +593,7 @@ export class OpenClawBridge {
       pluginId: "oms",
       kind: "memory",
       name: "ChaunyOMS Memory",
-      version: "1.0.1-beta",
+      version: "1.0.2-beta",
       description:
         "Authoritative OpenClaw memory tool slot backed by ChaunyOMS SQLite MemoryItem/BaseSummary/Source data. OpenClaw LLM drives tool calls; OMS returns evidence only; Markdown is export-only.",
       ownsLongTermMemory: true,
