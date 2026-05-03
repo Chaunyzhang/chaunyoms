@@ -65,6 +65,18 @@ async function main(): Promise<void> {
         tokenCount: 6,
         compacted: true,
       },
+      {
+        id: "m-raw-only",
+        sessionId: "s-raw",
+        agentId: "agent-1",
+        role: "user",
+        content: "The raw-only launch phrase is amber falcon.",
+        turnNumber: 1,
+        sequence: 3,
+        createdAt: "2026-04-24T00:00:04.000Z",
+        tokenCount: 8,
+        compacted: false,
+      },
     ];
     const summaries: SummaryEntry[] = [{
       id: "summary-1",
@@ -119,6 +131,30 @@ async function main(): Promise<void> {
     assert(initialStatus.counts.memoryItems === 2, "SQLite runtime should materialize memoryItem/evidence inputs as MemoryItems");
     assert(initialStatus.ftsReady === true && initialStatus.ftsStatus === "ready", "FTS should be ready immediately after mirror because the runtime keeps the raw substrate write-through indexed");
     assert(store.grepMessages("15432", { sessionId: "s-1" }).length === 1, "grep should find raw source message");
+    const summaryOnlyRecall = store.withAssemblyRead((runtime) =>
+      runtime.getQueryRecallEvidence(
+        "What deployment port did I mention earlier?",
+        4,
+        "question-session",
+        { requireSummaryPath: true },
+      ),
+    );
+    assert(
+      summaryOnlyRecall?.rawHits.some((hit) => hit.message.id === "m-1" && hit.sourceKind === "summary"),
+      "summary-only recall should expand raw evidence only through matching summary source refs",
+    );
+    const rawOnlyRecall = store.withAssemblyRead((runtime) =>
+      runtime.getQueryRecallEvidence(
+        "What raw-only launch phrase did I mention earlier?",
+        4,
+        "question-session",
+        { requireSummaryPath: true },
+      ),
+    );
+    assert(
+      rawOnlyRecall?.rawHits.length === 0,
+      "summary-only recall must not fall back to direct raw FTS/scan when no summary matches",
+    );
     const ftsStatus = store.getStatus();
     assert(ftsStatus.ftsReady === true && ftsStatus.ftsStatus === "ready", "FTS should report ready after grep initializes it");
     assert(store.expand("summary", "summary-1").messages.length === 2, "expand should follow summary source edges to raw messages");

@@ -8,6 +8,9 @@ export type ContextCandidateSource =
   | "active_memory"
   | "reviewed_asset"
   | "summary_context"
+  // Auxiliary context-assembly fallback only. Real summary QA acceptance is
+  // judged from OpenClaw LLM tool calls to OMS, not from this candidate alone.
+  | "summary_raw_expand"
   | "raw_exact_search";
 
 export type ContextCandidateAuthority =
@@ -161,7 +164,7 @@ export class ContextPlanner {
     if (source === "reviewed_asset") {
       return "reviewed_asset";
     }
-    if (source === "raw_exact_search") {
+    if (source === "raw_exact_search" || source === "summary_raw_expand") {
       return "raw_evidence";
     }
     if (source === "summary_context") {
@@ -201,6 +204,8 @@ export class ContextPlanner {
         return 7;
       case "summary_context":
         return 5;
+      case "summary_raw_expand":
+        return 4;
       case "raw_exact_search":
         return 4;
       case "stable_prefix":

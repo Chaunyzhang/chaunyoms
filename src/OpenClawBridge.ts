@@ -542,8 +542,9 @@ export class OpenClawBridge {
       source: "chaunyoms",
       markdownHotPath: false,
       content: [
-        "ChaunyOMS owns this agent's durable memory and context substrate.",
-        "Use the OMS memory runtime/search/get surfaces for recall.",
+        "OpenClaw LLM is the driver; ChaunyOMS is only the memory tool/service provider.",
+        "When the user asks about earlier material, call the OMS memory runtime/search/get surfaces yourself.",
+        "OMS returns summary-derived raw evidence; OpenClaw LLM must decide and answer from that evidence.",
         "Do not read or write MEMORY.md, DREAMS.md, daily notes, or Obsidian Markdown as live memory facts.",
       ].join("\n"),
     });
@@ -594,7 +595,7 @@ export class OpenClawBridge {
       name: "ChaunyOMS Memory",
       version: "1.0.1-beta",
       description:
-        "Authoritative OpenClaw memory slot backed by ChaunyOMS SQLite MemoryItem/BaseSummary/Source data; Markdown is export-only.",
+        "Authoritative OpenClaw memory tool slot backed by ChaunyOMS SQLite MemoryItem/BaseSummary/Source data. OpenClaw LLM drives tool calls; OMS returns evidence only; Markdown is export-only.",
       ownsLongTermMemory: true,
       ownsCompaction: true,
       ownsMarkdownHotPath: false,
@@ -914,7 +915,7 @@ export class OpenClawBridge {
 
     register(
       "memory_retrieve",
-      "Primary ChaunyOMS retrieval entrypoint. Returns the best standard result from active memory, reviewed knowledge, or source-backed historical recall.",
+      "Primary OMS tool for OpenClaw LLM-driven recall. The LLM calls this, OMS follows memory/summary/sourceRefs/source_edges to raw evidence, and the LLM answers from the returned evidence.",
       {
         type: "object",
         properties: {
@@ -948,7 +949,7 @@ export class OpenClawBridge {
 
     register(
       "memory_search",
-      "OpenClaw-compatible memory search facade backed by ChaunyOMS MemoryItem/BaseSummary/Source retrieval. Does not read Markdown memory files.",
+      "OpenClaw-compatible OMS search facade. OpenClaw LLM calls it; OMS searches ChaunyOMS MemoryItem/BaseSummary/Source and returns evidence. It does not read Markdown memory files.",
       {
         type: "object",
         properties: {
@@ -970,7 +971,7 @@ export class OpenClawBridge {
 
     register(
       "memory_get",
-      "OpenClaw-compatible memory get facade. Resolves memory_id, summary_id, source/message id, trace id, or asset id through ChaunyOMS source edges.",
+      "OpenClaw-compatible OMS get/expand facade. Resolves memory_id, summary_id, source/message id, trace id, or asset id through ChaunyOMS source edges back to raw evidence for the LLM.",
       {
         type: "object",
         properties: {

@@ -27,6 +27,7 @@ interface AssembleOptions {
   includeMemoryItems?: boolean;
   activeQuery?: string;
   sessionId?: string;
+  forceDagOnlyRecall?: boolean;
 }
 
 const MIN_RECENT_TAIL_RATIO = 0.05;
@@ -166,6 +167,7 @@ export class ContextAssembler {
     const content = [
       "[oms_recall_guidance]",
       "Compacted source messages and summaries exist in chaunyoms.",
+      "OpenClaw LLM is the driver; ChaunyOMS is only the memory tool/service provider.",
       "Default context only carries higher-level summaries; level-1 base summaries are retained out of context as recall substrate.",
       "Use `memory_retrieve` as the primary recall entrypoint when the current higher-level summary is insufficient or old details appear missing.",
       "Use `oms_expand`/`oms_trace` to descend from summary hits to level-1 base summaries and then source messages.",
@@ -244,7 +246,9 @@ export class ContextAssembler {
         effectiveTailBudget,
       );
       const queryRecallEvidence = this.shouldForceRawRecallForQuery(options.activeQuery)
-        ? runtime.getQueryRecallEvidence(options.activeQuery ?? "", 4, options.sessionId)
+        ? runtime.getQueryRecallEvidence(options.activeQuery ?? "", 4, options.sessionId, {
+          requireSummaryPath: options.forceDagOnlyRecall === true,
+        })
         : { rawHits: [] };
       return {
         recallGuidance,
@@ -259,8 +263,11 @@ export class ContextAssembler {
     }
     const { recallGuidance, memoryItems, summaries, recentTail, queryRecallEvidence } = runtimeRead;
     const queryRawEvidence = this.queryRecallEvidenceToItems(queryRecallEvidence, budget.recallBudget);
+    const queryRecallSource: ContextCandidateSource = options.forceDagOnlyRecall === true
+      ? "summary_raw_expand"
+      : "raw_exact_search";
     return this.planAndStore([
-      ...this.tagCandidateSource(queryRawEvidence, "raw_exact_search"),
+      ...this.tagCandidateSource(queryRawEvidence, queryRecallSource),
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
       ...(recallGuidance ? this.tagCandidateSource([recallGuidance], "summary_context") : []),
@@ -311,6 +318,8 @@ export class ContextAssembler {
         metadata: {
           layer: "query_raw_recall",
           messageId: hit.message.id,
+          sourceKind: hit.sourceKind,
+          sourceId: hit.sourceId,
           sourceSessionId: hit.message.sessionId,
           turnNumber: hit.message.turnNumber,
           score: hit.score,
@@ -324,10 +333,12 @@ export class ContextAssembler {
   buildOpenClawRecallSystemItem(): ContextItem {
     const content = [
       "[ChaunyOMS recall policy]",
+      "OpenClaw LLM is the driver. OMS is only a memory tool/service provider and does not answer for you.",
       "If the answer is not directly present in visible context, do not guess and do not stop at 'not found'.",
       "First call memory_retrieve.",
       "If the answer is still unclear, call oms_grep using short keywords or exact phrases instead of repeating the full question.",
-      "If summary or source ids are returned, use oms_expand or oms_trace to reach raw source before answering an exact fact.",
+      "If summary or source ids are returned, use memory_get, oms_expand, or oms_trace to reach raw source before answering an exact fact.",
+      "Once OMS returns answer-bearing raw evidence, answer the user directly; do not switch to filesystem/exec/web tools for memory recall.",
     ].join("\n");
 
     return {

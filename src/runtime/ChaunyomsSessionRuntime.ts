@@ -564,6 +564,7 @@ export class ChaunyomsSessionRuntime {
       includeMemoryItems: !this.config.emergencyBrake && this.config.openClawRuntimeProfile !== "lightweight",
       activeQuery,
       sessionId: context.sessionId,
+      forceDagOnlyRecall: this.config.forceDagOnlyRecall,
     };
 
     try {

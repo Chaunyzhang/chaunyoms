@@ -33,11 +33,44 @@ Do not use any other real OpenClaw test method.
 For QA-style questions, the allowed responsibilities are strictly split:
 
 - The sender harness sends one message and waits for the OpenClaw turn to end.
-- OpenClaw produces the formal user-visible answer.
+- OpenClaw LLM is the driver. It decides to call OMS tools from the fresh
+  question conversation, reads the tool result, and produces the formal
+  user-visible answer.
+- OMS is only a tool/service provider. It may ingest, summarize, compact,
+  index, retrieve, expand, and return evidence, but it must not be treated as
+  the answerer or as a harness-side judge.
 - Codex inspects transcript/runtime evidence outside the harness and judges
   whether the flow and answer are correct.
-- The expected retrieval path is summary/memory/sourceRefs to nearby raw source
-  evidence, injected back into OpenClaw so the main model answers from evidence.
+- The required retrieval path is:
+  `OpenClaw LLM calls OMS tool -> OMS follows summary/sourceRefs/source_edges
+  back to nearby raw source -> OMS returns raw evidence -> OpenClaw LLM answers`.
+
+Automatic context assembly can still exist as an OpenClaw integration detail,
+but it is not the primary acceptance path for real summary-subsystem QA. A run
+passes only when the OpenClaw transcript shows the LLM itself used the OMS tool
+surface and then answered from the returned evidence.
+
+For tests whose purpose is to validate the summary subsystem, this expectation
+is a hard acceptance criterion, not a preference:
+
+- The formal question must run with direct raw recall disabled
+  (`forceDagOnlyRecall=true` / `disableDirectRawRecall=true`).
+- The OpenClaw transcript must show an OpenClaw LLM-initiated `memory_search`,
+  `memory_retrieve`, `memory_get`, `oms_expand`, or equivalent OMS memory tool
+  call for the formal question.
+- The OMS tool result must show a summary route such as `summary_tree` /
+  `summary_tree_recall`, or an equivalent summary-derived source trace.
+- The evidence must trace from summary/sourceRefs/source_edges to raw source
+  messages near the answer-bearing turn.
+- `raw_exact_search`, message FTS, raw table scan hits, filesystem reads, or
+  exec/search tools are not acceptable substitutes for summary-derived evidence
+  in a summary-subsystem test.
+- If no summary path expands to nearby raw evidence returned by an OMS tool, the
+  test result is a retrieval-chain failure even when OpenClaw's final text
+  happens to match the expected answer.
+- Do not report answer accuracy for a summary-subsystem test unless transcript
+  and runtime evidence both show the OpenClaw LLM tool call chain and the OMS
+  summary-to-raw evidence path.
 
 ## Message Rule
 

@@ -262,10 +262,20 @@ export interface OmsGrepHit {
   before: RawMessage[];
   after: RawMessage[];
   score: number;
+  sourceKind?: "memory_item" | "summary" | "raw";
+  sourceId?: string;
 }
 
 export interface RuntimeQueryRecallEvidence {
   rawHits: OmsGrepHit[];
+}
+
+export interface RuntimeQueryRecallOptions {
+  // Summary-subsystem tests require the same substrate the OMS tools use:
+  // summary/sourceRefs/source_edges must lead to raw messages. Direct raw
+  // shortcuts are disabled so OpenClaw LLM-driven tool calls can be judged
+  // against the summary -> raw contract instead of lucky exact search.
+  requireSummaryPath?: boolean;
 }
 
 export interface OmsTraceEdge {
@@ -310,7 +320,12 @@ export interface RuntimeAssemblyReader {
   getCompactedMessageIds(messageIds: string[], sessionId?: string): Set<string>;
   getSummaries(budget: number, sessionId?: string): SummaryEntry[];
   getRecentTailByTokens(tokenBudget: number, maxTurns: number, sessionId?: string): RawMessage[];
-  getQueryRecallEvidence(query: string, limit?: number, currentSessionId?: string): RuntimeQueryRecallEvidence;
+  getQueryRecallEvidence(
+    query: string,
+    limit?: number,
+    currentSessionId?: string,
+    options?: RuntimeQueryRecallOptions,
+  ): RuntimeQueryRecallEvidence;
 }
 
 interface RuntimeDatabaseModule {
@@ -541,8 +556,8 @@ export class SQLiteRuntimeStore {
         getSummaries: (budget, sessionId) => this.readAssemblySummaries(budget, sessionId),
         getRecentTailByTokens: (tokenBudget, maxTurns, sessionId) =>
           this.readAssemblyRecentTailByTokens(tokenBudget, maxTurns, sessionId),
-        getQueryRecallEvidence: (query, limit, currentSessionId) =>
-          this.readAssemblyQueryRecallEvidence(query, limit, currentSessionId),
+        getQueryRecallEvidence: (query, limit, currentSessionId, options) =>
+          this.readAssemblyQueryRecallEvidence(query, limit, currentSessionId, options),
       });
     } finally {
       this.closeDatabase();
@@ -594,6 +609,7 @@ export class SQLiteRuntimeStore {
     query: string,
     limit = 3,
     currentSessionId?: string,
+    options: RuntimeQueryRecallOptions = {},
   ): RuntimeQueryRecallEvidence {
     if (!this.db) {
       return { rawHits: [] };
@@ -605,20 +621,33 @@ export class SQLiteRuntimeStore {
     const recallTerms = this.distinctiveRecallTerms(terms);
     const normalizedLimit = Math.max(Math.min(limit, 12), 1);
     const normalizedQuery = this.normalizeRecallQuestion(query);
-    const ftsScored = this.searchMessagesFts(recallTerms.join(" "), recallTerms, undefined, normalizedLimit * 4)
-      .filter((item) => this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId));
-    const scanScored = (this.db.prepare(`
-      SELECT * FROM messages
-      ORDER BY sequence ASC, turn_number ASC, created_at ASC
-    `).all() ?? [])
-      .map((row) => ({ message: this.rowToMessage(row), score: this.scoreText(String(row.content ?? ""), recallTerms) }))
-      .filter((item) => item.score > 0 && this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId));
-    const byId = new Map<string, { message: RawMessage; score: number }>();
-    const sourceExpanded = [
-      ...this.queryMemorySourceMessages(recallTerms, normalizedQuery, currentSessionId),
-      ...this.querySummarySourceMessages(recallTerms, normalizedQuery, currentSessionId),
-    ];
-    for (const item of [...sourceExpanded, ...ftsScored, ...scanScored]) {
+    const byId = new Map<string, {
+      message: RawMessage;
+      score: number;
+      sourceKind?: "memory_item" | "summary" | "raw";
+      sourceId?: string;
+    }>();
+    const sourceExpanded = options.requireSummaryPath
+      ? this.querySummarySourceMessages(recallTerms, normalizedQuery, currentSessionId)
+      : [
+        ...this.queryMemorySourceMessages(recallTerms, normalizedQuery, currentSessionId),
+        ...this.querySummarySourceMessages(recallTerms, normalizedQuery, currentSessionId),
+        ...this.searchMessagesFts(recallTerms.join(" "), recallTerms, undefined, normalizedLimit * 4)
+          .filter((item) => this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId))
+          .map((item) => ({ ...item, sourceKind: "raw" as const, sourceId: item.message.id })),
+        ...(this.db.prepare(`
+          SELECT * FROM messages
+          ORDER BY sequence ASC, turn_number ASC, created_at ASC
+        `).all() ?? [])
+          .map((row) => ({
+            message: this.rowToMessage(row),
+            score: this.scoreText(String(row.content ?? ""), recallTerms),
+            sourceKind: "raw" as const,
+            sourceId: String(row.id ?? ""),
+          }))
+          .filter((item) => item.score > 0 && this.isRecallEvidenceMessage(item.message, normalizedQuery, currentSessionId)),
+      ];
+    for (const item of sourceExpanded) {
       const existing = byId.get(item.message.id);
       if (!existing || item.score > existing.score) {
         byId.set(item.message.id, item);
@@ -630,6 +659,8 @@ export class SQLiteRuntimeStore {
       .map((item) => ({
         message: item.message,
         score: item.score,
+        sourceKind: item.sourceKind,
+        sourceId: item.sourceId,
         before: this.getMessagesByTurnWindow(item.message.sessionId, item.message.turnNumber - 1, item.message.turnNumber - 1),
         after: this.getMessagesByTurnWindow(item.message.sessionId, item.message.turnNumber + 1, item.message.turnNumber + 1),
     }));
@@ -640,7 +671,7 @@ export class SQLiteRuntimeStore {
     terms: string[],
     normalizedQuery: string,
     currentSessionId?: string,
-  ): Array<{ message: RawMessage; score: number }> {
+  ): Array<{ message: RawMessage; score: number; sourceKind: "memory_item"; sourceId: string }> {
     if (!this.db) {
       return [];
     }
@@ -651,7 +682,7 @@ export class SQLiteRuntimeStore {
       ORDER BY priority ASC, updated_at DESC, created_at DESC
       LIMIT 250
     `).all() ?? [];
-    const scored: Array<{ message: RawMessage; score: number }> = [];
+    const scored: Array<{ message: RawMessage; score: number; sourceKind: "memory_item"; sourceId: string }> = [];
     for (const row of rows) {
       const item = this.normalizeMemoryItemEntry(this.parseObject(row.payload_json) as unknown as MemoryItemEntry);
       const searchable = [
@@ -676,6 +707,8 @@ export class SQLiteRuntimeStore {
         scored.push({
           message,
           score: 1000 + memoryScore + this.scoreText(message.content, terms),
+          sourceKind: "memory_item",
+          sourceId: item.id,
         });
       }
     }
@@ -686,7 +719,7 @@ export class SQLiteRuntimeStore {
     terms: string[],
     normalizedQuery: string,
     currentSessionId?: string,
-  ): Array<{ message: RawMessage; score: number }> {
+  ): Array<{ message: RawMessage; score: number; sourceKind: "summary"; sourceId: string }> {
     if (!this.db) {
       return [];
     }
@@ -696,7 +729,7 @@ export class SQLiteRuntimeStore {
       ORDER BY end_turn DESC, start_turn DESC
       LIMIT 250
     `).all() ?? [];
-    const scored: Array<{ message: RawMessage; score: number }> = [];
+    const scored: Array<{ message: RawMessage; score: number; sourceKind: "summary"; sourceId: string }> = [];
     for (const row of rows) {
       const summary = this.parseObject(row.payload_json) as unknown as SummaryEntry;
       const searchable = [
@@ -726,6 +759,8 @@ export class SQLiteRuntimeStore {
         scored.push({
           message,
           score: 800 + summaryScore + this.scoreText(message.content, terms),
+          sourceKind: "summary",
+          sourceId: summary.id,
         });
       }
     }

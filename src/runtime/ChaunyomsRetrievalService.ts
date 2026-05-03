@@ -1498,6 +1498,12 @@ export class ChaunyomsRetrievalService {
       retrievalHitType: this.getRetrievalHitType(decision),
       matchedProjectId: decision.matchedProjectId ?? null,
       matchedProjectTitle: decision.matchedProjectTitle ?? null,
+      driverContract: {
+        driver: "openclaw_llm",
+        serviceProvider: "chaunyoms_oms",
+        requiredFlow: "openclaw_llm_tool_call -> oms_summary_to_raw_recall -> oms_returns_raw_evidence -> openclaw_llm_answers",
+        omsAnswersForLlm: false,
+      },
       shouldAutoRecall: this.shouldAutoRecall(decision, context),
       autoRecallReason: this.explainAutoRecall(decision, context),
       promptForApi,
@@ -3380,6 +3386,14 @@ export class ChaunyomsRetrievalService {
           "",
         ].filter((line) => line.length > 0).join("\n")
       : "";
+    const driverNote = [
+      "Driver contract:",
+      "- OpenClaw LLM called this OMS tool; OMS only provides retrieval/expansion service.",
+      "- If the evidence gate says answer and the raw/source lines contain the answer, answer the user now from this evidence.",
+      "- If the gate says trace_raw or expand_l1, call memory_get, oms_expand, or oms_trace on the listed target ids.",
+      "- Do not use filesystem, exec, web, or Markdown files as substitutes for OMS memory evidence.",
+      "",
+    ].join("\n");
     const summaryItems = items.filter((item) => item.kind === "summary");
     const messageItems = items
       .filter((item) => item.kind !== "summary")
@@ -3432,6 +3446,7 @@ export class ChaunyomsRetrievalService {
       "",
       answers,
       gate,
+      driverNote,
       budget,
       verifier,
       evidenceAnswer,
@@ -4015,6 +4030,12 @@ export class ChaunyomsRetrievalService {
       ...result,
       details: {
         ...result.details,
+        driverContract: {
+          driver: "openclaw_llm",
+          serviceProvider: "chaunyoms_oms",
+          requiredFlow: "openclaw_llm_tool_call -> oms_summary_to_raw_recall -> oms_returns_raw_evidence -> openclaw_llm_answers",
+          omsAnswersForLlm: false,
+        },
         toolCompatibility: {
           openClawTool,
           canonicalTool,
