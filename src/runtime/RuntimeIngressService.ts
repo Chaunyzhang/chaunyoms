@@ -134,18 +134,23 @@ export class RuntimeIngressService {
   resolveActiveUserQuery(
     rawStore: RawMessageRepository,
     runtimeMessages: RuntimeMessageSnapshot[],
+    sessionId?: string,
   ): string | undefined {
+    const messages = rawStore.getAll();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.role === "user" &&
+        (!sessionId || message.sessionId === sessionId) &&
+        message.content.trim().length > 0
+      ) {
+        return message.content.trim();
+      }
+    }
     for (let index = runtimeMessages.length - 1; index >= 0; index -= 1) {
       const message = runtimeMessages[index];
       if (message.role === "user" && message.text.trim().length > 0) {
         return message.text.trim();
-      }
-    }
-    const messages = rawStore.getAll();
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role === "user" && message.content.trim().length > 0) {
-        return message.content.trim();
       }
     }
     return undefined;

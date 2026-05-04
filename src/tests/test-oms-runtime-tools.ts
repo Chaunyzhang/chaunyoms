@@ -197,6 +197,45 @@ async function main(): Promise<void> {
 
     await bridge.assemble({ sessionId: "tools-session-2", config: { ...config, sessionId: "tools-session-2" } });
 
+    const formalQuestionSessionId = "tools-formal-question-session";
+    await bridge.ingest({
+
+      sessionId: formalQuestionSessionId,
+
+      config: { ...config, sessionId: formalQuestionSessionId },
+
+      id: "tool-formal-question",
+
+      role: "user",
+
+      content: [
+        "Answer this LOCOMO memory question from OMS-recalled raw evidence.",
+        "Before answering, call the OpenClaw OMS memory plugin/tool to search historical evidence.",
+        "",
+        "Question: What did Caroline research?",
+      ].join("\n"),
+
+      turnNumber: 1,
+
+    });
+
+    await bridge.assemble({ sessionId: formalQuestionSessionId, config: { ...config, sessionId: formalQuestionSessionId } });
+
+    const canonicalSearch = await tools.get("memory_search")?.execute("tool-canonical-query", {
+
+      sessionId: formalQuestionSessionId,
+
+      config: { ...config, sessionId: formalQuestionSessionId },
+
+      q: "Caroline researched LGBTQ art project",
+
+    }) as { details?: Record<string, unknown> } | undefined;
+
+    assert(canonicalSearch?.details?.query === "What did Caroline research?", `OpenClaw memory_search should use the exact formal Question line instead of a rewritten keyword query, got ${String(canonicalSearch?.details?.query)}`);
+    assert(canonicalSearch?.details?.originalToolQuery === "Caroline researched LGBTQ art project", "memory_search diagnostics should preserve the model-provided rewritten query");
+    assert(canonicalSearch?.details?.canonicalQuerySource === "current_formal_question", "memory_search diagnostics should show current formal question override");
+    assert(canonicalSearch?.details?.toolQueryOverridden === true, "memory_search should mark rewritten tool query overrides");
+
 
 
     const grep = await tools.get("oms_grep")?.execute("tool-1", {
@@ -263,7 +302,7 @@ async function main(): Promise<void> {
 
     assert(replayAgent?.details?.scope === "agent", "oms_replay should default to agent scope");
 
-    assert(replayAgent?.details?.messageCount === 2, "agent-scoped oms_replay should replay both sessions for the agent");
+    assert(replayAgent?.details?.messageCount === 3, "agent-scoped oms_replay should replay material and formal-question sessions for the agent");
 
 
 
@@ -281,7 +320,7 @@ async function main(): Promise<void> {
 
     assert(status?.details?.scope === "agent", "oms_status should default to agent scope");
 
-    assert(statusCounts?.rawMessages === 2, "agent-scoped oms_status should report agent-wide raw message count");
+    assert(statusCounts?.rawMessages === 3, "agent-scoped oms_status should report agent-wide raw message count including the formal question session");
 
     assert(compatibility?.mode === "advisory", "oms_status should expose OpenClaw compatibility contract state");
 
@@ -537,7 +576,7 @@ async function main(): Promise<void> {
 
     }) as { details?: Record<string, unknown> } | undefined;
 
-    assert(remainingAgentReplay?.details?.messageCount === 1, "session wipe should preserve other sessions on the same agent");
+    assert(remainingAgentReplay?.details?.messageCount === 2, "session wipe should preserve other material/formal sessions on the same agent");
 
 
 
@@ -568,7 +607,6 @@ async function main(): Promise<void> {
     assert(tools.has("oms_brainpack_status"), "oms_brainpack_status should be registered");
     assert(tools.has("oms_native_policy_status"), "oms_native_policy_status should be registered");
     assert(tools.has("oms_native_absorb"), "oms_native_absorb should be registered");
-    assert(tools.has("oms_benchmark_report"), "oms_benchmark_report should be registered");
     assert(tools.has("oms_recall_feedback"), "oms_recall_feedback should be registered");
     assert(tools.has("oms_setup_guide"), "oms_setup_guide should be registered");
 
@@ -596,27 +634,9 @@ async function main(): Promise<void> {
 
     assert(tools.has("oms_asset_verify"), "oms_asset_verify should be registered");
 
-    assert(tools.has("oms_test_start"), "oms_test_start should be registered");
-
-    assert(tools.has("oms_test_status"), "oms_test_status should be registered");
-
-    assert(tools.has("oms_test_result"), "oms_test_result should be registered");
-
-    assert(tools.has("oms_test_list"), "oms_test_list should be registered");
-
-    assert(tools.has("oms_test_cancel"), "oms_test_cancel should be registered");
-
-    assert(tools.has("qa_start"), "qa_start should be registered");
-
-    assert(tools.has("qa_status"), "qa_status should be registered");
-
-    assert(tools.has("qa_report"), "qa_report should be registered");
-
-    assert(tools.has("qa_runs"), "qa_runs should be registered");
-
-    assert(tools.has("qa_cancel"), "qa_cancel should be registered");
-
-    assert(tools.has("qa"), "qa should be registered");
+    assert(!tools.has("oms_test_start"), "legacy background QA tools must not be registered");
+    assert(!tools.has("qa_start"), "legacy QA aliases must not be registered");
+    assert(!tools.has("qa"), "unified legacy QA shortcut must not be registered");
 
     assert(tools.has("memory_retrieve"), "memory_retrieve should remain the primary retrieval entrypoint");
 
@@ -756,16 +776,7 @@ async function main(): Promise<void> {
     assert(nativeAbsorb?.details?.absorbed === true, "oms_native_absorb should route absorbed native output into OMS candidate flow");
     assert(nativeAbsorb?.details?.becomesMemoryItem === false, "native absorb tool must not directly create MemoryItem authority");
 
-    const benchmarkReport = await tools.get("oms_benchmark_report")?.execute("benchmark-report", {
-      sessionId: config.sessionId,
-      config,
-      suite: "locomo-small",
-      scope: "development_sample",
-      systems: ["chaunyoms"],
-      metrics: { accuracy: 0.75 },
-    }) as { details?: Record<string, unknown> } | undefined;
-    assert(benchmarkReport?.details?.claimLevel === "regression_only", "oms_benchmark_report should guard development samples as regression-only");
-    assert(benchmarkReport?.details?.publicComparableAllowed === false, "development sample reports must not be public-comparable");
+    assert(!tools.has("oms_benchmark_report"), "benchmark report tool must not be registered");
   } finally {
     await rm(dir, { recursive: true, force: true });
 

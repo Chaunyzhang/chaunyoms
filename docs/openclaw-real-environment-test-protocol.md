@@ -58,6 +58,11 @@ is a hard acceptance criterion, not a preference:
 
 - The formal question must run with direct raw recall disabled
   (`forceDagOnlyRecall=true` / `disableDirectRawRecall=true`).
+- The formal question text must explicitly instruct OpenClaw to call the OMS
+  memory plugin/tool to search historical evidence before answering.
+- That instruction must say the tool query is exactly the full `Question:` or
+  `User question:` text. OpenClaw must not rewrite the question into keywords or
+  add guessed terms.
 - The OpenClaw transcript may show an OpenClaw LLM-initiated `memory_search`,
   `memory_retrieve`, `memory_get`, `oms_expand`, or equivalent OMS memory tool
   call, but this is optional when contextEngine evidence was injected.
@@ -75,6 +80,24 @@ is a hard acceptance criterion, not a preference:
   failure even when OpenClaw's final text happens to match the expected answer.
 - Do not report answer accuracy for a summary-subsystem test unless runtime
   evidence shows the OMS summary-to-raw evidence path.
+
+Strict evidence delivery must be visible in diagnostics. A valid formal answer
+run must show all of these fields from contextEngine assembly or the OMS tool
+result that fed OpenClaw:
+
+- `deliveredToOpenClaw=true`
+- `selectedRawSourceCount>0`
+- `evidencePacketId` is non-empty
+- `rawExcerptHash` is non-empty
+- for summary-subsystem tests, `summaryDerivedRawSourceCount>0` or
+  `sourceSummaryIds` is non-empty
+
+`sourceTrace.verified=true` alone is not enough. It only proves a possible path
+exists. The delivery receipt proves answer-bearing raw excerpts were actually
+selected into the OpenClaw model context or returned in the OMS tool output for
+that question turn. If strict summary recall cannot produce such a receipt, OMS
+must fail closed with `evidence_delivery_blocked` instead of presenting summary
+text, atoms, or trace metadata as answer evidence.
 
 ## Runtime Semantics
 

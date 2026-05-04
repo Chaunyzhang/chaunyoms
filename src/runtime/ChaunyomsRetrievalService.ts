@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { ContextPlanner, ContextPlannerResult } from "../engines/ContextPlanner";
 import { LLMPlanner } from "../planner/LLMPlanner";
 import { PlanValidator } from "../planner/PlanValidator";
@@ -5,7 +7,6 @@ import { RetrievalRuntime } from "../retrieval/RetrievalRuntime";
 import { DeterministicReranker, RerankAudit, RetrievalEnhancementRegistry } from "../retrieval/RetrievalEnhancementProviders";
 import { BrainPackExporter, BrainPackSnapshotReason } from "../brainpack/BrainPackExporter";
 import { BrainPackScheduler } from "../brainpack/BrainPackScheduler";
-import { BenchmarkComparisonGuard } from "../evals/benchmark-comparison";
 import { MemoryOperationCreator } from "../memory/MemoryOperation";
 import { OpenClawNativeAbsorber } from "../native/OpenClawNativeAbsorber";
 import { RetrievalVerifier, RetrievalVerificationResult } from "../retrieval/RetrievalVerifier";
@@ -24,6 +25,7 @@ import {
   ProgressiveRetrievalStepRecord,
   ProjectRecord,
   RecallResult,
+  RawMessageRepository,
   RetrievalDecision,
   RetrievalStrength,
   SemanticCandidate,
@@ -104,6 +106,27 @@ interface RecallTextDiagnostics {
   transientEvidenceAtomHitCount?: number;
   retrievalVerification?: RetrievalVerificationResult;
   evidenceAnswer?: EvidenceAnswerResolution;
+  evidenceDelivery?: RetrievalEvidenceDeliveryReceipt;
+}
+
+interface RetrievalEvidenceDeliveryReceipt {
+  status: "delivered" | "blocked";
+  deliveredToOpenClaw: boolean;
+  evidencePacketId: string | null;
+  selectedRawSourceCount: number;
+  summaryDerivedRawSourceCount: number;
+  rawMessageIds: string[];
+  sourceSummaryIds: string[];
+  rawExcerptHash: string | null;
+  rawExcerptPreview: string[];
+  reason: string;
+}
+
+interface ToolQueryResolution {
+  query: string;
+  originalToolQuery: string;
+  canonicalQuerySource: "tool_query" | "current_formal_question";
+  toolQueryOverridden: boolean;
 }
 
 interface PlannerAuditContext {
@@ -150,7 +173,8 @@ export class ChaunyomsRetrievalService {
     const stores = await this.runtime.getSessionStores(context);
     const runtimeStore = await this.runtime.getRuntimeStore(context);
     const query = this.getQuery(args);
-    const scope = this.getScopeArg(args);
+    const requestedScope = this.getScopeArg(args);
+    const scope = this.resolveRecallScope(requestedScope, context);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
     const recallSearchQueries = this.buildRecallSearchQueries(query);
@@ -209,7 +233,11 @@ export class ChaunyomsRetrievalService {
         retrievalStrength,
       },
     };
-    const query = this.getQuery(args);
+    const stores = await this.runtime.getSessionStores(context);
+    const { rawStore, summaryStore, projectStore } = stores;
+    const runtimeStore = await this.runtime.getRuntimeStore(context);
+    const queryResolution = this.resolveToolQuery(args, context, rawStore, runtimeStore);
+    const query = queryResolution.query;
     if (!query) {
       return this.buildMissingQueryResponse("memory_retrieve");
     }
@@ -230,6 +258,9 @@ export class ChaunyomsRetrievalService {
           ...(this.isRecord(direct.details) ? direct.details : {}),
           ok: true,
           query,
+          originalToolQuery: queryResolution.originalToolQuery,
+          canonicalQuerySource: queryResolution.canonicalQuerySource,
+          toolQueryOverridden: queryResolution.toolQueryOverridden,
           retrievalHitType: "raw_exact_search",
           recallStrategy: "lossless_direct_grep",
           losslessFastPath: true,
@@ -239,9 +270,8 @@ export class ChaunyomsRetrievalService {
       };
     }
 
-    const stores = await this.runtime.getSessionStores(context);
-    const { rawStore, summaryStore, projectStore } = stores;
-    const scope = this.getScopeArg(args);
+    const requestedScope = this.getScopeArg(args);
+    const scope = this.resolveRecallScope(requestedScope, context);
     const scopedSessionId = scope === "session" ? context.sessionId : undefined;
     const { decision } = await this.resolveRetrievalDecision(query, context);
     const recallSearchQueries = this.buildRecallSearchQueries(query);
@@ -259,7 +289,6 @@ export class ChaunyomsRetrievalService {
     }
     const activeProjects = projectStore.getAll().filter((project) => project.status !== "archived");
     const matchedProject = this.matchProject(query, activeProjects);
-    const runtimeStore = await this.runtime.getRuntimeStore(context);
     const shouldProbeMemoryItems = decision.route === "memory_item" ||
       ((decision.requiresSourceRecall || decision.route === "summary_tree") &&
         (!context.config.autoRecallEnabled || context.config.emergencyBrake));
@@ -334,6 +363,9 @@ export class ChaunyomsRetrievalService {
           explanation: decision.explanation,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
+          originalToolQuery: queryResolution.originalToolQuery,
+          canonicalQuerySource: queryResolution.canonicalQuerySource,
+          toolQueryOverridden: queryResolution.toolQueryOverridden,
           hitCount: memoryItemHits.length,
           memoryItemHitCount: memoryItemHits.length,
           topRecordType: "memory_item",
@@ -416,6 +448,10 @@ export class ChaunyomsRetrievalService {
       const planned = await this.planRecallItems(query, enhancedResult, retrievalBudget, context.config, decision);
       timings.planMs = Date.now() - planStartedAt;
       const evidenceGate = this.evaluateEvidenceGate(query, planned.items, enhancedResult);
+      const evidenceDelivery = this.buildRetrievalEvidenceDeliveryReceipt(
+        planned.items,
+        context.config.forceDagOnlyRecall === true || dagOnlyRecall || this.isHardSourceTraceRequired(context),
+      );
       const retrievalVerification = this.retrievalVerifier.verify({
         retrievalStrength,
         items: planned.items,
@@ -455,8 +491,12 @@ export class ChaunyomsRetrievalService {
         rerankAudit: planned.rerankAudit,
         timings,
       });
+      timings.totalMs = Date.now() - startedAt;
       await this.runtime.recordRetrievalPlan(context, "memory_retrieve", planned.plan, recallBudget, {
         query,
+        originalToolQuery: queryResolution.originalToolQuery,
+        canonicalQuerySource: queryResolution.canonicalQuerySource,
+        toolQueryOverridden: queryResolution.toolQueryOverridden,
         route: decision.route,
         retrievalStrength,
         usageFeedbackEnabled: context.config.usageFeedbackEnabled,
@@ -470,11 +510,19 @@ export class ChaunyomsRetrievalService {
         retrievalVerification,
         evidenceAnswer,
         evidenceGate,
+        evidenceDelivery,
+        deliveredToOpenClaw: evidenceDelivery.deliveredToOpenClaw,
+        evidencePacketId: evidenceDelivery.evidencePacketId,
+        selectedRawSourceCount: evidenceDelivery.selectedRawSourceCount,
+        summaryDerivedRawSourceCount: evidenceDelivery.summaryDerivedRawSourceCount,
+        rawExcerptHash: evidenceDelivery.rawExcerptHash,
+        rawMessageIds: evidenceDelivery.rawMessageIds,
+        sourceSummaryIds: evidenceDelivery.sourceSummaryIds,
         progressiveRetrievalSteps,
         rerankAudit: planned.rerankAudit,
+        timings,
       });
       const presentation = this.resolveRecallPresentationOptions(args, context.config.retrievalStrength);
-      timings.totalMs = Date.now() - startedAt;
       if (this.isRetrievalVerifierBlocked(retrievalVerification)) {
         return this.attachDiagnostics(
           this.buildRetrievalVerifierBlockedResponse(
@@ -496,6 +544,27 @@ export class ChaunyomsRetrievalService {
           semanticExpansion,
         );
       }
+      if (this.isEvidenceDeliveryBlocked(evidenceDelivery)) {
+        return this.attachDiagnostics(
+          this.buildEvidenceDeliveryBlockedResponse(
+            query,
+            decision,
+            enhancedResult,
+            evidenceDelivery,
+            evidenceGate,
+            {
+              retrievalBudget,
+              persistentEvidenceAtomHitCount,
+              transientEvidenceAtomHitCount,
+            },
+            progressiveRetrievalSteps,
+          ),
+          query,
+          context,
+          decision,
+          semanticExpansion,
+        );
+      }
       return this.attachDiagnostics({
         content: [{ type: "text", text: this.formatRecallText(query, planned.items, enhancedResult.sourceTrace, enhancedResult.answerCandidates, presentation, evidenceGate, {
           retrievalBudget,
@@ -503,12 +572,16 @@ export class ChaunyomsRetrievalService {
           transientEvidenceAtomHitCount,
           retrievalVerification,
           evidenceAnswer,
+          evidenceDelivery,
         }) }],
         details: {
           ok: true,
           route: decision.route,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
+          originalToolQuery: queryResolution.originalToolQuery,
+          canonicalQuerySource: queryResolution.canonicalQuerySource,
+          toolQueryOverridden: queryResolution.toolQueryOverridden,
           consumedTokens: planned.consumedTokens,
           hitCount: planned.items.length,
           retrievalHitType: enhancedResult.strategy === "raw_first" ? "raw_history_recall" : "summary_tree_recall",
@@ -517,6 +590,14 @@ export class ChaunyomsRetrievalService {
           persistentEvidenceAtomHitCount,
           transientEvidenceAtomHitCount,
           evidenceGate,
+          evidenceDelivery,
+          deliveredToOpenClaw: evidenceDelivery.deliveredToOpenClaw,
+          evidencePacketId: evidenceDelivery.evidencePacketId,
+          selectedRawSourceCount: evidenceDelivery.selectedRawSourceCount,
+          summaryDerivedRawSourceCount: evidenceDelivery.summaryDerivedRawSourceCount,
+          rawExcerptHash: evidenceDelivery.rawExcerptHash,
+          rawMessageIds: evidenceDelivery.rawMessageIds,
+          sourceSummaryIds: evidenceDelivery.sourceSummaryIds,
           retrievalVerification,
           evidenceAnswer,
           dagExpansion: enhancedResult.dagExpansion ?? null,
@@ -533,6 +614,7 @@ export class ChaunyomsRetrievalService {
           retrievalBudget,
           rawFtsHintLimit: this.resolveRawFtsHintLimit(args),
           scope,
+          requestedScope,
           sessionId: scopedSessionId ?? null,
           dagTrace: presentation.includeFullTrace ? enhancedResult.dagTrace : this.compactDagTrace(enhancedResult.dagTrace),
           sourceTrace: presentation.includeFullTrace ? enhancedResult.sourceTrace : this.compactSourceTrace(enhancedResult.sourceTrace),
@@ -559,6 +641,9 @@ export class ChaunyomsRetrievalService {
           route: decision.route,
           retrievalLabel: this.describeRetrievalRoute(decision),
           query,
+          originalToolQuery: queryResolution.originalToolQuery,
+          canonicalQuerySource: queryResolution.canonicalQuerySource,
+          toolQueryOverridden: queryResolution.toolQueryOverridden,
           hitCount: 0,
           knowledgeHitCount: 0,
           topRecordType: null,
@@ -588,6 +673,9 @@ export class ChaunyomsRetrievalService {
         route: decision.route,
         retrievalLabel: this.describeRetrievalRoute(decision),
         query,
+        originalToolQuery: queryResolution.originalToolQuery,
+        canonicalQuerySource: queryResolution.canonicalQuerySource,
+        toolQueryOverridden: queryResolution.toolQueryOverridden,
         hitCount: recentTail.length,
         retrievalHitType: "recent_tail",
         routePlan: decision.routePlan,
@@ -944,33 +1032,6 @@ export class ChaunyomsRetrievalService {
       metadata,
     });
     return this.jsonToolResponse("oms_native_absorb", result, result.ok);
-  }
-
-  async executeOmsBenchmarkReport(args: unknown): Promise<ToolResponse> {
-    const context = this.resolveContext(args);
-    const guard = new BenchmarkComparisonGuard();
-    const scope = this.getStringArg(args, "scope") === "standard_public"
-      ? "standard_public"
-      : "development_sample";
-    const systems = this.readStringArrayArg(args, "systems");
-    const metrics = this.isRecord(args) && this.isRecord(args.metrics)
-      ? args.metrics
-      : {};
-    const report = guard.buildReport({
-      suite: this.getStringArg(args, "suite") || "unspecified",
-      scope,
-      systems: systems.length > 0 ? systems : ["chaunyoms"],
-      metrics,
-      generatedAt: this.getStringArg(args, "generatedAt") || undefined,
-    });
-    return this.jsonToolResponse("oms_benchmark_report", {
-      ...report,
-      publicComparableAllowed: guard.canClaimPublicComparison(report),
-      enforcement: report.claimLevel === "public_comparable"
-        ? "public_comparison_allowed"
-        : "regression_only_do_not_publish_as_public_ranking",
-      contextAgentId: context.config.agentId,
-    }, true);
   }
 
   async executeOmsRecallFeedback(args: unknown): Promise<ToolResponse> {
@@ -1846,6 +1907,102 @@ export class ChaunyomsRetrievalService {
       : "";
   }
 
+  private resolveToolQuery(
+    args: unknown,
+    context: LifecycleContext,
+    rawStore: RawMessageRepository,
+    runtimeStore: SQLiteRuntimeStore,
+  ): ToolQueryResolution {
+    const originalToolQuery = this.getQuery(args);
+    const currentFormalQuestion = this.extractCurrentFormalQuestion(rawStore, runtimeStore, context);
+    if (
+      currentFormalQuestion &&
+      (!originalToolQuery || this.normalizeQuestionForComparison(originalToolQuery) !== this.normalizeQuestionForComparison(currentFormalQuestion))
+    ) {
+      return {
+        query: currentFormalQuestion,
+        originalToolQuery,
+        canonicalQuerySource: "current_formal_question",
+        toolQueryOverridden: true,
+      };
+    }
+    return {
+      query: originalToolQuery,
+      originalToolQuery,
+      canonicalQuerySource: "tool_query",
+      toolQueryOverridden: false,
+    };
+  }
+
+  private extractCurrentFormalQuestion(
+    rawStore: RawMessageRepository,
+    runtimeStore: SQLiteRuntimeStore,
+    context: LifecycleContext,
+  ): string {
+    const messages = rawStore.getAll();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.sessionId !== context.sessionId || message.role !== "user") {
+        continue;
+      }
+      const question = this.extractQuestionLine(message.content);
+      if (question) {
+        return question;
+      }
+      break;
+    }
+    for (const message of [...runtimeStore.replay({ sessionId: context.sessionId, limit: 24 })].reverse()) {
+      if (message.role !== "user") {
+        continue;
+      }
+      const question = this.extractQuestionLine(message.content);
+      if (question) {
+        return question;
+      }
+      break;
+    }
+    for (let index = context.runtimeMessages.length - 1; index >= 0; index -= 1) {
+      const message = context.runtimeMessages[index];
+      if (message.role !== "user") {
+        continue;
+      }
+      const question = this.extractQuestionLine(message.text);
+      if (question) {
+        return question;
+      }
+    }
+    return "";
+  }
+
+  private extractQuestionLine(text: string): string {
+    const labelPattern = /(?:^|\s)(?:Question|User question)\s*:\s*/gi;
+    let match: RegExpExecArray | null;
+    let lastMatch: RegExpExecArray | null = null;
+    while ((match = labelPattern.exec(text)) !== null) {
+      lastMatch = match;
+    }
+    if (!lastMatch) {
+      return "";
+    }
+
+    const start = lastMatch.index + lastMatch[0].length;
+    const rest = text.slice(start).trim();
+    if (!rest) {
+      return "";
+    }
+
+    const nextField = rest.search(/\s+(?:Question date|Answer date|Gold answer|Expected answer|Reference answer|Options|Choices|Candidate answers|Answer|Return)\s*:/i);
+    const question = (nextField >= 0 ? rest.slice(0, nextField) : rest).trim();
+    if (question) {
+      return question;
+    }
+    return "";
+  }
+
+  private normalizeQuestionForComparison(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, " ").trim();
+  }
+
   private getStringArg(args: unknown, key: string): string {
     if (!this.isRecord(args)) {
       return "";
@@ -2075,6 +2232,53 @@ export class ChaunyomsRetrievalService {
 
   private queryNeedsRawSource(query: string): boolean {
     return /(quote|verbatim|exact wording|original text|raw source|source span|trace raw|原文|原话|逐字|引用|精确出处|源消息|源码片段)/i.test(query);
+  }
+
+  private buildRetrievalEvidenceDeliveryReceipt(
+    items: ContextItem[],
+    strictSummaryRecall: boolean,
+  ): RetrievalEvidenceDeliveryReceipt {
+    const rawItems = items.filter((item) => item.kind !== "summary");
+    const summaryDerivedRawItems = rawItems.filter((item) =>
+      typeof item.metadata?.sourceSummaryId === "string" &&
+      item.metadata.sourceSummaryId.trim().length > 0,
+    );
+    const selectedForHash = strictSummaryRecall ? summaryDerivedRawItems : rawItems;
+    const rawMessageIds = this.uniqueStrings(rawItems.map((item) => item.metadata?.messageId));
+    const sourceSummaryIds = this.uniqueStrings(summaryDerivedRawItems.map((item) => item.metadata?.sourceSummaryId));
+    const rawExcerptPreview = selectedForHash
+      .map((item) => this.truncateText(String(item.content ?? ""), 220))
+      .slice(0, 4);
+    const rawExcerptHash = selectedForHash.length > 0
+      ? createHash("sha256")
+          .update(selectedForHash.map((item) => String(item.content ?? "")).join("\n---raw-evidence---\n"), "utf8")
+          .digest("hex")
+      : null;
+    const deliveredToOpenClaw = strictSummaryRecall
+      ? summaryDerivedRawItems.length > 0
+      : rawItems.length > 0;
+    return {
+      status: deliveredToOpenClaw ? "delivered" : "blocked",
+      deliveredToOpenClaw,
+      evidencePacketId: rawExcerptHash ? `oms-evidence-${rawExcerptHash.slice(0, 16)}` : null,
+      selectedRawSourceCount: rawItems.length,
+      summaryDerivedRawSourceCount: summaryDerivedRawItems.length,
+      rawMessageIds,
+      sourceSummaryIds,
+      rawExcerptHash: rawExcerptHash ? rawExcerptHash.slice(0, 32) : null,
+      rawExcerptPreview,
+      reason: deliveredToOpenClaw
+        ? "raw_source_evidence_returned_in_oms_tool_output_for_openclaw_llm"
+        : strictSummaryRecall
+          ? "strict_summary_recall_failed_no_summary_derived_raw_source_returned"
+          : "no_raw_source_returned",
+    };
+  }
+
+  private uniqueStrings(values: unknown[]): string[] {
+    return [...new Set(values.filter((value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+    ))];
   }
 
   private evaluateEvidenceGate(
@@ -2687,6 +2891,16 @@ export class ChaunyomsRetrievalService {
     return value === "session" ? "session" : "agent";
   }
 
+  private resolveRecallScope(
+    requestedScope: "session" | "agent",
+    context: LifecycleContext,
+  ): "session" | "agent" {
+    if (context.config.forceDagOnlyRecall) {
+      return "agent";
+    }
+    return requestedScope;
+  }
+
   private shouldUseFtsRecallHints(args: unknown, context: LifecycleContext): boolean {
     if (!context.config.autoRecallEnabled || context.config.emergencyBrake) {
       return false;
@@ -2830,6 +3044,62 @@ export class ChaunyomsRetrievalService {
 
   private isRetrievalVerifierBlocked(result: RetrievalVerificationResult): boolean {
     return (result.sourceTraceRequired || result.fullRawTraceRequired) && result.status !== "sufficient";
+  }
+
+  private isEvidenceDeliveryBlocked(result: RetrievalEvidenceDeliveryReceipt): boolean {
+    return result.status === "blocked";
+  }
+
+  private buildEvidenceDeliveryBlockedResponse(
+    query: string,
+    decision: RetrievalDecision,
+    recallResult: RecallResult,
+    evidenceDelivery: RetrievalEvidenceDeliveryReceipt,
+    evidenceGate: EvidenceGateResult,
+    diagnostics: {
+      retrievalBudget: RetrievalBudgetPlan;
+      persistentEvidenceAtomHitCount: number;
+      transientEvidenceAtomHitCount: number;
+    },
+    progressiveRetrievalSteps: ProgressiveRetrievalStepRecord[],
+  ): ToolResponse {
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `Evidence delivery blocked final answer for: ${query}`,
+          `Reason: ${evidenceDelivery.reason}`,
+          "Strict summary recall requires summary-derived raw source lines to be returned to OpenClaw before it answers.",
+        ].join("\n"),
+      }],
+      details: {
+        ok: false,
+        route: decision.route,
+        retrievalLabel: this.describeRetrievalRoute(decision),
+        query,
+        hitCount: 0,
+        blockedHitCount: recallResult.items.length,
+        retrievalHitType: "evidence_delivery_blocked",
+        evidencePresentation: "no_answer",
+        autoRecall: true,
+        autoRecallReason: "strict_summary_recall_requires_delivered_raw_evidence",
+        routePlan: decision.routePlan,
+        layerScores: decision.layerScores ?? [],
+        explanation: decision.explanation,
+        evidenceDelivery,
+        evidenceGate,
+        sourceTrace: this.compactSourceTrace(recallResult.sourceTrace),
+        answerCandidates: this.compactAnswerCandidates(recallResult.answerCandidates ?? [], {
+          maxItems: 3,
+          maxCharsPerItem: 200,
+          includeFullTrace: false,
+        }),
+        retrievalBudget: diagnostics.retrievalBudget,
+        persistentEvidenceAtomHitCount: diagnostics.persistentEvidenceAtomHitCount,
+        transientEvidenceAtomHitCount: diagnostics.transientEvidenceAtomHitCount,
+        progressiveRetrievalSteps,
+      },
+    };
   }
 
   private buildRetrievalVerifierBlockedResponse(
@@ -3386,6 +3656,16 @@ export class ChaunyomsRetrievalService {
           "",
         ].filter((line) => line.length > 0).join("\n")
       : "";
+    const evidenceDelivery = diagnostics.evidenceDelivery
+      ? [
+          "Evidence delivery:",
+          `- status=${diagnostics.evidenceDelivery.status}, deliveredToOpenClaw=${diagnostics.evidenceDelivery.deliveredToOpenClaw}`,
+          `- selectedRawSourceCount=${diagnostics.evidenceDelivery.selectedRawSourceCount}, summaryDerivedRawSourceCount=${diagnostics.evidenceDelivery.summaryDerivedRawSourceCount}`,
+          `- evidencePacketId=${diagnostics.evidenceDelivery.evidencePacketId ?? "none"}, rawExcerptHash=${diagnostics.evidenceDelivery.rawExcerptHash ?? "none"}`,
+          `- reason=${diagnostics.evidenceDelivery.reason}`,
+          "",
+        ].join("\n")
+      : "";
     const driverNote = [
       "Driver contract:",
       "- OpenClaw LLM called this OMS tool; OMS only provides retrieval/expansion service.",
@@ -3456,6 +3736,7 @@ export class ChaunyomsRetrievalService {
       budget,
       verifier,
       evidenceAnswer,
+      evidenceDelivery,
       localMatchText,
       evidenceHeading,
       messages,

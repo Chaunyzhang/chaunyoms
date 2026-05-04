@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   ContextBudget,
   ContextItem,
@@ -28,6 +30,31 @@ interface AssembleOptions {
   activeQuery?: string;
   sessionId?: string;
   forceDagOnlyRecall?: boolean;
+}
+
+export interface EvidenceDeliveryReceipt {
+  status: "delivered" | "blocked" | "not_required";
+  deliveredToOpenClaw: boolean;
+  evidencePacketId: string | null;
+  route: "summary_raw_expand" | "raw_exact_search" | null;
+  activeQuery?: string;
+  selectedRawSourceCount: number;
+  summaryDerivedRawSourceCount: number;
+  rawMessageIds: string[];
+  sourceSummaryIds: string[];
+  rawExcerptHash: string | null;
+  rawExcerptPreview: string[];
+  reason?: string;
+}
+
+interface AssemblyPlanResult {
+  budget: ContextBudget;
+  items: ContextItem[];
+  plan: ContextPlannerResult;
+}
+
+interface RuntimeAssemblyPlanResult extends AssemblyPlanResult {
+  evidenceDelivery: EvidenceDeliveryReceipt;
 }
 
 const MIN_RECENT_TAIL_RATIO = 0.05;
@@ -195,7 +222,7 @@ export class ContextAssembler {
     sharedDataDir: string,
     workspaceDir: string,
     options: AssembleOptions = {},
-  ): Promise<{ budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult }> {
+  ): Promise<RuntimeAssemblyPlanResult> {
     const budget = this.allocateBudget(totalBudget, systemPromptTokens);
     const stablePrefix = options.includeStablePrefix === false
       ? []
@@ -237,7 +264,9 @@ export class ContextAssembler {
         runtime.getRecentTailByTokens(effectiveTailBudget, effectiveTailTurns, options.sessionId),
         effectiveTailBudget,
       );
-      const queryRecallEvidence = this.shouldForceRawRecallForQuery(options.activeQuery)
+      const mustUseSummaryRecall = options.forceDagOnlyRecall === true &&
+        String(options.activeQuery ?? "").trim().length > 0;
+      const queryRecallEvidence = (mustUseSummaryRecall || this.shouldForceRawRecallForQuery(options.activeQuery))
         ? runtime.getQueryRecallEvidence(options.activeQuery ?? "", 4, options.sessionId, {
           requireSummaryPath: options.forceDagOnlyRecall === true,
         })
@@ -257,7 +286,7 @@ export class ContextAssembler {
     const queryRecallSource: ContextCandidateSource = options.forceDagOnlyRecall === true
       ? "summary_raw_expand"
       : "raw_exact_search";
-    return this.planAndStore([
+    const planResult = this.planAndStore([
       ...this.tagCandidateSource(queryRawEvidence, queryRecallSource),
       ...this.tagCandidateSource(leadingStablePrefix, "stable_prefix"),
       ...this.tagCandidateSource(recentTail, "recent_tail"),
@@ -265,6 +294,16 @@ export class ContextAssembler {
       ...this.tagCandidateSource(memoryItems, "active_memory"),
       ...this.tagCandidateSource(deferredStablePrefix, "reviewed_asset"),
     ], budget);
+    const evidenceDelivery = this.buildEvidenceDeliveryReceipt(
+      planResult,
+      queryRecallSource,
+      options.activeQuery,
+      options.forceDagOnlyRecall === true,
+    );
+    return {
+      ...planResult,
+      evidenceDelivery,
+    };
   }
 
   private shouldForceRawRecallForQuery(query?: string): boolean {
@@ -310,6 +349,7 @@ export class ContextAssembler {
           messageId: hit.message.id,
           sourceKind: hit.sourceKind,
           sourceId: hit.sourceId,
+          sourceSummaryId: hit.sourceKind === "summary" ? hit.sourceId : undefined,
           sourceSessionId: hit.message.sessionId,
           turnNumber: hit.message.turnNumber,
           score: hit.score,
@@ -353,7 +393,7 @@ export class ContextAssembler {
     sharedDataDir: string,
     workspaceDir: string,
     options: AssembleOptions = {},
-  ): Promise<{ budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult }> {
+  ): Promise<AssemblyPlanResult> {
     const budget = this.allocateBudget(totalBudget, systemPromptTokens);
     const stablePrefix = options.includeStablePrefix === false
       ? []
@@ -679,12 +719,84 @@ export class ContextAssembler {
   private planAndStore(
     entries: Array<{ item: ContextItem; source: ContextCandidateSource }>,
     budget: ContextBudget,
-  ): { budget: ContextBudget; items: ContextItem[]; plan: ContextPlannerResult } {
+  ): AssemblyPlanResult {
     const candidates = this.buildPlannerCandidates(entries);
     const plan = this.planner.plan(candidates, { budget: budget.availableBudget });
     const items = plan.selected.map((candidate) => candidate.item);
     this.contextViewStore.setItems(items);
     return { budget, items, plan };
+  }
+
+  private buildEvidenceDeliveryReceipt(
+    result: AssemblyPlanResult,
+    route: ContextCandidateSource,
+    activeQuery: string | undefined,
+    strictSummaryRecall: boolean,
+  ): EvidenceDeliveryReceipt {
+    const query = String(activeQuery ?? "").trim();
+    const selectedRaw = result.plan.selected
+      .filter((candidate) =>
+        candidate.source === route &&
+        candidate.authority === "raw_evidence" &&
+        candidate.item.metadata?.layer === "query_raw_recall")
+      .map((candidate) => candidate.item);
+    const rawMessageIds = this.uniqueStrings(selectedRaw.map((item) => item.metadata?.messageId));
+    const sourceSummaryIds = this.uniqueStrings(
+      selectedRaw
+        .filter((item) => item.metadata?.sourceKind === "summary")
+        .map((item) => item.metadata?.sourceId ?? item.metadata?.sourceSummaryId),
+    );
+    const rawExcerptPreview = selectedRaw
+      .map((item) => this.truncateForReceipt(item.content, 220))
+      .slice(0, 4);
+    const rawExcerptHash = selectedRaw.length > 0
+      ? this.hash(selectedRaw.map((item) => item.content).join("\n---raw-evidence---\n"))
+      : null;
+    const deliveredToOpenClaw = selectedRaw.length > 0;
+    const status = deliveredToOpenClaw
+      ? "delivered"
+      : strictSummaryRecall && query
+        ? "blocked"
+        : "not_required";
+    const resolvedRoute = route === "summary_raw_expand" || route === "raw_exact_search"
+      ? route
+      : null;
+    return {
+      status,
+      deliveredToOpenClaw,
+      evidencePacketId: rawExcerptHash ? `oms-evidence-${rawExcerptHash.slice(0, 16)}` : null,
+      route: resolvedRoute,
+      activeQuery: query || undefined,
+      selectedRawSourceCount: selectedRaw.length,
+      summaryDerivedRawSourceCount: sourceSummaryIds.length,
+      rawMessageIds,
+      sourceSummaryIds,
+      rawExcerptHash: rawExcerptHash ? rawExcerptHash.slice(0, 32) : null,
+      rawExcerptPreview,
+      reason: deliveredToOpenClaw
+        ? "selected_summary_or_raw_expanded_evidence_entered_openclaw_context"
+        : strictSummaryRecall && query
+          ? "strict_summary_recall_failed_no_raw_evidence_selected_for_openclaw_context"
+          : "no_active_query_requiring_raw_delivery",
+    };
+  }
+
+  private uniqueStrings(values: unknown[]): string[] {
+    return [...new Set(values.filter((value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+    ))];
+  }
+
+  private truncateForReceipt(value: string, maxChars: number): string {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (normalized.length <= maxChars) {
+      return normalized;
+    }
+    return `${normalized.slice(0, Math.max(0, maxChars - 16)).trimEnd()} ... [truncated]`;
+  }
+
+  private hash(value: string): string {
+    return createHash("sha256").update(value, "utf8").digest("hex");
   }
 
   private tagCandidateSource(

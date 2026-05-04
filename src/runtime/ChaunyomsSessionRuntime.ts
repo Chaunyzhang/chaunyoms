@@ -1,6 +1,9 @@
 ﻿import { createHash } from "node:crypto";
 
-import { ContextAssembler } from "../engines/ContextAssembler";
+import {
+  ContextAssembler,
+  EvidenceDeliveryReceipt,
+} from "../engines/ContextAssembler";
 import { ContextPlannerResult } from "../engines/ContextPlanner";
 import { CompactionEngine } from "../engines/CompactionEngine";
 import { KnowledgeIntakeGate } from "../engines/KnowledgeIntakeGate";
@@ -86,6 +89,7 @@ export interface AssembleResult {
   items: ContextItem[];
   estimatedTokens: number;
   importedMessages: number;
+  evidenceDelivery?: EvidenceDeliveryReceipt;
 }
 
 export interface CompactResult {
@@ -546,6 +550,7 @@ export class ChaunyomsSessionRuntime {
     const activeQuery = this.resolveActiveUserQuery(
       rawStore,
       context.runtimeMessages,
+      context.sessionId,
     );
 
     if (!this.config.emergencyBrake && this.config.compactionBarrierEnabled) {
@@ -600,12 +605,21 @@ export class ChaunyomsSessionRuntime {
           route: "assemble",
           retrievalStrength: context.config.retrievalStrength,
           usageFeedbackEnabled: context.config.usageFeedbackEnabled,
+          evidenceDelivery: result.evidenceDelivery,
+          deliveredToOpenClaw: result.evidenceDelivery.deliveredToOpenClaw,
+          evidencePacketId: result.evidenceDelivery.evidencePacketId,
+          selectedRawSourceCount: result.evidenceDelivery.selectedRawSourceCount,
+          summaryDerivedRawSourceCount: result.evidenceDelivery.summaryDerivedRawSourceCount,
+          rawExcerptHash: result.evidenceDelivery.rawExcerptHash,
+          rawMessageIds: result.evidenceDelivery.rawMessageIds,
+          sourceSummaryIds: result.evidenceDelivery.sourceSummaryIds,
         },
       });
       return {
         items,
         estimatedTokens: items.reduce((sum, item) => sum + item.tokenCount, 0),
         importedMessages: synced.importedMessages,
+        evidenceDelivery: result.evidenceDelivery,
       };
     } catch (sqliteError) {
       this.logger.warn("assemble_sqlite_failed_runtime_tail_fallback", {
@@ -1175,8 +1189,9 @@ export class ChaunyomsSessionRuntime {
   private resolveActiveUserQuery(
     rawStore: RawMessageRepository,
     runtimeMessages: RuntimeMessageSnapshot[],
+    sessionId: string,
   ): string | undefined {
-    return this.runtimeIngressService.resolveActiveUserQuery(rawStore, runtimeMessages);
+    return this.runtimeIngressService.resolveActiveUserQuery(rawStore, runtimeMessages, sessionId);
   }
 
   private buildRuntimeMessageTailFallback(

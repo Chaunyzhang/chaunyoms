@@ -4159,26 +4159,45 @@ export class SQLiteRuntimeStore {
 
   private normalizeKind(kind: string, id: string): string {
     const normalized = kind.trim().toLowerCase();
+    const normalizedId = id.trim();
     if (["message", "summary", "memory_item", "asset"].includes(normalized)) {
       return normalized;
     }
-    if (id.startsWith("memory-item:")) {
+    if (/^(message|message_id|source|source_id|raw|raw_message):/i.test(normalizedId)) {
+      return "message";
+    }
+    if (/^(summary|summary_id):/i.test(normalizedId) || normalizedId.startsWith("s-")) {
+      return "summary";
+    }
+    if (/^(memory|memory_id|memory_item|memory-item):/i.test(normalizedId)) {
       return "memory_item";
+    }
+    if (/^(asset|asset_id|doc):/i.test(normalizedId)) {
+      return "asset";
     }
     if (normalized === "atom" || normalized === "memory" || normalized === "evidence_atom") {
       return normalized;
     }
-    if (id.includes("summary") || id.startsWith("s-")) {
+    if (normalizedId.includes("summary")) {
       return "summary";
     }
     return "message";
   }
 
   private normalizeTargetId(kind: string, id: string): string {
+    const stripped = this.stripRuntimeTargetPrefix(id.trim());
     if (kind === "memory_item" && !id.startsWith("memory-item:")) {
-      return this.normalizeMemoryItemTargetId(id);
+      return this.normalizeMemoryItemTargetId(stripped);
     }
-    return id;
+    return stripped;
+  }
+
+  private stripRuntimeTargetPrefix(id: string): string {
+    return id
+      .replace(/^(message|message_id|source|source_id|raw|raw_message):/i, "")
+      .replace(/^(summary|summary_id):/i, "")
+      .replace(/^(memory|memory_id|memory_item):/i, "")
+      .replace(/^(asset|asset_id|doc):/i, "");
   }
 
   private normalizeRole(value: unknown): RawMessage["role"] {

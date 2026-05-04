@@ -1,4 +1,5 @@
 import { RuntimeMessageIngress } from "../runtime/RuntimeMessageIngress";
+import { RuntimeIngressService } from "../runtime/RuntimeIngressService";
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
@@ -142,6 +143,64 @@ function main(): void {
   });
 
   assert(!assistantOnlyNoReply.persist, "expected empty no-reply assistant markers to be dropped entirely");
+
+  const activeQueryService = new RuntimeIngressService({} as ConstructorParameters<typeof RuntimeIngressService>[0]);
+  const activeQuery = activeQueryService.resolveActiveUserQuery({
+    getAll() {
+      return [{
+        id: "current-user",
+        sessionId: "question-session",
+        role: "user",
+        content: "Question: When did Caroline go to the LGBTQ support group?",
+        turnNumber: 1,
+        createdAt: new Date().toISOString(),
+        tokenCount: 12,
+        compacted: false,
+      }];
+    },
+  } as any, [{
+    sourceKey: "stale-host-payload",
+    role: "user",
+    content: "Question: What did Caroline research?",
+    text: "Question: What did Caroline research?",
+  }]);
+
+  assert(
+    activeQuery === "Question: When did Caroline go to the LGBTQ support group?",
+    "expected activeQuery to prefer synchronized raw session store over stale host payload messages",
+  );
+
+  const scopedActiveQuery = activeQueryService.resolveActiveUserQuery({
+    getAll() {
+      return [
+        {
+          id: "previous-question",
+          sessionId: "previous-question-session",
+          role: "user",
+          content: "Question: When did Caroline meet up with her friends, family, and mentors?",
+          turnNumber: 1,
+          createdAt: new Date().toISOString(),
+          tokenCount: 12,
+          compacted: false,
+        },
+        {
+          id: "current-question",
+          sessionId: "fresh-question-session",
+          role: "user",
+          content: "Question: When did Melanie paint a sunrise?",
+          turnNumber: 1,
+          createdAt: new Date().toISOString(),
+          tokenCount: 12,
+          compacted: false,
+        },
+      ];
+    },
+  } as any, [], "fresh-question-session");
+
+  assert(
+    scopedActiveQuery === "Question: When did Melanie paint a sunrise?",
+    "expected activeQuery to stay scoped to the current fresh question session instead of leaking the previous question",
+  );
 
   console.log("test-runtime-ingress-normalization passed");
 }

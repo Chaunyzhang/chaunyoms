@@ -158,6 +158,11 @@ async function main(): Promise<void> {
     const ftsStatus = store.getStatus();
     assert(ftsStatus.ftsReady === true && ftsStatus.ftsStatus === "ready", "FTS should report ready after grep initializes it");
     assert(store.expand("summary", "summary-1").messages.length === 2, "expand should follow summary source edges to raw messages");
+    assert(store.expand("summary", "summary:summary-1").messages.length === 2, "expand should accept OpenClaw-style summary-prefixed ids");
+    assert(store.expand("auto", "summary:summary-1").messages.length === 2, "auto expand should infer summary-prefixed ids");
+    assert(store.expand("message", "message:m-1").messages[0]?.id === "m-1", "expand should accept OpenClaw-style message-prefixed ids");
+    assert(store.expand("auto", "source:m-1").messages[0]?.id === "m-1", "auto expand should treat source-prefixed ids as raw messages");
+    assert(store.trace("summary", "summary:summary-1").some((edge) => edge.targetId === "m-1"), "trace should accept summary-prefixed ids");
     assert(store.trace("memory", "memory-1").length === 0, "legacy memory trace should not exist as a runtime layer");
     assert(store.trace("evidence_atom", atoms[0].id).length === 0, "legacy evidence atom trace should not exist as a runtime layer");
     assert(store.trace("memory_item", "memory-item:memory-1").some((edge) => edge.targetId === "m-1"), "trace should expose MemoryItem-draft-derived MemoryItem source edge");
